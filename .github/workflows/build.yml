@@ -199,8 +199,11 @@ jobs:
           }
           browser.runtime.onMessage.addListener(function (msg, sender) {
             if (!msg || msg.type !== "page") return;
-            return browser.runtime.sendNativeMessage(APP, { type: "get", url: msg.url }).then(function (res) {
-              if (!res || !res.code) { log("no code for " + msg.url); return {}; }
+            return browser.runtime.sendNativeMessage(APP, { type: "get", url: msg.url }).then(function (raw) {
+              var res = {};
+              try { res = (typeof raw === "string") ? JSON.parse(raw) : (raw || {}); }
+              catch (e) { log("parse error: " + e); }
+              if (!res.code) { log("no code for " + msg.url); return {}; }
               if (!sender.tab) { log("no sender.tab, using fallback"); return { fallback: true, code: res.code }; }
               return browser.tabs.executeScript(sender.tab.id, {
                 code: res.code,
@@ -311,7 +314,7 @@ jobs:
                       } catch (e: Exception) {
                           Log.e("GreyScript", "delegate error", e)
                       }
-                      return GeckoResult.fromValue<Any>(reply)
+                      return GeckoResult.fromValue<Any>(reply.toString())
                   }
               }
 
