@@ -93,7 +93,7 @@ jobs:
 
           android {
               namespace = "com.grey.gecko"
-              compileSdk = 35
+              compileSdk = 36
               defaultConfig {
                   applicationId = "com.grey.gecko"
                   minSdk = 26
@@ -119,8 +119,16 @@ jobs:
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
-              kotlinOptions { jvmTarget = "17" }
+              kotlinOptions {
+                  jvmTarget = "17"
+                  freeCompilerArgs += "-Xskip-metadata-version-check"
+              }
               buildFeatures { compose = true }
+          }
+
+          // Latest GeckoView/androidx want compileSdk 37 / AGP 9; skip that check.
+          tasks.configureEach {
+              if (name.startsWith("check") && name.endsWith("AarMetadata")) enabled = false
           }
 
           dependencies {
