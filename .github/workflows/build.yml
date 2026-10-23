@@ -126,7 +126,6 @@ jobs:
               buildFeatures { compose = true }
           }
 
-          // Latest GeckoView/androidx want compileSdk 37 / AGP 9; skip that check.
           tasks.configureEach {
               if (name.startsWith("check") && name.endsWith("AarMetadata")) enabled = false
           }
@@ -167,7 +166,7 @@ jobs:
           {
             "manifest_version": 2,
             "name": "GreyScripts",
-            "version": "1.0",
+            "version": "2.0",
             "browser_specific_settings": { "gecko": { "id": "scripts@grey.gecko" } },
             "background": { "scripts": ["background.js"] },
             "content_scripts": [
@@ -182,43 +181,709 @@ jobs:
           EOF
 
           cat > app/src/main/assets/ext/content.js <<'EOF'
-          browser.runtime.sendMessage({ type: "page", url: location.href }).then(function (r) {
-            if (r && r.fallback && r.code) {
-              var s = document.createElement("script");
-              s.textContent = r.code;
-              document.documentElement.appendChild(s);
-              s.remove();
-            }
-          }).catch(function (e) { console.log("GreyScript content error: " + e); });
+          browser.runtime.sendMessage({ type: "page", url: location.href }).catch(function (e) {
+            console.log("GreyScript content error: " + e);
+          });
           EOF
 
           cat > app/src/main/assets/ext/background.js <<'EOF'
           var APP = "browser";
-          function log(m) {
+          var libCache = {};
+
+          function nlog(m) {
             try { browser.runtime.sendNativeMessage(APP, { type: "log", msg: String(m) }); } catch (e) {}
           }
-          browser.runtime.onMessage.addListener(function (msg, sender) {
-            if (!msg || msg.type !== "page") return;
-            return browser.runtime.sendNativeMessage(APP, { type: "get", url: msg.url }).then(function (raw) {
-              var res = {};
-              try { res = (typeof raw === "string") ? JSON.parse(raw) : (raw || {}); }
-              catch (e) { log("parse error: " + e); }
-              if (!res.code) { log("no code for " + msg.url); return {}; }
-              if (!sender.tab) { log("no sender.tab, using fallback"); return { fallback: true, code: res.code }; }
+
+          function native(o) {
+            return browser.runtime.sendNativeMessage(APP, o).then(function (raw) {
+              if (typeof raw === "string") {
+                try { return JSON.parse(raw); } catch (e) { return {}; }
+              }
+              return raw || {};
+            });
+          }
+
+          function gmFactory(sid, vals, info) {
+            function send(m) {
+              try { return browser.runtime.sendMessage(m); } catch (e) { return Promise.resolve(); }
+            }
+            function log() {
+              var a = [];
+              for (var i = 0; i < arguments.length; i++) {
+                var x = arguments[i];
+                try { a.push(typeof x === "string" ? x : JSON.stringify(x)); } catch (e) { a.push(String(x)); }
+              }
+              send({ type: "log", msg: "[" + info.script.name + "] " + a.join(" ") });
+            }
+            function addStyle(css) {
+              var s = document.createElement("style");
+              s.textContent = css;
+              (document.head || document.documentElement).appendChild(s);
+              return s;
+            }
+            function getValue(k, d) {
+              return Object.prototype.hasOwnProperty.call(vals, k) ? vals[k] : d;
+            }
+            function setValue(k, v) {
+              var j;
+              try { j = JSON.stringify(v); } catch (e) { j = undefined; }
+              if (j === undefined) {
+                delete vals[k];
+                send({ type: "deleteValue", sid: sid, key: k });
+              } else {
+                vals[k] = v;
+                send({ type: "setValue", sid: sid, key: k, value: j });
+              }
+            }
+            function deleteValue(k) {
+              delete vals[k];
+              send({ type: "deleteValue", sid: sid, key: k });
+            }
+            function listValues() { return Object.keys(vals); }
+            function xhr(d) {
+              var aborted = false;
+              var det = {
+                url: d.url,
+                method: d.method,
+                headers: d.headers,
+                data: d.data == null ? null : (typeof d.data === "string" ? d.data : String(d.data)),
+                timeout: d.timeout
+              };
+              send({ type: "xhr", details: det }).then(function (r) {
+                if (aborted) return;
+                if (!r || !r.ok) {
+                  var er = { error: (r && r.error) || "request failed", status: 0 };
+                  if (r && r.timeout) { if (d.ontimeout) d.ontimeout(er); }
+                  else if (d.onerror) { d.onerror(er); }
+                  if (d.onloadend) d.onloadend(er);
+                  return;
+                }
+                var bin = atob(r.b64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                var text = new TextDecoder("utf-8").decode(bytes);
+                var rt = d.responseType || "text";
+                var resp;
+                if (rt === "arraybuffer") resp = bytes.buffer;
+                else if (rt === "blob") resp = new Blob([bytes]);
+                else if (rt === "json") { try { resp = JSON.parse(text); } catch (e) { resp = null; } }
+                else resp = text;
+                var res = {
+                  status: r.status,
+                  statusText: r.statusText,
+                  finalUrl: r.finalUrl,
+                  responseHeaders: r.responseHeaders,
+                  response: resp,
+                  responseText: (rt === "arraybuffer" || rt === "blob") ? "" : text,
+                  readyState: 4,
+                  context: d.context
+                };
+                if (d.onload) d.onload(res);
+                if (d.onloadend) d.onloadend(res);
+              }).catch(function (e) { log("xhr handler error: " + e); });
+              return { abort: function () { aborted = true; if (d.onabort) d.onabort({}); } };
+            }
+            function xhrP(d) {
+              return new Promise(function (resolve, reject) {
+                var o = {};
+                for (var k in d) o[k] = d[k];
+                o.onload = function (r) { resolve(r); };
+                o.onerror = function (e) { reject(e); };
+                o.ontimeout = function (e) { reject(e); };
+                xhr(o);
+              });
+            }
+            function setClipboard(t) {
+              t = String(t);
+              function fb() {
+                var ta = document.createElement("textarea");
+                ta.value = t;
+                ta.style.cssText = "position:fixed;opacity:0;top:0;left:0";
+                (document.body || document.documentElement).appendChild(ta);
+                ta.select();
+                try { document.execCommand("copy"); } catch (e) {}
+                ta.remove();
+              }
+              try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                  navigator.clipboard.writeText(t).catch(fb);
+                } else {
+                  fb();
+                }
+              } catch (e) { fb(); }
+            }
+            function openInTab(u) {
+              try { window.open(u, "_blank"); } catch (e) { log("openInTab failed: " + e); }
+            }
+            function unsupported(n) {
+              return function () { log(n + " is not supported"); };
+            }
+            var GM = {
+              info: info,
+              log: log,
+              addStyle: function (c) { return Promise.resolve(addStyle(c)); },
+              getValue: function (k, d) { return Promise.resolve(getValue(k, d)); },
+              setValue: function (k, v) { setValue(k, v); return Promise.resolve(); },
+              deleteValue: function (k) { deleteValue(k); return Promise.resolve(); },
+              listValues: function () { return Promise.resolve(listValues()); },
+              xmlHttpRequest: xhrP,
+              setClipboard: function (t) { setClipboard(t); return Promise.resolve(); },
+              openInTab: function (u) { openInTab(u); return Promise.resolve(); }
+            };
+            return {
+              GM_info: info,
+              GM_log: log,
+              GM_addStyle: addStyle,
+              GM_getValue: getValue,
+              GM_setValue: setValue,
+              GM_deleteValue: deleteValue,
+              GM_listValues: listValues,
+              GM_xmlhttpRequest: xhr,
+              GM_setClipboard: setClipboard,
+              GM_openInTab: openInTab,
+              GM_registerMenuCommand: unsupported("GM_registerMenuCommand"),
+              GM_notification: unsupported("GM_notification"),
+              GM_download: unsupported("GM_download"),
+              GM: GM,
+              unsafeWindow: window.wrappedJSObject || window
+            };
+          }
+
+          function bufToB64(buf) {
+            var b = new Uint8Array(buf);
+            var s = "";
+            var chunk = 0x8000;
+            for (var i = 0; i < b.length; i += chunk) {
+              s += String.fromCharCode.apply(null, b.subarray(i, i + chunk));
+            }
+            return btoa(s);
+          }
+
+          function doXhr(d) {
+            var opts = { method: d.method || "GET", headers: d.headers || {}, credentials: "include", redirect: "follow" };
+            if (d.data != null && opts.method !== "GET" && opts.method !== "HEAD") opts.body = d.data;
+            var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+            var timedOut = false;
+            var timer = null;
+            if (ctrl) opts.signal = ctrl.signal;
+            if (ctrl && d.timeout > 0) {
+              timer = setTimeout(function () { timedOut = true; ctrl.abort(); }, d.timeout);
+            }
+            return fetch(d.url, opts).then(function (r) {
+              var hdrs = "";
+              r.headers.forEach(function (v, k) { hdrs += k + ": " + v + "\r\n"; });
+              return r.arrayBuffer().then(function (buf) {
+                if (timer) clearTimeout(timer);
+                return {
+                  ok: true,
+                  status: r.status,
+                  statusText: r.statusText,
+                  finalUrl: r.url,
+                  responseHeaders: hdrs,
+                  b64: bufToB64(buf)
+                };
+              });
+            }).catch(function (e) {
+              if (timer) clearTimeout(timer);
+              return { ok: false, timeout: timedOut, error: String(e) };
+            });
+          }
+
+          function fetchLib(url) {
+            if (!libCache[url]) {
+              libCache[url] = fetch(url).then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.text();
+              }).catch(function (e) {
+                delete libCache[url];
+                nlog("require failed " + url + ": " + e);
+                return "";
+              });
+            }
+            return libCache[url];
+          }
+
+          function buildCode(s, libs) {
+            var info = {
+              script: {
+                name: s.name,
+                version: s.version,
+                description: s.description,
+                namespace: s.namespace,
+                grant: s.grants || [],
+                matches: s.matches || []
+              },
+              scriptHandler: "GreyGecko",
+              version: "1.0"
+            };
+            var runAt = s.runAt || "document-idle";
+            var timing;
+            if (runAt === "document-start") {
+              timing = "__safe();";
+            } else if (runAt === "document-end") {
+              timing = "if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', __safe, { once: true }); } else { __safe(); }";
+            } else {
+              timing = "if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function () { setTimeout(__safe, 0); }, { once: true }); } else { __safe(); }";
+            }
+            return "(function () {\n" +
+              "var __A = (" + gmFactory.toString() + ")(" + JSON.stringify(s.id) + ", " + JSON.stringify(s.values || {}) + ", " + JSON.stringify(info) + ");\n" +
+              "var GM_info = __A.GM_info, GM_log = __A.GM_log, GM_addStyle = __A.GM_addStyle, GM_getValue = __A.GM_getValue, GM_setValue = __A.GM_setValue, GM_deleteValue = __A.GM_deleteValue, GM_listValues = __A.GM_listValues, GM_xmlhttpRequest = __A.GM_xmlhttpRequest, GM_setClipboard = __A.GM_setClipboard, GM_openInTab = __A.GM_openInTab, GM_registerMenuCommand = __A.GM_registerMenuCommand, GM_notification = __A.GM_notification, GM_download = __A.GM_download, GM = __A.GM, unsafeWindow = __A.unsafeWindow;\n" +
+              "var __run = function () {\n" + (libs ? libs + "\n;\n" : "") + s.code + "\n};\n" +
+              "var __safe = function () { try { __run(); } catch (e) { GM_log('script error: ' + (e && e.stack ? e.stack : e)); } };\n" +
+              timing + "\n})();";
+          }
+
+          function runScript(s, sender, url) {
+            return Promise.all((s.requires || []).map(fetchLib)).then(function (libs) {
+              var code = buildCode(s, libs.join("\n;\n"));
               return browser.tabs.executeScript(sender.tab.id, {
-                code: res.code,
+                code: code,
                 runAt: "document_start",
                 frameId: sender.frameId || 0
-              }).then(function () {
-                log("injected into " + msg.url);
-                return {};
-              }, function (e) {
-                log("executeScript failed: " + e + " -> fallback");
-                return { fallback: true, code: res.code };
               });
-            }).catch(function (e) { log("native error: " + e); return {}; });
+            }).then(function () {
+              nlog("injected '" + s.name + "' into " + url);
+            }, function (e) {
+              nlog("script '" + s.name + "' failed: " + e);
+            });
+          }
+
+          function handlePage(msg, sender) {
+            if (!sender.tab) { nlog("no sender.tab"); return Promise.resolve({}); }
+            return native({ type: "get", url: msg.url }).then(function (res) {
+              var list = res.scripts || [];
+              if (!list.length) { return {}; }
+              return Promise.all(list.map(function (s) { return runScript(s, sender, msg.url); })).then(function () { return {}; });
+            }).catch(function (e) {
+              nlog("native error: " + e);
+              return {};
+            });
+          }
+
+          browser.runtime.onMessage.addListener(function (msg, sender) {
+            if (!msg) return;
+            if (msg.type === "log") { nlog(msg.msg); return; }
+            if (msg.type === "setValue" || msg.type === "deleteValue") { native(msg); return; }
+            if (msg.type === "xhr") { return doXhr(msg.details); }
+            if (msg.type === "page") { return handlePage(msg, sender); }
           });
-          log("background started");
+
+          nlog("background started");
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/Scripts.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.content.SharedPreferences
+          import android.util.Log
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.json.JSONTokener
+
+          class Script(
+              val id: String,
+              var code: String,
+              var enabled: Boolean,
+              var sourceUrl: String,
+              var remoteVersion: String
+          )
+
+          class Meta(
+              val name: String,
+              val version: String,
+              val namespace: String,
+              val description: String,
+              val matches: List<String>,
+              val includes: List<String>,
+              val excludes: List<String>,
+              val runAt: String,
+              val requires: List<String>,
+              val grants: List<String>,
+              val updateUrl: String,
+              val downloadUrl: String
+          )
+
+          fun parseMeta(code: String): Meta {
+              val map = HashMap<String, MutableList<String>>()
+              val tag = "==UserScript=="
+              val start = code.indexOf(tag)
+              val end = code.indexOf("==/UserScript==")
+              if (start >= 0 && end > start) {
+                  val block = code.substring(start + tag.length, end)
+                  val re = Regex("^\\s*//\\s*@([A-Za-z0-9_:\\-]+)\\s*(.*)")
+                  for (line in block.lines()) {
+                      val m = re.find(line.trimEnd()) ?: continue
+                      map.getOrPut(m.groupValues[1].lowercase()) { mutableListOf() }.add(m.groupValues[2].trim())
+                  }
+              }
+              fun one(k: String): String = map[k]?.firstOrNull() ?: ""
+              fun many(k: String): List<String> = (map[k] ?: mutableListOf<String>()).filter { it.isNotBlank() }
+              var runAt = one("run-at").lowercase().replace("_", "-")
+              if (runAt != "document-start" && runAt != "document-end") runAt = "document-idle"
+              return Meta(
+                  one("name").ifBlank { "Unnamed script" },
+                  one("version"),
+                  one("namespace"),
+                  one("description"),
+                  many("match"),
+                  many("include"),
+                  many("exclude"),
+                  runAt,
+                  many("require"),
+                  many("grant"),
+                  one("updateurl"),
+                  one("downloadurl")
+              )
+          }
+
+          fun compareVersions(a: String, b: String): Int {
+              val pa = a.split(".", "-", "+").map { p -> p.filter { c -> c.isDigit() }.ifEmpty { "0" }.toIntOrNull() ?: 0 }
+              val pb = b.split(".", "-", "+").map { p -> p.filter { c -> c.isDigit() }.ifEmpty { "0" }.toIntOrNull() ?: 0 }
+              for (i in 0 until maxOf(pa.size, pb.size)) {
+                  val x = pa.getOrElse(i) { 0 }
+                  val y = pb.getOrElse(i) { 0 }
+                  if (x != y) return x.compareTo(y)
+              }
+              return 0
+          }
+
+          fun globToRegex(g: String): Regex {
+              val body = g.split("*").joinToString(".*") { Regex.escape(it) }
+              return Regex(body, RegexOption.IGNORE_CASE)
+          }
+
+          fun matchPattern(p: String, url: String): Boolean {
+              if (p == "<all_urls>") return url.startsWith("http")
+              val m = Regex("(\\*|https?|file|ftp)://([^/]*)(/.*)?").matchEntire(p) ?: return false
+              val scheme = m.groupValues[1]
+              val host = m.groupValues[2]
+              val path = m.groupValues[3].ifEmpty { "/*" }
+              val sre = if (scheme == "*") "https?" else Regex.escape(scheme)
+              val hre = when {
+                  host == "*" -> "[^/]*"
+                  host.startsWith("*.") -> "([^/]*\\.)?" + Regex.escape(host.substring(2))
+                  else -> Regex.escape(host)
+              }
+              val pre = path.split("*").joinToString(".*") { Regex.escape(it) }
+              return try {
+                  Regex(sre + "://" + hre + pre, RegexOption.IGNORE_CASE).matches(url)
+              } catch (e: Exception) {
+                  false
+              }
+          }
+
+          fun matchInclude(p: String, url: String): Boolean {
+              val t = p.trim()
+              if (t == "*") return true
+              if (t.length > 2 && t.startsWith("/") && t.endsWith("/")) {
+                  return try {
+                      Regex(t.substring(1, t.length - 1), RegexOption.IGNORE_CASE).matches(url)
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+              return globToRegex(t).matches(url)
+          }
+
+          fun applies(m: Meta, url: String): Boolean {
+              val u = url.substringBefore('#')
+              if (m.matches.isEmpty() && m.includes.isEmpty()) return false
+              val ok = m.matches.any { matchPattern(it, u) } || m.includes.any { matchInclude(it, u) }
+              if (!ok) return false
+              return !m.excludes.any { matchInclude(it, u) }
+          }
+
+          fun checkUrlFor(m: Meta, src: String): String =
+              m.updateUrl.ifBlank { m.downloadUrl }.ifBlank { src }
+
+          fun applyUrlFor(m: Meta, src: String): String =
+              m.downloadUrl.ifBlank { m.updateUrl }.ifBlank { src }
+
+          fun httpGet(url: String): String {
+              val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+              c.connectTimeout = 15000
+              c.readTimeout = 20000
+              c.instanceFollowRedirects = true
+              c.setRequestProperty("User-Agent", "GreyGecko/1.0")
+              try {
+                  if (c.responseCode !in 200..299) throw Exception("HTTP " + c.responseCode)
+                  return c.inputStream.bufferedReader().readText()
+              } finally {
+                  c.disconnect()
+              }
+          }
+
+          object Store {
+              private fun sp(): SharedPreferences = Gecko.prefs(Gecko.appCtx)
+
+              fun newId(): String = java.util.UUID.randomUUID().toString().take(8)
+
+              @Synchronized
+              fun load(): MutableList<Script> {
+                  val out = mutableListOf<Script>()
+                  try {
+                      val arr = JSONArray(sp().getString("list", "[]") ?: "[]")
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          out.add(
+                              Script(
+                                  o.getString("id"),
+                                  o.optString("code"),
+                                  o.optBoolean("enabled", true),
+                                  o.optString("src"),
+                                  o.optString("remote")
+                              )
+                          )
+                      }
+                  } catch (e: Exception) {
+                      Log.e("GreyScript", "load failed", e)
+                  }
+                  return out
+              }
+
+              @Synchronized
+              fun save(list: List<Script>) {
+                  val arr = JSONArray()
+                  for (s in list) {
+                      val o = JSONObject()
+                      o.put("id", s.id)
+                      o.put("code", s.code)
+                      o.put("enabled", s.enabled)
+                      o.put("src", s.sourceUrl)
+                      o.put("remote", s.remoteVersion)
+                      arr.put(o)
+                  }
+                  sp().edit().putString("list", arr.toString()).apply()
+              }
+
+              @Synchronized
+              fun setEnabled(id: String, v: Boolean) {
+                  val l = load()
+                  for (s in l) {
+                      if (s.id == id) s.enabled = v
+                  }
+                  save(l)
+              }
+
+              @Synchronized
+              fun remove(id: String) {
+                  val l = load()
+                  l.removeAll { it.id == id }
+                  save(l)
+                  sp().edit().remove("vals_" + id).apply()
+              }
+
+              @Synchronized
+              fun values(id: String): JSONObject {
+                  return try {
+                      JSONObject(sp().getString("vals_" + id, "{}") ?: "{}")
+                  } catch (e: Exception) {
+                      JSONObject()
+                  }
+              }
+
+              @Synchronized
+              fun setValue(id: String, key: String, json: String) {
+                  if (id.isBlank() || key.isBlank()) return
+                  if (json.isEmpty()) {
+                      deleteValue(id, key)
+                      return
+                  }
+                  val o = values(id)
+                  try {
+                      o.put(key, JSONTokener(json).nextValue())
+                  } catch (e: Exception) {
+                      return
+                  }
+                  sp().edit().putString("vals_" + id, o.toString()).apply()
+              }
+
+              @Synchronized
+              fun deleteValue(id: String, key: String) {
+                  if (id.isBlank()) return
+                  val o = values(id)
+                  o.remove(key)
+                  sp().edit().putString("vals_" + id, o.toString()).apply()
+              }
+
+              fun lastCheck(): Long = sp().getLong("lastCheck", 0L)
+
+              fun setLastCheck(t: Long) {
+                  sp().edit().putLong("lastCheck", t).apply()
+              }
+          }
+
+          object Updater {
+              fun checkAll(): Int {
+                  val found = HashMap<String, String>()
+                  for (s in Store.load()) {
+                      val m = parseMeta(s.code)
+                      val u = checkUrlFor(m, s.sourceUrl)
+                      if (u.isBlank()) continue
+                      try {
+                          val remote = parseMeta(httpGet(u)).version
+                          if (remote.isNotBlank() && compareVersions(remote, m.version) > 0) {
+                              found[s.id] = remote
+                          } else {
+                              found[s.id] = ""
+                          }
+                      } catch (e: Exception) {
+                          Log.d("GreyScript", "update check failed: " + e)
+                      }
+                  }
+                  val fresh = Store.load()
+                  var n = 0
+                  for (f in fresh) {
+                      val r = found[f.id]
+                      if (r != null) {
+                          f.remoteVersion = r
+                          if (r.isNotBlank()) n++
+                      }
+                  }
+                  Store.save(fresh)
+                  Store.setLastCheck(System.currentTimeMillis())
+                  return n
+              }
+
+              fun applyAll(): Int {
+                  val updates = HashMap<String, String>()
+                  for (s in Store.load()) {
+                      if (s.remoteVersion.isBlank()) continue
+                      val u = applyUrlFor(parseMeta(s.code), s.sourceUrl)
+                      if (u.isBlank()) continue
+                      try {
+                          val t = httpGet(u)
+                          if (t.contains("==UserScript==")) updates[s.id] = t
+                      } catch (e: Exception) {
+                          Log.d("GreyScript", "update download failed: " + e)
+                      }
+                  }
+                  val fresh = Store.load()
+                  for (f in fresh) {
+                      val t = updates[f.id]
+                      if (t != null) {
+                          f.code = t
+                          f.remoteVersion = ""
+                      }
+                  }
+                  Store.save(fresh)
+                  return updates.size
+              }
+
+              fun autoCheck() {
+                  if (System.currentTimeMillis() - Store.lastCheck() > 86400000L) {
+                      try {
+                          checkAll()
+                      } catch (e: Exception) {
+                          Log.d("GreyScript", "auto check failed: " + e)
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/Guide.kt <<'EOF'
+          package com.grey.gecko
+
+          const val NEW_TEMPLATE = """// ==UserScript==
+          // @name         New script
+          // @namespace    greygecko
+          // @version      1.0
+          // @description  What this script does
+          // @match        *://*.example.com/*
+          // @run-at       document-idle
+          // @grant        GM_addStyle
+          // ==/UserScript==
+
+          (function () {
+            'use strict';
+
+            GM_addStyle('body { outline: 4px solid red; }');
+            GM_log('Script ran on ' + location.href);
+          })();
+          """
+
+          const val GUIDE = """Write a userscript for the GreyGecko browser using this guide.
+          Reply with ONE complete .user.js file in a single code block (header + code) and nothing else.
+
+          ABOUT
+          GreyGecko is an Android browser with the Firefox engine. Userscripts work like Tampermonkey scripts, but only the features listed here exist.
+
+          HEADER (required, at the very top of the file)
+          // ==UserScript==
+          // @name         Short name
+          // @namespace    greygecko
+          // @version      1.0
+          // @description  What it does
+          // @match        *://*.example.com/*
+          // @run-at       document-idle
+          // @grant        GM_addStyle
+          // ==/UserScript==
+
+          HEADER KEYS
+          @name, @namespace, @version, @description: informational.
+          @match: URL pattern, repeatable. Form: scheme://host/path with * wildcards, for example *://*.example.com/* or https://example.com/page/*. You need at least one @match or @include, otherwise the script never runs.
+          @include: glob (https://example.com/*) or a regex written between slashes. Repeatable.
+          @exclude: same format as @include. The script does not run on matching URLs. Repeatable.
+          @run-at: document-start, document-end or document-idle (default).
+          @require: URL of a JS library that is loaded before the script. Repeatable.
+          @grant: optional. Every GM function listed below is always available, even if not granted.
+          @updateURL / @downloadURL: URL of the raw .user.js file, used for update checks. An update is offered only when @version is higher than the installed one.
+          Ignored keys: @author, @icon, @connect, @noframes, @resource, @license, @unwrap.
+
+          HOW IT RUNS
+          - Only in the top page, not inside iframes. Once per page load (not on in-page navigation of single-page sites).
+          - The script runs in an isolated world: it shares the page DOM (document, elements, events) but NOT the page's JavaScript variables. Use unsafeWindow.someGlobal to read page globals. Functions you define are not visible to the page's own scripts.
+          - document-start means as early as possible, but page scripts may already have run. Do not rely on running before them. At document-start document.body may not exist yet: use document.documentElement or wait for DOMContentLoaded.
+          - The code is wrapped in a function: top-level variables are private and a top-level return is allowed. There is no top-level await and no import/export. For async code use (async () => { ... })().
+          - Errors thrown by the script and GM_log output go to the app Logcat (menu > Logcat, filter: GreyScript).
+
+          AVAILABLE API
+          GM_addStyle(css): injects CSS, returns the style element.
+          GM_getValue(key, default): synchronous read from per-script persistent storage.
+          GM_setValue(key, value): saves any JSON-serializable value.
+          GM_deleteValue(key), GM_listValues().
+          GM_xmlhttpRequest({method, url, headers, data, responseType, timeout, onload, onerror, ontimeout, onloadend}): cross-origin requests. data must be a string. responseType: text (default), json, arraybuffer, blob. Callbacks receive {status, statusText, response, responseText, responseHeaders, finalUrl}. Cookies are normally sent. The Referer and Origin headers cannot be changed.
+          GM_setClipboard(text): best effort, may need a user tap.
+          GM_openInTab(url): opens the URL; may be blocked by the popup blocker unless triggered by a tap.
+          GM_log(...): writes to Logcat.
+          GM_info: {script: {name, version, description, namespace, grant, matches}, scriptHandler, version}.
+          Promise versions: GM.getValue, GM.setValue, GM.deleteValue, GM.listValues, GM.xmlHttpRequest (returns a promise), GM.addStyle, GM.setClipboard, GM.openInTab, GM.info.
+          unsafeWindow: the real page window.
+
+          NOT AVAILABLE (do not use)
+          GM_registerMenuCommand (does nothing, there is no script menu), GM_notification, GM_download, GM_getResourceText, GM_getResourceURL, GM_addValueChangeListener, GM_cookie, GM_addElement, @resource. GM_xmlhttpRequest with FormData or Blob bodies, progress events, and binary uploads. Scripts inside iframes. Extension APIs (browser.*, chrome.*).
+          There is no UI outside the page. If the user needs controls, add your own buttons or overlays to the page DOM (for example position: fixed).
+
+          TIPS
+          - Single-page sites change the DOM without reloading: use a MutationObserver or a short setInterval instead of running once.
+          - Check that elements exist before using them.
+          - Prefix ids and classes of injected elements with the script name to avoid clashes.
+          - Use GM_setValue and GM_getValue to remember settings.
+          - Avoid eval and new Function.
+          - Keep everything in one self-contained file.
+
+          EXAMPLE
+          // ==UserScript==
+          // @name         Highlight links
+          // @namespace    greygecko
+          // @version      1.0
+          // @description  Outlines every link on example.com
+          // @match        *://*.example.com/*
+          // @run-at       document-idle
+          // @grant        GM_addStyle
+          // @grant        GM_getValue
+          // @grant        GM_setValue
+          // ==/UserScript==
+
+          (function () {
+            'use strict';
+            var runs = GM_getValue('runs', 0) + 1;
+            GM_setValue('runs', runs);
+            GM_addStyle('a { outline: 2px solid orange !important; }');
+            GM_log('run number ' + runs + ' on ' + location.href);
+          })();
+          """
           EOF
 
           cat > app/src/main/java/com/grey/gecko/MainActivity.kt <<'EOF'
@@ -235,8 +900,15 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.enableEdgeToEdge
           import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
           import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.foundation.text.KeyboardActions
           import androidx.compose.foundation.text.KeyboardOptions
           import androidx.compose.foundation.text.selection.SelectionContainer
@@ -247,9 +919,11 @@ jobs:
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.font.FontFamily
           import androidx.compose.ui.text.input.ImeAction
           import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
@@ -257,6 +931,7 @@ jobs:
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
+          import org.json.JSONArray
           import org.json.JSONObject
           import org.mozilla.geckoview.GeckoResult
           import org.mozilla.geckoview.GeckoRuntime
@@ -268,10 +943,8 @@ jobs:
           val Bar = Color(0xFF2A2A2A)
           val Field = Color(0xFF3A3A3A)
           val Btn = Color(0xFF4A4A4A)
-
-          const val DEFAULT_CODE =
-              "document.documentElement.style.outline = '8px solid red';\n" +
-              "console.log('GreyScript: user script ran on ' + location.href);"
+          val Soft = Color(0xFFAAAAAA)
+          val Danger = Color(0xFFE49A9A)
 
           object Gecko {
               private var rt: GeckoRuntime? = null
@@ -279,13 +952,6 @@ jobs:
 
               fun prefs(c: Context): SharedPreferences =
                   c.applicationContext.getSharedPreferences("scripts", Context.MODE_PRIVATE)
-
-              fun matches(pattern: String, url: String): Boolean {
-                  val p = pattern.trim()
-                  if (p.isEmpty() || p == "*") return true
-                  val re = p.split("*").joinToString(".*") { Regex.escape(it) }
-                  return Regex(re).matches(url)
-              }
 
               private val delegate = object : WebExtension.MessageDelegate {
                   override fun onMessage(
@@ -299,17 +965,31 @@ jobs:
                           when (m.optString("type")) {
                               "log" -> Log.d("GreyScript", "ext: " + m.optString("msg"))
                               "get" -> {
-                                  val sp = prefs(appCtx)
                                   val url = m.optString("url")
-                                  if (sp.getBoolean("enabled", true) &&
-                                      matches(sp.getString("match", "*") ?: "*", url)
-                                  ) {
-                                      reply.put("code", sp.getString("code", "") ?: "")
-                                      Log.d("GreyScript", "script matched: " + url)
-                                  } else {
-                                      Log.d("GreyScript", "no script for: " + url)
+                                  val arr = JSONArray()
+                                  for (s in Store.load()) {
+                                      if (!s.enabled) continue
+                                      val meta = parseMeta(s.code)
+                                      if (!applies(meta, url)) continue
+                                      val o = JSONObject()
+                                      o.put("id", s.id)
+                                      o.put("name", meta.name)
+                                      o.put("version", meta.version)
+                                      o.put("namespace", meta.namespace)
+                                      o.put("description", meta.description)
+                                      o.put("runAt", meta.runAt)
+                                      o.put("code", s.code)
+                                      o.put("requires", JSONArray(meta.requires))
+                                      o.put("grants", JSONArray(meta.grants))
+                                      o.put("matches", JSONArray(meta.matches + meta.includes))
+                                      o.put("values", Store.values(s.id))
+                                      arr.put(o)
                                   }
+                                  reply.put("scripts", arr)
+                                  Log.d("GreyScript", "scripts for " + url + ": " + arr.length())
                               }
+                              "setValue" -> Store.setValue(m.optString("sid"), m.optString("key"), m.optString("value"))
+                              "deleteValue" -> Store.deleteValue(m.optString("sid"), m.optString("key"))
                           }
                       } catch (e: Exception) {
                           Log.e("GreyScript", "delegate error", e)
@@ -348,6 +1028,7 @@ jobs:
                   super.onCreate(savedInstanceState)
                   enableEdgeToEdge()
                   val runtime = Gecko.runtime(this)
+                  Thread { Updater.autoCheck() }.start()
                   session = GeckoSession()
                   session.open(runtime)
                   session.loadUri("https://example.com")
@@ -390,6 +1071,14 @@ jobs:
           )
 
           @Composable
+          fun switchColors() = SwitchDefaults.colors(
+              checkedThumbColor = Color.White,
+              checkedTrackColor = Color(0xFF777777),
+              uncheckedThumbColor = Soft,
+              uncheckedTrackColor = Field
+          )
+
+          @Composable
           fun App(session: GeckoSession) {
               MaterialTheme(
                   colorScheme = darkColorScheme(
@@ -402,7 +1091,13 @@ jobs:
                   )
               ) {
                   var screen by remember { mutableStateOf("browser") }
-                  BackHandler(screen != "browser") { screen = "browser" }
+                  var editId by remember { mutableStateOf<String?>(null) }
+                  BackHandler(screen != "browser") {
+                      screen = when (screen) {
+                          "guide", "editor" -> "scripts"
+                          else -> "browser"
+                      }
+                  }
                   Column(
                       Modifier
                           .fillMaxSize()
@@ -412,11 +1107,17 @@ jobs:
                           .imePadding()
                   ) {
                       when (screen) {
-                          "script" -> ScriptScreen { screen = "browser" }
+                          "scripts" -> ScriptsScreen(
+                              onBack = { screen = "browser" },
+                              onEdit = { id -> editId = id; screen = "editor" },
+                              onGuide = { screen = "guide" }
+                          )
+                          "editor" -> EditorScreen(editId) { screen = "scripts" }
+                          "guide" -> GuideScreen { screen = "scripts" }
                           "logs" -> LogScreen { screen = "browser" }
                           else -> BrowserScreen(
                               session,
-                              onScript = { screen = "script" },
+                              onScripts = { screen = "scripts" },
                               onLogs = { screen = "logs" }
                           )
                       }
@@ -425,7 +1126,7 @@ jobs:
           }
 
           @Composable
-          fun BrowserScreen(session: GeckoSession, onScript: () -> Unit, onLogs: () -> Unit) {
+          fun BrowserScreen(session: GeckoSession, onScripts: () -> Unit, onLogs: () -> Unit) {
               var url by remember { mutableStateOf("https://example.com") }
               var menu by remember { mutableStateOf(false) }
               fun go() { session.loadUri(normalize(url)) }
@@ -458,8 +1159,8 @@ jobs:
                           modifier = Modifier.background(Bar)
                       ) {
                           DropdownMenuItem(
-                              text = { Text("Script", color = Color.White) },
-                              onClick = { menu = false; onScript() }
+                              text = { Text("Scripts", color = Color.White) },
+                              onClick = { menu = false; onScripts() }
                           )
                           DropdownMenuItem(
                               text = { Text("Logcat", color = Color.White) },
@@ -476,70 +1177,464 @@ jobs:
           }
 
           @Composable
-          fun ScriptScreen(onBack: () -> Unit) {
-              val ctx = LocalContext.current
-              val sp = remember { Gecko.prefs(ctx) }
-              var match by remember { mutableStateOf(sp.getString("match", "*") ?: "*") }
-              var code by remember { mutableStateOf(sp.getString("code", DEFAULT_CODE) ?: DEFAULT_CODE) }
-              var enabled by remember { mutableStateOf(sp.getBoolean("enabled", true)) }
-              var saved by remember { mutableStateOf(false) }
+          fun ScriptsScreen(onBack: () -> Unit, onEdit: (String?) -> Unit, onGuide: () -> Unit) {
+              val scope = rememberCoroutineScope()
+              var scripts by remember { mutableStateOf(Store.load()) }
+              var status by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+              var showImport by remember { mutableStateOf(false) }
+              fun reload() { scripts = Store.load() }
+              val updates = scripts.count { it.remoteVersion.isNotBlank() }
 
-              Column(
-                  Modifier.fillMaxSize().padding(10.dp).verticalScroll(rememberScrollState())
-              ) {
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                      TextButton(onClick = onBack) { Text("← Back", color = Color.White) }
-                      Text("Script", fontSize = 20.sp, color = Color.White)
-                  }
-                  Spacer(Modifier.height(8.dp))
-                  Text("Match pattern (* = all pages, e.g. *example.com*)", color = Color.White, fontSize = 13.sp)
-                  OutlinedTextField(
-                      value = match,
-                      onValueChange = { match = it; saved = false },
-                      modifier = Modifier.fillMaxWidth(),
-                      singleLine = true,
-                      colors = fieldColors()
-                  )
-                  Spacer(Modifier.height(8.dp))
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                      Switch(
-                          checked = enabled,
-                          onCheckedChange = { enabled = it; saved = false },
-                          colors = SwitchDefaults.colors(
-                              checkedThumbColor = Color.White,
-                              checkedTrackColor = Color(0xFF777777),
-                              uncheckedThumbColor = Color(0xFFAAAAAA),
-                              uncheckedTrackColor = Field
-                          )
-                      )
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Scripts", color = Color.White, fontSize = 18.sp)
                       Spacer(Modifier.width(8.dp))
-                      Text("Enabled", color = Color.White)
+                      Box(
+                          Modifier
+                              .size(24.dp)
+                              .border(1.dp, Color(0xFF888888), CircleShape)
+                              .clickable { onGuide() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text("?", color = Color.White, fontSize = 14.sp)
+                      }
+                      Spacer(Modifier.weight(1f))
+                      TextButton(onClick = { showImport = true }) { Text("Import", color = Color.White) }
+                      TextButton(onClick = { onEdit(null) }) { Text("New", color = Color.White) }
                   }
-                  Spacer(Modifier.height(8.dp))
-                  Text("JavaScript", color = Color.White, fontSize = 13.sp)
-                  OutlinedTextField(
-                      value = code,
-                      onValueChange = { code = it; saved = false },
-                      modifier = Modifier.fillMaxWidth(),
-                      minLines = 10,
-                      textStyle = androidx.compose.ui.text.TextStyle(
-                          fontFamily = FontFamily.Monospace,
-                          fontSize = 13.sp
-                      ),
-                      colors = fieldColors()
+                  Row(
+                      Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text(
+                          scripts.size.toString() + " scripts · " + scripts.count { it.enabled } + " enabled",
+                          color = Soft,
+                          fontSize = 12.sp,
+                          modifier = Modifier.weight(1f)
+                      )
+                      TextButton(onClick = {
+                          if (!busy) {
+                              busy = true
+                              status = "Checking…"
+                              scope.launch {
+                                  val n = withContext(Dispatchers.IO) { Updater.checkAll() }
+                                  reload()
+                                  busy = false
+                                  status = if (n == 0) "All scripts are up to date" else n.toString() + " update(s) available"
+                              }
+                          }
+                      }) { Text("Check updates", color = Color.White, fontSize = 12.sp) }
+                      if (updates > 0) {
+                          TextButton(onClick = {
+                              if (!busy) {
+                                  busy = true
+                                  status = "Updating…"
+                                  scope.launch {
+                                      val n = withContext(Dispatchers.IO) { Updater.applyAll() }
+                                      reload()
+                                      busy = false
+                                      status = n.toString() + " script(s) updated"
+                                  }
+                              }
+                          }) { Text("Update all", color = Color.White, fontSize = 12.sp) }
+                      }
+                  }
+                  if (status.isNotBlank()) {
+                      Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
+                  }
+                  if (scripts.isEmpty()) {
+                      Text(
+                          "No scripts yet. Tap New to start from a template, or tap ? for a guide you can give to an AI.",
+                          color = Soft,
+                          fontSize = 13.sp,
+                          modifier = Modifier.padding(12.dp)
+                      )
+                  }
+                  LazyColumn(Modifier.weight(1f)) {
+                      items(scripts, key = { it.id }) { s ->
+                          ScriptRow(
+                              s,
+                              onClick = { onEdit(s.id) },
+                              onToggle = { v -> Store.setEnabled(s.id, v); reload() }
+                          )
+                      }
+                  }
+              }
+              if (showImport) {
+                  ImportDialog(
+                      onDismiss = { showImport = false },
+                      onImported = { name ->
+                          showImport = false
+                          reload()
+                          status = "Imported " + name
+                      }
                   )
-                  Spacer(Modifier.height(10.dp))
-                  Button(onClick = {
-                      sp.edit()
-                          .putString("match", match)
-                          .putString("code", code)
-                          .putBoolean("enabled", enabled)
-                          .apply()
-                      saved = true
-                  }) { Text("Save") }
-                  if (saved) {
+              }
+          }
+
+          @Composable
+          fun ScriptRow(s: Script, onClick: () -> Unit, onToggle: (Boolean) -> Unit) {
+              val m = remember(s.code) { parseMeta(s.code) }
+              val pat = (m.matches + m.includes).firstOrNull() ?: "no @match, won't run"
+              val sub = (if (m.version.isNotBlank()) "v" + m.version + " · " else "") + pat
+              Row(
+                  Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 12.dp, vertical = 10.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Column(Modifier.weight(1f)) {
+                      Text(
+                          m.name,
+                          color = if (s.enabled) Color.White else Color(0xFF888888),
+                          fontSize = 14.sp,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text(
+                              sub,
+                              color = Soft,
+                              fontSize = 12.sp,
+                              maxLines = 1,
+                              overflow = TextOverflow.Ellipsis,
+                              modifier = Modifier.weight(1f, fill = false)
+                          )
+                          if (s.remoteVersion.isNotBlank()) {
+                              Spacer(Modifier.width(6.dp))
+                              Text(
+                                  "update " + s.remoteVersion,
+                                  color = Color.White,
+                                  fontSize = 11.sp,
+                                  modifier = Modifier
+                                      .border(0.5.dp, Color(0xFF888888), RoundedCornerShape(6.dp))
+                                      .padding(horizontal = 6.dp, vertical = 1.dp)
+                              )
+                          }
+                      }
+                  }
+                  Switch(checked = s.enabled, onCheckedChange = onToggle, colors = switchColors())
+              }
+              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+          }
+
+          @Composable
+          fun ImportDialog(onDismiss: () -> Unit, onImported: (String) -> Unit) {
+              val scope = rememberCoroutineScope()
+              var url by remember { mutableStateOf("") }
+              var err by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+              AlertDialog(
+                  onDismissRequest = { if (!busy) onDismiss() },
+                  containerColor = Bar,
+                  title = { Text("Import from URL", color = Color.White) },
+                  text = {
+                      Column {
+                          OutlinedTextField(
+                              value = url,
+                              onValueChange = { url = it; err = "" },
+                              singleLine = true,
+                              colors = fieldColors(),
+                              placeholder = { Text("https://site.com/script.user.js", color = Color(0xFF999999)) }
+                          )
+                          if (err.isNotBlank()) {
+                              Text(err, color = Danger, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = {
+                          val u = url.trim()
+                          if (u.isNotEmpty() && !busy) {
+                              busy = true
+                              err = "Downloading…"
+                              scope.launch {
+                                  val r = withContext(Dispatchers.IO) {
+                                      try { httpGet(u) } catch (e: Exception) { "ERR:" + e.message }
+                                  }
+                                  if (r.startsWith("ERR:")) {
+                                      err = r.substring(4)
+                                      busy = false
+                                  } else if (!r.contains("==UserScript==")) {
+                                      err = "No ==UserScript== header found"
+                                      busy = false
+                                  } else {
+                                      val l = Store.load()
+                                      l.add(Script(Store.newId(), r, true, u, ""))
+                                      Store.save(l)
+                                      busy = false
+                                      onImported(parseMeta(r).name)
+                                  }
+                              }
+                          }
+                      }) { Text("Import", color = Color.White) }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = { if (!busy) onDismiss() }) { Text("Cancel", color = Color.White) }
+                  }
+              )
+          }
+
+          @Composable
+          fun InfoChip(t: String) {
+              Text(
+                  t,
+                  color = Color(0xFFDDDDDD),
+                  fontSize = 11.sp,
+                  fontFamily = FontFamily.Monospace,
+                  modifier = Modifier
+                      .background(Field, RoundedCornerShape(6.dp))
+                      .padding(horizontal = 8.dp, vertical = 3.dp)
+              )
+          }
+
+          @Composable
+          fun EditorScreen(id: String?, onBack: () -> Unit) {
+              val scope = rememberCoroutineScope()
+              val existing = remember { if (id == null) null else Store.load().firstOrNull { it.id == id } }
+              var curId by remember { mutableStateOf(existing?.id) }
+              var code by remember { mutableStateOf(existing?.code ?: NEW_TEMPLATE) }
+              var enabled by remember { mutableStateOf(existing?.enabled ?: true) }
+              var srcUrl by remember { mutableStateOf(existing?.sourceUrl ?: "") }
+              var remoteVer by remember { mutableStateOf(existing?.remoteVersion ?: "") }
+              var savedCode by remember { mutableStateOf(existing?.code ?: NEW_TEMPLATE) }
+              var savedEnabled by remember { mutableStateOf(existing?.enabled ?: true) }
+              var savedSrc by remember { mutableStateOf(existing?.sourceUrl ?: "") }
+              var status by remember { mutableStateOf("") }
+              var showDiscard by remember { mutableStateOf(false) }
+              var showDelete by remember { mutableStateOf(false) }
+              val meta = remember(code) { parseMeta(code) }
+              val dirty = code != savedCode || enabled != savedEnabled || srcUrl != savedSrc
+
+              BackHandler(dirty) { showDiscard = true }
+
+              fun save() {
+                  val list = Store.load()
+                  val sid = curId
+                  val target = if (sid == null) null else list.firstOrNull { it.id == sid }
+                  if (target == null) {
+                      val s = Script(sid ?: Store.newId(), code, enabled, srcUrl, remoteVer)
+                      list.add(s)
+                      curId = s.id
+                  } else {
+                      target.code = code
+                      target.enabled = enabled
+                      target.sourceUrl = srcUrl
+                      target.remoteVersion = remoteVer
+                  }
+                  Store.save(list)
+                  savedCode = code
+                  savedEnabled = enabled
+                  savedSrc = srcUrl
+                  status = "Saved. Reload the page to run it."
+              }
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      TextButton(onClick = { if (dirty) showDiscard = true else onBack() }) {
+                          Text("←", color = Color.White, fontSize = 20.sp)
+                      }
+                      Text(
+                          if (curId == null) "New script" else "Edit script",
+                          color = Color.White,
+                          fontSize = 18.sp,
+                          modifier = Modifier.weight(1f)
+                      )
+                      Button(onClick = { save() }) { Text("Save") }
+                      Spacer(Modifier.width(6.dp))
+                  }
+                  Column(
+                      Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)
+                  ) {
+                      Text("Parsed from header", color = Color(0xFF888888), fontSize = 11.sp)
                       Spacer(Modifier.height(6.dp))
-                      Text("Saved. Reload the page to run it.", color = Color(0xFFBBBBBB), fontSize = 13.sp)
+                      Row(Modifier.horizontalScroll(rememberScrollState())) {
+                          InfoChip(meta.name)
+                          if (meta.version.isNotBlank()) { Spacer(Modifier.width(6.dp)); InfoChip("v" + meta.version) }
+                          Spacer(Modifier.width(6.dp))
+                          InfoChip((meta.matches.size + meta.includes.size).toString() + " match")
+                          Spacer(Modifier.width(6.dp))
+                          InfoChip("run-at " + meta.runAt.removePrefix("document-"))
+                          if (meta.excludes.isNotEmpty()) { Spacer(Modifier.width(6.dp)); InfoChip(meta.excludes.size.toString() + " exclude") }
+                          if (meta.requires.isNotEmpty()) { Spacer(Modifier.width(6.dp)); InfoChip(meta.requires.size.toString() + " require") }
+                      }
+                      if (meta.matches.isEmpty() && meta.includes.isEmpty()) {
+                          Text(
+                              "No @match or @include: this script will never run.",
+                              color = Danger,
+                              fontSize = 12.sp,
+                              modifier = Modifier.padding(top = 6.dp)
+                          )
+                      }
+                      Spacer(Modifier.height(10.dp))
+                      OutlinedTextField(
+                          value = code,
+                          onValueChange = { code = it },
+                          modifier = Modifier.fillMaxWidth(),
+                          minLines = 12,
+                          textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
+                          colors = fieldColors()
+                      )
+                      Spacer(Modifier.height(10.dp))
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text("Enabled", color = Color.White, modifier = Modifier.weight(1f))
+                          Switch(checked = enabled, onCheckedChange = { enabled = it }, colors = switchColors())
+                      }
+                      Spacer(Modifier.height(10.dp))
+                      Text("Update URL (used if the header has no @updateURL or @downloadURL)", color = Color(0xFF888888), fontSize = 11.sp)
+                      Spacer(Modifier.height(6.dp))
+                      OutlinedTextField(
+                          value = srcUrl,
+                          onValueChange = { srcUrl = it },
+                          modifier = Modifier.fillMaxWidth(),
+                          singleLine = true,
+                          textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
+                          colors = fieldColors()
+                      )
+                      Spacer(Modifier.height(8.dp))
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Button(onClick = {
+                              val u = checkUrlFor(meta, srcUrl)
+                              if (u.isBlank()) {
+                                  status = "Add an update URL first"
+                              } else {
+                                  status = "Checking…"
+                                  scope.launch {
+                                      val r = withContext(Dispatchers.IO) {
+                                          try { httpGet(u) } catch (e: Exception) { "ERR:" + e.message }
+                                      }
+                                      if (r.startsWith("ERR:")) {
+                                          status = r.substring(4)
+                                      } else {
+                                          val rv = parseMeta(r).version
+                                          if (rv.isNotBlank() && compareVersions(rv, meta.version) > 0) {
+                                              remoteVer = rv
+                                              status = "Update " + rv + " available"
+                                          } else {
+                                              remoteVer = ""
+                                              status = "Up to date"
+                                          }
+                                      }
+                                  }
+                              }
+                          }) { Text("Check") }
+                          if (remoteVer.isNotBlank()) {
+                              Spacer(Modifier.width(8.dp))
+                              Button(onClick = {
+                                  val u = applyUrlFor(meta, srcUrl)
+                                  if (u.isBlank()) {
+                                      status = "No update URL"
+                                  } else {
+                                      status = "Downloading…"
+                                      scope.launch {
+                                          val r = withContext(Dispatchers.IO) {
+                                              try { httpGet(u) } catch (e: Exception) { "ERR:" + e.message }
+                                          }
+                                          if (r.startsWith("ERR:")) {
+                                              status = r.substring(4)
+                                          } else if (!r.contains("==UserScript==")) {
+                                              status = "Downloaded file has no script header"
+                                          } else {
+                                              code = r
+                                              remoteVer = ""
+                                              save()
+                                              status = "Updated to v" + parseMeta(r).version
+                                          }
+                                      }
+                                  }
+                              }) { Text("Update to v" + remoteVer) }
+                          }
+                      }
+                      if (status.isNotBlank()) {
+                          Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+                      }
+                      if (curId != null) {
+                          Text(
+                              "Delete script",
+                              color = Danger,
+                              fontSize = 14.sp,
+                              modifier = Modifier
+                                  .padding(top = 20.dp, bottom = 12.dp)
+                                  .clickable { showDelete = true }
+                          )
+                      }
+                  }
+              }
+              if (showDiscard) {
+                  AlertDialog(
+                      onDismissRequest = { showDiscard = false },
+                      containerColor = Bar,
+                      title = { Text("Discard changes?", color = Color.White) },
+                      text = { Text("You have unsaved changes.", color = Soft) },
+                      confirmButton = {
+                          TextButton(onClick = { showDiscard = false; onBack() }) { Text("Discard", color = Danger) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { showDiscard = false }) { Text("Keep editing", color = Color.White) }
+                      }
+                  )
+              }
+              if (showDelete) {
+                  AlertDialog(
+                      onDismissRequest = { showDelete = false },
+                      containerColor = Bar,
+                      title = { Text("Delete script?", color = Color.White) },
+                      text = { Text(meta.name, color = Soft) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              showDelete = false
+                              val sid = curId
+                              if (sid != null) Store.remove(sid)
+                              onBack()
+                          }) { Text("Delete", color = Danger) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { showDelete = false }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
+              }
+          }
+
+          @Composable
+          fun GuideScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              var copied by remember { mutableStateOf(false) }
+              LaunchedEffect(copied) {
+                  if (copied) {
+                      delay(1500)
+                      copied = false
+                  }
+              }
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Script guide", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                      Button(onClick = {
+                          val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("GreyGecko script guide", GUIDE))
+                          copied = true
+                      }) { Text(if (copied) "Copied" else "Copy for AI") }
+                      Spacer(Modifier.width(6.dp))
+                  }
+                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
+                      Text(
+                          "Copy this and paste it into your AI chat, then describe the script you want.",
+                          color = Color(0xFFBBBBBB),
+                          fontSize = 13.sp
+                      )
+                      Spacer(Modifier.height(10.dp))
+                      SelectionContainer {
+                          Text(GUIDE, color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 11.5.sp)
+                      }
                   }
               }
           }
@@ -549,7 +1644,7 @@ jobs:
               val ctx = LocalContext.current
               val scope = rememberCoroutineScope()
               var raw by remember { mutableStateOf("Loading...") }
-              var filter by remember { mutableStateOf("") }
+              var filter by remember { mutableStateOf("GreyScript") }
               val scroll = rememberScrollState()
 
               fun refresh() {
@@ -567,7 +1662,7 @@ jobs:
 
               Column(Modifier.fillMaxSize().padding(10.dp)) {
                   Row(verticalAlignment = Alignment.CenterVertically) {
-                      TextButton(onClick = onBack) { Text("← Back", color = Color.White) }
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Spacer(Modifier.weight(1f))
                       Button(onClick = { refresh() }) { Text("Refresh") }
                       Spacer(Modifier.width(8.dp))
