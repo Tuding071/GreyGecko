@@ -1,0 +1,605 @@
+name: Build GreyGecko
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Resolve latest GeckoView
+        run: |
+          META=$(curl -fsSL https://maven.mozilla.org/maven2/org/mozilla/geckoview/geckoview-arm64-v8a/maven-metadata.xml)
+          VER=$(echo "$META" | grep -oP '(?<=<release>)[^<]+' | head -1 || true)
+          if [ -z "$VER" ]; then
+            VER=$(echo "$META" | grep -oP '(?<=<latest>)[^<]+' | head -1 || true)
+          fi
+          if [ -z "$VER" ]; then
+            echo "Could not resolve GeckoView version"; exit 1
+          fi
+          echo "GECKO_VERSION=$VER" >> $GITHUB_ENV
+          echo "Using GeckoView $VER"
+
+      - name: Test keystore cache
+        id: ks
+        uses: actions/cache@v4
+        with:
+          path: keystore
+          key: test-keystore-v1
+
+      - name: Create test keystore
+        if: steps.ks.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p keystore
+          keytool -genkeypair -keystore keystore/test.jks -storepass testkey123 \
+            -keypass testkey123 -alias test -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Test, O=Test, C=PH"
+
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/grey/gecko app/src/main/assets/ext
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://maven.mozilla.org/maven2/") }
+              }
+          }
+          rootProject.name = "GreyGecko"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.1.0" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.grey.gecko"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.grey.gecko"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              signingConfigs {
+                  create("test") {
+                      storeFile = file(System.getenv("KEYSTORE_PATH"))
+                      storePassword = "testkey123"
+                      keyAlias = "test"
+                      keyPassword = "testkey123"
+                  }
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("test")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+
+          dependencies {
+              implementation("org.mozilla.geckoview:geckoview-arm64-v8a:${System.getenv("GECKO_VERSION")}")
+              implementation(platform("androidx.compose:compose-bom:2025.01.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.core:core-ktx:1.15.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="GreyGecko"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/assets/ext/manifest.json <<'EOF'
+          {
+            "manifest_version": 2,
+            "name": "GreyScripts",
+            "version": "1.0",
+            "browser_specific_settings": { "gecko": { "id": "scripts@grey.gecko" } },
+            "background": { "scripts": ["background.js"] },
+            "content_scripts": [
+              {
+                "matches": ["<all_urls>"],
+                "js": ["content.js"],
+                "run_at": "document_start"
+              }
+            ],
+            "permissions": ["nativeMessaging", "geckoViewAddons", "tabs", "<all_urls>"]
+          }
+          EOF
+
+          cat > app/src/main/assets/ext/content.js <<'EOF'
+          browser.runtime.sendMessage({ type: "page", url: location.href }).then(function (r) {
+            if (r && r.fallback && r.code) {
+              var s = document.createElement("script");
+              s.textContent = r.code;
+              document.documentElement.appendChild(s);
+              s.remove();
+            }
+          }).catch(function (e) { console.log("GreyScript content error: " + e); });
+          EOF
+
+          cat > app/src/main/assets/ext/background.js <<'EOF'
+          var APP = "browser";
+          function log(m) {
+            try { browser.runtime.sendNativeMessage(APP, { type: "log", msg: String(m) }); } catch (e) {}
+          }
+          browser.runtime.onMessage.addListener(function (msg, sender) {
+            if (!msg || msg.type !== "page") return;
+            return browser.runtime.sendNativeMessage(APP, { type: "get", url: msg.url }).then(function (res) {
+              if (!res || !res.code) { log("no code for " + msg.url); return {}; }
+              if (!sender.tab) { log("no sender.tab, using fallback"); return { fallback: true, code: res.code }; }
+              return browser.tabs.executeScript(sender.tab.id, {
+                code: res.code,
+                runAt: "document_start",
+                frameId: sender.frameId || 0
+              }).then(function () {
+                log("injected into " + msg.url);
+                return {};
+              }, function (e) {
+                log("executeScript failed: " + e + " -> fallback");
+                return { fallback: true, code: res.code };
+              });
+            }).catch(function (e) { log("native error: " + e); return {}; });
+          });
+          log("background started");
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/MainActivity.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.os.Bundle
+          import android.util.Log
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONObject
+          import org.mozilla.geckoview.GeckoResult
+          import org.mozilla.geckoview.GeckoRuntime
+          import org.mozilla.geckoview.GeckoSession
+          import org.mozilla.geckoview.GeckoView
+          import org.mozilla.geckoview.WebExtension
+
+          val BG = Color(0xFF1E1E1E)
+          val Bar = Color(0xFF2A2A2A)
+          val Field = Color(0xFF3A3A3A)
+          val Btn = Color(0xFF4A4A4A)
+
+          const val DEFAULT_CODE =
+              "document.documentElement.style.outline = '8px solid red';\n" +
+              "console.log('GreyScript: user script ran on ' + location.href);"
+
+          object Gecko {
+              private var rt: GeckoRuntime? = null
+              lateinit var appCtx: Context
+
+              fun prefs(c: Context): SharedPreferences =
+                  c.applicationContext.getSharedPreferences("scripts", Context.MODE_PRIVATE)
+
+              fun matches(pattern: String, url: String): Boolean {
+                  val p = pattern.trim()
+                  if (p.isEmpty() || p == "*") return true
+                  val re = p.split("*").joinToString(".*") { Regex.escape(it) }
+                  return Regex(re).matches(url)
+              }
+
+              private val delegate = object : WebExtension.MessageDelegate {
+                  override fun onMessage(
+                      nativeApp: String,
+                      message: Any,
+                      sender: WebExtension.MessageSender
+                  ): GeckoResult<Any>? {
+                      val reply = JSONObject()
+                      try {
+                          val m = message as JSONObject
+                          when (m.optString("type")) {
+                              "log" -> Log.d("GreyScript", "ext: " + m.optString("msg"))
+                              "get" -> {
+                                  val sp = prefs(appCtx)
+                                  val url = m.optString("url")
+                                  if (sp.getBoolean("enabled", true) &&
+                                      matches(sp.getString("match", "*") ?: "*", url)
+                                  ) {
+                                      reply.put("code", sp.getString("code", "") ?: "")
+                                      Log.d("GreyScript", "script matched: " + url)
+                                  } else {
+                                      Log.d("GreyScript", "no script for: " + url)
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          Log.e("GreyScript", "delegate error", e)
+                      }
+                      return GeckoResult.fromValue<Any>(reply)
+                  }
+              }
+
+              @Synchronized
+              fun runtime(ctx: Context): GeckoRuntime {
+                  rt?.let { return it }
+                  appCtx = ctx.applicationContext
+                  val r = GeckoRuntime.create(appCtx)
+                  rt = r
+                  r.webExtensionController
+                      .ensureBuiltIn("resource://android/assets/ext/", "scripts@grey.gecko")
+                      .accept(
+                          { ext ->
+                              if (ext != null) {
+                                  ext.setMessageDelegate(delegate, "browser")
+                                  Log.d("GreyScript", "extension installed: " + ext.id)
+                              } else {
+                                  Log.e("GreyScript", "extension install returned null")
+                              }
+                          },
+                          { e -> Log.e("GreyScript", "extension install failed", e) }
+                      )
+                  return r
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              private lateinit var session: GeckoSession
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  val runtime = Gecko.runtime(this)
+                  session = GeckoSession()
+                  session.open(runtime)
+                  session.loadUri("https://example.com")
+                  setContent { App(session) }
+              }
+
+              override fun onDestroy() {
+                  session.close()
+                  super.onDestroy()
+              }
+          }
+
+          fun normalize(s: String): String {
+              val t = s.trim()
+              return when {
+                  t.startsWith("http://") || t.startsWith("https://") ||
+                      t.startsWith("about:") || t.startsWith("file:") -> t
+                  t.contains(" ") || !t.contains(".") ->
+                      "https://duckduckgo.com/?q=" + java.net.URLEncoder.encode(t, "UTF-8")
+                  else -> "https://" + t
+              }
+          }
+
+          fun readLogcat(): String = try {
+              val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "-t", "2000"))
+              p.inputStream.bufferedReader().readText()
+          } catch (e: Exception) {
+              "logcat error: " + e
+          }
+
+          @Composable
+          fun fieldColors() = OutlinedTextFieldDefaults.colors(
+              focusedContainerColor = Field,
+              unfocusedContainerColor = Field,
+              focusedTextColor = Color.White,
+              unfocusedTextColor = Color.White,
+              focusedBorderColor = Color(0xFF888888),
+              unfocusedBorderColor = Color(0xFF555555),
+              cursorColor = Color.White
+          )
+
+          @Composable
+          fun App(session: GeckoSession) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = Btn,
+                      onPrimary = Color.White,
+                      background = BG,
+                      onBackground = Color.White,
+                      surface = Bar,
+                      onSurface = Color.White
+                  )
+              ) {
+                  var screen by remember { mutableStateOf("browser") }
+                  BackHandler(screen != "browser") { screen = "browser" }
+                  Column(
+                      Modifier
+                          .fillMaxSize()
+                          .background(BG)
+                          .statusBarsPadding()
+                          .navigationBarsPadding()
+                          .imePadding()
+                  ) {
+                      when (screen) {
+                          "script" -> ScriptScreen { screen = "browser" }
+                          "logs" -> LogScreen { screen = "browser" }
+                          else -> BrowserScreen(
+                              session,
+                              onScript = { screen = "script" },
+                              onLogs = { screen = "logs" }
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun BrowserScreen(session: GeckoSession, onScript: () -> Unit, onLogs: () -> Unit) {
+              var url by remember { mutableStateOf("https://example.com") }
+              var menu by remember { mutableStateOf(false) }
+              fun go() { session.loadUri(normalize(url)) }
+
+              Row(
+                  Modifier.fillMaxWidth().background(Bar).padding(6.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  OutlinedTextField(
+                      value = url,
+                      onValueChange = { url = it },
+                      modifier = Modifier.weight(1f),
+                      singleLine = true,
+                      colors = fieldColors(),
+                      keyboardOptions = KeyboardOptions(
+                          keyboardType = KeyboardType.Uri,
+                          imeAction = ImeAction.Go
+                      ),
+                      keyboardActions = KeyboardActions(onGo = { go() })
+                  )
+                  Spacer(Modifier.width(6.dp))
+                  Button(onClick = { go() }) { Text("Go") }
+                  Box {
+                      TextButton(onClick = { menu = true }) {
+                          Text("⋮", fontSize = 22.sp, color = Color.White)
+                      }
+                      DropdownMenu(
+                          expanded = menu,
+                          onDismissRequest = { menu = false },
+                          modifier = Modifier.background(Bar)
+                      ) {
+                          DropdownMenuItem(
+                              text = { Text("Script", color = Color.White) },
+                              onClick = { menu = false; onScript() }
+                          )
+                          DropdownMenuItem(
+                              text = { Text("Logcat", color = Color.White) },
+                              onClick = { menu = false; onLogs() }
+                          )
+                      }
+                  }
+              }
+              AndroidView(
+                  factory = { ctx -> GeckoView(ctx).also { it.setSession(session) } },
+                  onRelease = { it.releaseSession() },
+                  modifier = Modifier.fillMaxSize()
+              )
+          }
+
+          @Composable
+          fun ScriptScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val sp = remember { Gecko.prefs(ctx) }
+              var match by remember { mutableStateOf(sp.getString("match", "*") ?: "*") }
+              var code by remember { mutableStateOf(sp.getString("code", DEFAULT_CODE) ?: DEFAULT_CODE) }
+              var enabled by remember { mutableStateOf(sp.getBoolean("enabled", true)) }
+              var saved by remember { mutableStateOf(false) }
+
+              Column(
+                  Modifier.fillMaxSize().padding(10.dp).verticalScroll(rememberScrollState())
+              ) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      TextButton(onClick = onBack) { Text("← Back", color = Color.White) }
+                      Text("Script", fontSize = 20.sp, color = Color.White)
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  Text("Match pattern (* = all pages, e.g. *example.com*)", color = Color.White, fontSize = 13.sp)
+                  OutlinedTextField(
+                      value = match,
+                      onValueChange = { match = it; saved = false },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      colors = fieldColors()
+                  )
+                  Spacer(Modifier.height(8.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Switch(
+                          checked = enabled,
+                          onCheckedChange = { enabled = it; saved = false },
+                          colors = SwitchDefaults.colors(
+                              checkedThumbColor = Color.White,
+                              checkedTrackColor = Color(0xFF777777),
+                              uncheckedThumbColor = Color(0xFFAAAAAA),
+                              uncheckedTrackColor = Field
+                          )
+                      )
+                      Spacer(Modifier.width(8.dp))
+                      Text("Enabled", color = Color.White)
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  Text("JavaScript", color = Color.White, fontSize = 13.sp)
+                  OutlinedTextField(
+                      value = code,
+                      onValueChange = { code = it; saved = false },
+                      modifier = Modifier.fillMaxWidth(),
+                      minLines = 10,
+                      textStyle = androidx.compose.ui.text.TextStyle(
+                          fontFamily = FontFamily.Monospace,
+                          fontSize = 13.sp
+                      ),
+                      colors = fieldColors()
+                  )
+                  Spacer(Modifier.height(10.dp))
+                  Button(onClick = {
+                      sp.edit()
+                          .putString("match", match)
+                          .putString("code", code)
+                          .putBoolean("enabled", enabled)
+                          .apply()
+                      saved = true
+                  }) { Text("Save") }
+                  if (saved) {
+                      Spacer(Modifier.height(6.dp))
+                      Text("Saved. Reload the page to run it.", color = Color(0xFFBBBBBB), fontSize = 13.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun LogScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var raw by remember { mutableStateOf("Loading...") }
+              var filter by remember { mutableStateOf("") }
+              val scroll = rememberScrollState()
+
+              fun refresh() {
+                  scope.launch { raw = withContext(Dispatchers.IO) { readLogcat() } }
+              }
+              LaunchedEffect(Unit) { refresh() }
+
+              val shown = remember(raw, filter) {
+                  raw.lines().filter { filter.isBlank() || it.contains(filter, true) }.joinToString("\n")
+              }
+              LaunchedEffect(shown) {
+                  delay(150)
+                  scroll.scrollTo(scroll.maxValue)
+              }
+
+              Column(Modifier.fillMaxSize().padding(10.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      TextButton(onClick = onBack) { Text("← Back", color = Color.White) }
+                      Spacer(Modifier.weight(1f))
+                      Button(onClick = { refresh() }) { Text("Refresh") }
+                      Spacer(Modifier.width(8.dp))
+                      Button(onClick = {
+                          val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("logcat", shown))
+                      }) { Text("Copy") }
+                  }
+                  OutlinedTextField(
+                      value = filter,
+                      onValueChange = { filter = it },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      placeholder = { Text("Filter (e.g. GreyScript)", color = Color(0xFF999999)) },
+                      colors = fieldColors()
+                  )
+                  Spacer(Modifier.height(6.dp))
+                  Box(
+                      Modifier
+                          .fillMaxSize()
+                          .background(Field)
+                          .padding(6.dp)
+                          .verticalScroll(scroll)
+                  ) {
+                      SelectionContainer {
+                          Text(
+                              shown,
+                              color = Color.White,
+                              fontFamily = FontFamily.Monospace,
+                              fontSize = 11.sp
+                          )
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/keystore/test.jks
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GreyGecko
+          path: app/build/outputs/apk/release/*.apk
