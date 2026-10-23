@@ -134,6 +134,7 @@ jobs:
               implementation("org.mozilla.geckoview:geckoview-arm64-v8a:${System.getenv("GECKO_VERSION")}")
               implementation(platform("androidx.compose:compose-bom:2025.01.00"))
               implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.animation:animation")
               implementation("androidx.compose.material3:material3")
               implementation("androidx.activity:activity-compose:1.9.3")
               implementation("androidx.core:core-ktx:1.15.0")
@@ -886,6 +887,209 @@ jobs:
           """
           EOF
 
+          cat > app/src/main/java/com/grey/gecko/Browser.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.mozilla.geckoview.AllowOrDeny
+          import org.mozilla.geckoview.GeckoResult
+          import org.mozilla.geckoview.GeckoRuntime
+          import org.mozilla.geckoview.GeckoSession
+
+          class BrowserTab(val id: Int, val session: GeckoSession) {
+              var url by mutableStateOf("")
+              var title by mutableStateOf("")
+              var progress by mutableStateOf(0)
+              var loading by mutableStateOf(false)
+          }
+
+          fun shownUrl(t: BrowserTab?): String {
+              val u = t?.url ?: ""
+              return if (u == "about:blank") "" else u
+          }
+
+          class TabManager(private val runtime: GeckoRuntime) {
+              val tabs = mutableStateListOf<BrowserTab>()
+              var current by mutableStateOf<BrowserTab?>(null)
+              private var counter = 0
+
+              fun newTab(url: String, select: Boolean = true): BrowserTab {
+                  val s = GeckoSession()
+                  counter += 1
+                  val t = BrowserTab(counter, s)
+                  attach(t)
+                  s.open(runtime)
+                  tabs.add(t)
+                  if (select || current == null) current = t
+                  s.loadUri(url)
+                  return t
+              }
+
+              fun select(t: BrowserTab) {
+                  current = t
+              }
+
+              fun close(t: BrowserTab) {
+                  val i = tabs.indexOf(t)
+                  if (i < 0) return
+                  tabs.removeAt(i)
+                  if (tabs.isEmpty()) {
+                      newTab("about:blank", true)
+                  } else if (current === t) {
+                      current = tabs[minOf(i, tabs.size - 1)]
+                  }
+                  Handler(Looper.getMainLooper()).postDelayed({ t.session.close() }, 400)
+              }
+
+              fun closeAll() {
+                  for (t in tabs.toList()) {
+                      t.session.close()
+                  }
+                  tabs.clear()
+                  current = null
+              }
+
+              private fun attach(t: BrowserTab) {
+                  t.session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+                      override fun onLocationChange(
+                          session: GeckoSession,
+                          url: String?,
+                          perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
+                          hasUserGesture: Boolean
+                      ) {
+                          t.url = url ?: ""
+                      }
+
+                      override fun onLoadRequest(
+                          session: GeckoSession,
+                          request: GeckoSession.NavigationDelegate.LoadRequest
+                      ): GeckoResult<AllowOrDeny>? {
+                          if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
+                              newTab(request.uri, true)
+                              return GeckoResult.fromValue(AllowOrDeny.DENY)
+                          }
+                          return null
+                      }
+                  }
+                  t.session.progressDelegate = object : GeckoSession.ProgressDelegate {
+                      override fun onPageStart(session: GeckoSession, url: String) {
+                          t.loading = true
+                          t.progress = 8
+                          t.title = ""
+                          t.url = url
+                      }
+
+                      override fun onProgressChange(session: GeckoSession, progress: Int) {
+                          t.progress = maxOf(progress, 8)
+                          t.loading = progress < 100
+                      }
+
+                      override fun onPageStop(session: GeckoSession, success: Boolean) {
+                          t.loading = false
+                          t.progress = 0
+                          if (success) HistoryStore.add(t.url, t.title)
+                      }
+                  }
+                  t.session.contentDelegate = object : GeckoSession.ContentDelegate {
+                      override fun onTitleChange(session: GeckoSession, title: String?) {
+                          t.title = title ?: ""
+                          HistoryStore.setTitle(t.url, t.title)
+                      }
+                  }
+              }
+          }
+
+          class PageEntry(val url: String, val title: String, val time: Long)
+
+          private fun browserPrefs() =
+              Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+
+          private fun readEntries(key: String): MutableList<PageEntry> {
+              val out = mutableListOf<PageEntry>()
+              try {
+                  val arr = JSONArray(browserPrefs().getString(key, "[]") ?: "[]")
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      out.add(PageEntry(o.optString("u"), o.optString("t"), o.optLong("d")))
+                  }
+              } catch (e: Exception) {
+              }
+              return out
+          }
+
+          private fun writeEntries(key: String, list: List<PageEntry>) {
+              val arr = JSONArray()
+              for (e in list) {
+                  val o = JSONObject()
+                  o.put("u", e.url)
+                  o.put("t", e.title)
+                  o.put("d", e.time)
+                  arr.put(o)
+              }
+              browserPrefs().edit().putString(key, arr.toString()).apply()
+          }
+
+          object HistoryStore {
+              @Synchronized
+              fun load(): List<PageEntry> = readEntries("history")
+
+              @Synchronized
+              fun add(url: String, title: String) {
+                  if (url.isBlank() || url.startsWith("about:")) return
+                  val l = readEntries("history")
+                  if (l.isNotEmpty() && l[0].url == url) l.removeAt(0)
+                  l.add(0, PageEntry(url, title, System.currentTimeMillis()))
+                  while (l.size > 300) l.removeAt(l.size - 1)
+                  writeEntries("history", l)
+              }
+
+              @Synchronized
+              fun setTitle(url: String, title: String) {
+                  if (url.isBlank() || title.isBlank()) return
+                  val l = readEntries("history")
+                  val i = l.indexOfFirst { it.url == url }
+                  if (i >= 0) {
+                      l[i] = PageEntry(url, title, l[i].time)
+                      writeEntries("history", l)
+                  }
+              }
+
+              @Synchronized
+              fun clear() {
+                  writeEntries("history", emptyList())
+              }
+          }
+
+          object BookmarkStore {
+              @Synchronized
+              fun load(): List<PageEntry> = readEntries("bookmarks")
+
+              @Synchronized
+              fun add(url: String, title: String) {
+                  if (url.isBlank()) return
+                  val l = readEntries("bookmarks")
+                  l.removeAll { it.url == url }
+                  l.add(0, PageEntry(url, title, System.currentTimeMillis()))
+                  writeEntries("bookmarks", l)
+              }
+
+              @Synchronized
+              fun remove(url: String) {
+                  val l = readEntries("bookmarks")
+                  l.removeAll { it.url == url }
+                  writeEntries("bookmarks", l)
+              }
+          }
+          EOF
+
           cat > app/src/main/java/com/grey/gecko/MainActivity.kt <<'EOF'
           package com.grey.gecko
 
@@ -899,9 +1103,16 @@ jobs:
           import androidx.activity.compose.BackHandler
           import androidx.activity.compose.setContent
           import androidx.activity.enableEdgeToEdge
+          import androidx.compose.animation.AnimatedVisibility
+          import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.animation.fadeIn
+          import androidx.compose.animation.fadeOut
+          import androidx.compose.animation.slideInHorizontally
+          import androidx.compose.animation.slideOutHorizontally
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
@@ -909,6 +1120,7 @@ jobs:
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicTextField
           import androidx.compose.foundation.text.KeyboardActions
           import androidx.compose.foundation.text.KeyboardOptions
           import androidx.compose.foundation.text.selection.SelectionContainer
@@ -917,12 +1129,22 @@ jobs:
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.clipToBounds
+          import androidx.compose.ui.focus.FocusRequester
+          import androidx.compose.ui.focus.focusRequester
+          import androidx.compose.ui.focus.onFocusChanged
           import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalFocusManager
+          import androidx.compose.ui.text.TextRange
           import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.font.FontFamily
           import androidx.compose.ui.text.input.ImeAction
           import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.input.TextFieldValue
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
@@ -935,7 +1157,6 @@ jobs:
           import org.json.JSONObject
           import org.mozilla.geckoview.GeckoResult
           import org.mozilla.geckoview.GeckoRuntime
-          import org.mozilla.geckoview.GeckoSession
           import org.mozilla.geckoview.GeckoView
           import org.mozilla.geckoview.WebExtension
 
@@ -1022,21 +1243,20 @@ jobs:
           }
 
           class MainActivity : ComponentActivity() {
-              private lateinit var session: GeckoSession
+              private lateinit var tabs: TabManager
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   enableEdgeToEdge()
                   val runtime = Gecko.runtime(this)
                   Thread { Updater.autoCheck() }.start()
-                  session = GeckoSession()
-                  session.open(runtime)
-                  session.loadUri("https://example.com")
-                  setContent { App(session) }
+                  tabs = TabManager(runtime)
+                  tabs.newTab("https://example.com", true)
+                  setContent { App(tabs) }
               }
 
               override fun onDestroy() {
-                  session.close()
+                  tabs.closeAll()
                   super.onDestroy()
               }
           }
@@ -1079,7 +1299,7 @@ jobs:
           )
 
           @Composable
-          fun App(session: GeckoSession) {
+          fun App(tabs: TabManager) {
               MaterialTheme(
                   colorScheme = darkColorScheme(
                       primary = Btn,
@@ -1116,7 +1336,7 @@ jobs:
                           "guide" -> GuideScreen { screen = "scripts" }
                           "logs" -> LogScreen { screen = "browser" }
                           else -> BrowserScreen(
-                              session,
+                              tabs,
                               onScripts = { screen = "scripts" },
                               onLogs = { screen = "logs" }
                           )
@@ -1126,54 +1346,412 @@ jobs:
           }
 
           @Composable
-          fun BrowserScreen(session: GeckoSession, onScripts: () -> Unit, onLogs: () -> Unit) {
-              var url by remember { mutableStateOf("https://example.com") }
+          fun BrowserScreen(tabs: TabManager, onScripts: () -> Unit, onLogs: () -> Unit) {
+              val cur = tabs.current
               var menu by remember { mutableStateOf(false) }
-              fun go() { session.loadUri(normalize(url)) }
+              var sheetOpen by remember { mutableStateOf(false) }
+              var section by remember { mutableStateOf("tabs") }
+              var editing by remember { mutableStateOf(false) }
+              var text by remember { mutableStateOf(TextFieldValue("")) }
+              val focusManager = LocalFocusManager.current
 
-              Row(
-                  Modifier.fillMaxWidth().background(Bar).padding(6.dp),
-                  verticalAlignment = Alignment.CenterVertically
-              ) {
-                  OutlinedTextField(
-                      value = url,
-                      onValueChange = { url = it },
-                      modifier = Modifier.weight(1f),
-                      singleLine = true,
-                      colors = fieldColors(),
-                      keyboardOptions = KeyboardOptions(
-                          keyboardType = KeyboardType.Uri,
-                          imeAction = ImeAction.Go
-                      ),
-                      keyboardActions = KeyboardActions(onGo = { go() })
-                  )
-                  Spacer(Modifier.width(6.dp))
-                  Button(onClick = { go() }) { Text("Go") }
-                  Box {
-                      TextButton(onClick = { menu = true }) {
-                          Text("⋮", fontSize = 22.sp, color = Color.White)
-                      }
-                      DropdownMenu(
-                          expanded = menu,
-                          onDismissRequest = { menu = false },
-                          modifier = Modifier.background(Bar)
+              fun submit(raw: String) {
+                  val t = tabs.current
+                  if (raw.isNotBlank() && t != null) t.session.loadUri(normalize(raw))
+                  editing = false
+                  focusManager.clearFocus()
+              }
+
+              BackHandler(sheetOpen) { sheetOpen = false }
+
+              Box(Modifier.fillMaxSize()) {
+                  Column(Modifier.fillMaxSize()) {
+                      Row(
+                          Modifier.fillMaxWidth().background(Bar).padding(6.dp),
+                          verticalAlignment = Alignment.CenterVertically
                       ) {
-                          DropdownMenuItem(
-                              text = { Text("Scripts", color = Color.White) },
-                              onClick = { menu = false; onScripts() }
+                          Box(
+                              Modifier
+                                  .size(40.dp)
+                                  .clip(RoundedCornerShape(8.dp))
+                                  .background(Field)
+                                  .clickable {
+                                      section = "tabs"
+                                      sheetOpen = true
+                                  },
+                              contentAlignment = Alignment.Center
+                          ) {
+                              Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                  repeat(3) {
+                                      Box(Modifier.width(18.dp).height(2.dp).background(Color.White))
+                                  }
+                              }
+                          }
+                          Spacer(Modifier.width(6.dp))
+                          UrlBar(
+                              tab = cur,
+                              editing = editing,
+                              text = text,
+                              onText = { text = it },
+                              onStart = {
+                                  val u = shownUrl(tabs.current)
+                                  text = TextFieldValue(u, TextRange(0, u.length))
+                                  editing = true
+                              },
+                              onFocusLost = { editing = false },
+                              onSubmit = { submit(text.text) },
+                              modifier = Modifier.weight(1f)
                           )
-                          DropdownMenuItem(
-                              text = { Text("Logcat", color = Color.White) },
-                              onClick = { menu = false; onLogs() }
+                          if (editing) {
+                              Spacer(Modifier.width(6.dp))
+                              Button(onClick = { submit(text.text) }) { Text("Go") }
+                          }
+                          Box {
+                              TextButton(onClick = { menu = true }) {
+                                  Text("⋮", fontSize = 22.sp, color = Color.White)
+                              }
+                              DropdownMenu(
+                                  expanded = menu,
+                                  onDismissRequest = { menu = false },
+                                  modifier = Modifier.background(Bar)
+                              ) {
+                                  DropdownMenuItem(
+                                      text = { Text("Scripts", color = Color.White) },
+                                      onClick = { menu = false; onScripts() }
+                                  )
+                                  DropdownMenuItem(
+                                      text = { Text("Logcat", color = Color.White) },
+                                      onClick = { menu = false; onLogs() }
+                                  )
+                              }
+                          }
+                      }
+                      AndroidView(
+                          factory = { ctx -> GeckoView(ctx) },
+                          update = { v ->
+                              val s = cur?.session
+                              if (s != null && v.session !== s) v.setSession(s)
+                          },
+                          onRelease = { it.releaseSession() },
+                          modifier = Modifier.fillMaxSize()
+                      )
+                  }
+                  AnimatedVisibility(visible = sheetOpen, enter = fadeIn(), exit = fadeOut()) {
+                      Box(
+                          Modifier
+                              .fillMaxSize()
+                              .background(Color(0x99000000))
+                              .pointerInput(Unit) { detectTapGestures { sheetOpen = false } }
+                      )
+                  }
+                  AnimatedVisibility(
+                      visible = sheetOpen,
+                      enter = slideInHorizontally { -it },
+                      exit = slideOutHorizontally { -it }
+                  ) {
+                      SideSheet(
+                          tabs = tabs,
+                          section = section,
+                          onSection = { section = it },
+                          onClose = { sheetOpen = false },
+                          onSelect = { t ->
+                              tabs.select(t)
+                              editing = false
+                              sheetOpen = false
+                          },
+                          onNewTab = {
+                              tabs.newTab("about:blank", true)
+                              sheetOpen = false
+                              text = TextFieldValue("")
+                              editing = true
+                          },
+                          onOpenUrl = { u ->
+                              tabs.current?.session?.loadUri(u)
+                              sheetOpen = false
+                          }
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun UrlLabel(label: String, color: Color) {
+              Text(
+                  label,
+                  color = color,
+                  fontSize = 14.sp,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis,
+                  modifier = Modifier.padding(horizontal = 10.dp)
+              )
+          }
+
+          @Composable
+          fun UrlBar(
+              tab: BrowserTab?,
+              editing: Boolean,
+              text: TextFieldValue,
+              onText: (TextFieldValue) -> Unit,
+              onStart: () -> Unit,
+              onFocusLost: () -> Unit,
+              onSubmit: () -> Unit,
+              modifier: Modifier = Modifier
+          ) {
+              val shape = RoundedCornerShape(8.dp)
+              val url = shownUrl(tab)
+              val loading = tab?.loading ?: false
+              val fill by animateFloatAsState(targetValue = (tab?.progress ?: 0) / 100f, label = "urlProgress")
+              val focus = remember { FocusRequester() }
+              var hadFocus by remember { mutableStateOf(false) }
+
+              LaunchedEffect(editing) {
+                  if (editing) {
+                      hadFocus = false
+                      focus.requestFocus()
+                  }
+              }
+
+              Box(
+                  modifier
+                      .height(40.dp)
+                      .clip(shape)
+                      .background(Field)
+                      .border(0.5.dp, Color(0xFF555555), shape)
+              ) {
+                  if (editing) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                          BasicTextField(
+                              value = text,
+                              onValueChange = onText,
+                              singleLine = true,
+                              textStyle = TextStyle(color = Color.White, fontSize = 14.sp),
+                              cursorBrush = SolidColor(Color.White),
+                              keyboardOptions = KeyboardOptions(
+                                  keyboardType = KeyboardType.Uri,
+                                  imeAction = ImeAction.Go
+                              ),
+                              keyboardActions = KeyboardActions(onGo = { onSubmit() }),
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .padding(horizontal = 10.dp)
+                                  .focusRequester(focus)
+                                  .onFocusChanged { st ->
+                                      if (st.isFocused) {
+                                          hadFocus = true
+                                      } else if (hadFocus) {
+                                          onFocusLost()
+                                      }
+                                  }
                           )
+                      }
+                  } else {
+                      BoxWithConstraints(Modifier.fillMaxSize().clickable { onStart() }) {
+                          val w = maxWidth
+                          val label = if (url.isEmpty()) "Search or enter address" else url
+                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                              UrlLabel(label, if (url.isEmpty()) Soft else Color.White)
+                          }
+                          if (loading) {
+                              Box(
+                                  Modifier
+                                      .fillMaxHeight()
+                                      .width(w * fill)
+                                      .clipToBounds()
+                                      .background(Color.White)
+                              ) {
+                                  Box(
+                                      Modifier
+                                          .wrapContentWidth(Alignment.Start, unbounded = true)
+                                          .width(w)
+                                          .fillMaxHeight(),
+                                      contentAlignment = Alignment.CenterStart
+                                  ) {
+                                      UrlLabel(label, if (url.isEmpty()) Color(0xFF666666) else Color(0xFF2B2B2B))
+                                  }
+                              }
+                          }
                       }
                   }
               }
-              AndroidView(
-                  factory = { ctx -> GeckoView(ctx).also { it.setSession(session) } },
-                  onRelease = { it.releaseSession() },
-                  modifier = Modifier.fillMaxSize()
-              )
+          }
+
+          @Composable
+          fun SheetSection(
+              title: String,
+              count: String,
+              open: Boolean,
+              onClick: () -> Unit,
+              content: @Composable ColumnScope.() -> Unit
+          ) {
+              Column {
+                  Row(
+                      Modifier
+                          .fillMaxWidth()
+                          .background(if (open) Color(0xFF333333) else Color.Transparent)
+                          .clickable { onClick() }
+                          .padding(horizontal = 14.dp, vertical = 14.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text(title, color = Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                      if (count.isNotBlank()) {
+                          Text(count, color = Soft, fontSize = 11.sp)
+                          Spacer(Modifier.width(8.dp))
+                      }
+                      Text(if (open) "▴" else "▾", color = Soft, fontSize = 14.sp)
+                  }
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
+                  if (open) {
+                      Column(Modifier.fillMaxWidth().background(Color(0xFF232323)), content = content)
+                  }
+              }
+          }
+
+          @Composable
+          fun SheetRow(
+              title: String,
+              sub: String,
+              active: Boolean,
+              onClick: () -> Unit,
+              onRemove: (() -> Unit)?
+          ) {
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .background(if (active) Color(0xFF2D2D2D) else Color.Transparent)
+                      .clickable { onClick() }
+                      .padding(start = 14.dp, top = 9.dp, bottom = 9.dp, end = 6.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Column(Modifier.weight(1f)) {
+                      Text(title, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                      Text(sub, color = Soft, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+                  if (onRemove != null) {
+                      Text(
+                          "×",
+                          color = Soft,
+                          fontSize = 18.sp,
+                          modifier = Modifier
+                              .clickable { onRemove() }
+                              .padding(horizontal = 10.dp, vertical = 4.dp)
+                      )
+                  }
+              }
+              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF2F2F2F)))
+          }
+
+          @Composable
+          fun EmptyNote(msg: String) {
+              Text(msg, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(14.dp))
+          }
+
+          @Composable
+          fun SideSheet(
+              tabs: TabManager,
+              section: String,
+              onSection: (String) -> Unit,
+              onClose: () -> Unit,
+              onSelect: (BrowserTab) -> Unit,
+              onNewTab: () -> Unit,
+              onOpenUrl: (String) -> Unit
+          ) {
+              var hist by remember { mutableStateOf<List<PageEntry>>(HistoryStore.load()) }
+              var marks by remember { mutableStateOf<List<PageEntry>>(BookmarkStore.load()) }
+              val fmt = remember {
+                  java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
+              }
+              Column(
+                  Modifier
+                      .fillMaxHeight()
+                      .fillMaxWidth(0.78f)
+                      .background(Bar)
+                      .pointerInput(Unit) { detectTapGestures { } }
+              ) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(start = 14.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text("Menu", color = Color.White, fontSize = 16.sp, modifier = Modifier.weight(1f))
+                      TextButton(onClick = onClose) { Text("×", color = Soft, fontSize = 22.sp) }
+                  }
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
+                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                      SheetSection("History", "", section == "history", { onSection("history") }) {
+                          if (hist.isEmpty()) EmptyNote("No history yet.")
+                          for (e in hist.take(100)) {
+                              val host = android.net.Uri.parse(e.url).host ?: e.url
+                              SheetRow(
+                                  title = e.title.ifBlank { e.url },
+                                  sub = host + " · " + fmt.format(java.util.Date(e.time)),
+                                  active = false,
+                                  onClick = { onOpenUrl(e.url) },
+                                  onRemove = null
+                              )
+                          }
+                          if (hist.isNotEmpty()) {
+                              Text(
+                                  "Clear history",
+                                  color = Danger,
+                                  fontSize = 12.sp,
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .clickable {
+                                          HistoryStore.clear()
+                                          hist = emptyList()
+                                      }
+                                      .padding(14.dp)
+                              )
+                          }
+                      }
+                      SheetSection("Bookmarks", "", section == "bookmarks", { onSection("bookmarks") }) {
+                          Text(
+                              "+ Add current page",
+                              color = Color.White,
+                              fontSize = 13.sp,
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .clickable {
+                                      val t = tabs.current
+                                      val u = shownUrl(t)
+                                      if (t != null && u.isNotBlank()) {
+                                          BookmarkStore.add(u, t.title.ifBlank { u })
+                                          marks = BookmarkStore.load()
+                                      }
+                                  }
+                                  .padding(horizontal = 14.dp, vertical = 11.dp)
+                          )
+                          if (marks.isEmpty()) EmptyNote("No bookmarks yet.")
+                          for (e in marks) {
+                              SheetRow(
+                                  title = e.title.ifBlank { e.url },
+                                  sub = e.url,
+                                  active = false,
+                                  onClick = { onOpenUrl(e.url) },
+                                  onRemove = {
+                                      BookmarkStore.remove(e.url)
+                                      marks = BookmarkStore.load()
+                                  }
+                              )
+                          }
+                      }
+                      SheetSection("Tabs", tabs.tabs.size.toString(), section == "tabs", { onSection("tabs") }) {
+                          for (t in tabs.tabs) {
+                              val isCur = t === tabs.current
+                              SheetRow(
+                                  title = t.title.ifBlank { shownUrl(t).ifBlank { "New tab" } },
+                                  sub = shownUrl(t).ifBlank { "about:blank" } + (if (isCur) " · current" else ""),
+                                  active = isCur,
+                                  onClick = { onSelect(t) },
+                                  onRemove = { tabs.close(t) }
+                              )
+                          }
+                      }
+                  }
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
+                  Box(Modifier.fillMaxWidth().padding(10.dp)) {
+                      Button(onClick = onNewTab, modifier = Modifier.fillMaxWidth()) { Text("+ New Tab") }
+                  }
+              }
           }
 
           @Composable
@@ -1595,117 +2173,4 @@ jobs:
                           }) { Text("Delete", color = Danger) }
                       },
                       dismissButton = {
-                          TextButton(onClick = { showDelete = false }) { Text("Cancel", color = Color.White) }
-                      }
-                  )
-              }
-          }
-
-          @Composable
-          fun GuideScreen(onBack: () -> Unit) {
-              val ctx = LocalContext.current
-              var copied by remember { mutableStateOf(false) }
-              LaunchedEffect(copied) {
-                  if (copied) {
-                      delay(1500)
-                      copied = false
-                  }
-              }
-              Column(Modifier.fillMaxSize()) {
-                  Row(
-                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
-                      Text("Script guide", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
-                      Button(onClick = {
-                          val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                          cm.setPrimaryClip(ClipData.newPlainText("GreyGecko script guide", GUIDE))
-                          copied = true
-                      }) { Text(if (copied) "Copied" else "Copy for AI") }
-                      Spacer(Modifier.width(6.dp))
-                  }
-                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
-                      Text(
-                          "Copy this and paste it into your AI chat, then describe the script you want.",
-                          color = Color(0xFFBBBBBB),
-                          fontSize = 13.sp
-                      )
-                      Spacer(Modifier.height(10.dp))
-                      SelectionContainer {
-                          Text(GUIDE, color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 11.5.sp)
-                      }
-                  }
-              }
-          }
-
-          @Composable
-          fun LogScreen(onBack: () -> Unit) {
-              val ctx = LocalContext.current
-              val scope = rememberCoroutineScope()
-              var raw by remember { mutableStateOf("Loading...") }
-              var filter by remember { mutableStateOf("GreyScript") }
-              val scroll = rememberScrollState()
-
-              fun refresh() {
-                  scope.launch { raw = withContext(Dispatchers.IO) { readLogcat() } }
-              }
-              LaunchedEffect(Unit) { refresh() }
-
-              val shown = remember(raw, filter) {
-                  raw.lines().filter { filter.isBlank() || it.contains(filter, true) }.joinToString("\n")
-              }
-              LaunchedEffect(shown) {
-                  delay(150)
-                  scroll.scrollTo(scroll.maxValue)
-              }
-
-              Column(Modifier.fillMaxSize().padding(10.dp)) {
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
-                      Spacer(Modifier.weight(1f))
-                      Button(onClick = { refresh() }) { Text("Refresh") }
-                      Spacer(Modifier.width(8.dp))
-                      Button(onClick = {
-                          val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                          cm.setPrimaryClip(ClipData.newPlainText("logcat", shown))
-                      }) { Text("Copy") }
-                  }
-                  OutlinedTextField(
-                      value = filter,
-                      onValueChange = { filter = it },
-                      modifier = Modifier.fillMaxWidth(),
-                      singleLine = true,
-                      placeholder = { Text("Filter (e.g. GreyScript)", color = Color(0xFF999999)) },
-                      colors = fieldColors()
-                  )
-                  Spacer(Modifier.height(6.dp))
-                  Box(
-                      Modifier
-                          .fillMaxSize()
-                          .background(Field)
-                          .padding(6.dp)
-                          .verticalScroll(scroll)
-                  ) {
-                      SelectionContainer {
-                          Text(
-                              shown,
-                              color = Color.White,
-                              fontFamily = FontFamily.Monospace,
-                              fontSize = 11.sp
-                          )
-                      }
-                  }
-              }
-          }
-          EOF
-
-      - name: Build
-        env:
-          KEYSTORE_PATH: ${{ github.workspace }}/keystore/test.jks
-        run: gradle assembleRelease --no-daemon --stacktrace
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: GreyGecko
-          path: app/build/outputs/apk/release/*.apk
+                          TextButton(onClick = { sho
