@@ -2173,4 +2173,117 @@ jobs:
                           }) { Text("Delete", color = Danger) }
                       },
                       dismissButton = {
-                          TextButton(onClick = { sho
+                          TextButton(onClick = { showDelete = false }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
+              }
+          }
+
+          @Composable
+          fun GuideScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              var copied by remember { mutableStateOf(false) }
+              LaunchedEffect(copied) {
+                  if (copied) {
+                      delay(1500)
+                      copied = false
+                  }
+              }
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Script guide", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                      Button(onClick = {
+                          val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("GreyGecko script guide", GUIDE))
+                          copied = true
+                      }) { Text(if (copied) "Copied" else "Copy for AI") }
+                      Spacer(Modifier.width(6.dp))
+                  }
+                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
+                      Text(
+                          "Copy this and paste it into your AI chat, then describe the script you want.",
+                          color = Color(0xFFBBBBBB),
+                          fontSize = 13.sp
+                      )
+                      Spacer(Modifier.height(10.dp))
+                      SelectionContainer {
+                          Text(GUIDE, color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 11.5.sp)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun LogScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var raw by remember { mutableStateOf("Loading...") }
+              var filter by remember { mutableStateOf("GreyScript") }
+              val scroll = rememberScrollState()
+
+              fun refresh() {
+                  scope.launch { raw = withContext(Dispatchers.IO) { readLogcat() } }
+              }
+              LaunchedEffect(Unit) { refresh() }
+
+              val shown = remember(raw, filter) {
+                  raw.lines().filter { filter.isBlank() || it.contains(filter, true) }.joinToString("\n")
+              }
+              LaunchedEffect(shown) {
+                  delay(150)
+                  scroll.scrollTo(scroll.maxValue)
+              }
+
+              Column(Modifier.fillMaxSize().padding(10.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Spacer(Modifier.weight(1f))
+                      Button(onClick = { refresh() }) { Text("Refresh") }
+                      Spacer(Modifier.width(8.dp))
+                      Button(onClick = {
+                          val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("logcat", shown))
+                      }) { Text("Copy") }
+                  }
+                  OutlinedTextField(
+                      value = filter,
+                      onValueChange = { filter = it },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      placeholder = { Text("Filter (e.g. GreyScript)", color = Color(0xFF999999)) },
+                      colors = fieldColors()
+                  )
+                  Spacer(Modifier.height(6.dp))
+                  Box(
+                      Modifier
+                          .fillMaxSize()
+                          .background(Field)
+                          .padding(6.dp)
+                          .verticalScroll(scroll)
+                  ) {
+                      SelectionContainer {
+                          Text(
+                              shown,
+                              color = Color.White,
+                              fontFamily = FontFamily.Monospace,
+                              fontSize = 11.sp
+                          )
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/keystore/test.jks
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GreyGecko
+          path: app/build/outputs/apk/release/*.apk
