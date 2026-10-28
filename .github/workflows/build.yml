@@ -1172,7 +1172,7 @@ jobs:
                       .getBoolean("grabber", true)
               }
 
-              fun setEnabled(v: Boolean) {
+              fun setGrabber(v: Boolean) {
                   enabled = v
                   Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
                       .edit().putBoolean("grabber", v).apply()
@@ -1898,7 +1898,7 @@ jobs:
                           grabberOn = grabberOn,
                           onGrabber = { v ->
                               grabberOn = v
-                              Videos.setEnabled(v)
+                              Videos.setGrabber(v)
                           },
                           onSection = { section = it },
                           onClose = { sheetOpen = false },
