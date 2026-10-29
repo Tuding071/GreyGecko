@@ -1507,6 +1507,7 @@ jobs:
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
@@ -1530,6 +1531,7 @@ jobs:
           import androidx.compose.ui.focus.onFocusChanged
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalFocusManager
           import androidx.compose.ui.text.TextRange
@@ -1770,44 +1772,8 @@ jobs:
                           .navigationBarsPadding()
                           .imePadding()
                   ) {
-                      when (screen) {
-                          "tabs" -> TabManagerScreen(
-                              tabs,
-                              onBack = { screen = "browser" },
-                              onNewTab = {
-                                  tabs.newTab("about:blank", true)
-                                  startEdit = true
-                                  screen = "browser"
-                              },
-                              onSelect = { t ->
-                                  tabs.select(t)
-                                  screen = "browser"
-                              }
-                          )
-                          "history" -> HistoryScreen(
-                              onBack = { screen = "browser" },
-                              onOpen = { u ->
-                                  tabs.current?.session?.loadUri(u)
-                                  screen = "browser"
-                              }
-                          )
-                          "bookmarks" -> BookmarksScreen(
-                              tabs,
-                              onBack = { screen = "browser" },
-                              onOpen = { u ->
-                                  tabs.current?.session?.loadUri(u)
-                                  screen = "browser"
-                              }
-                          )
-                          "scripts" -> ScriptsScreen(
-                              onBack = { screen = "browser" },
-                              onEdit = { id -> editId = id; screen = "editor" },
-                              onGuide = { screen = "guide" }
-                          )
-                          "editor" -> EditorScreen(editId) { screen = "scripts" }
-                          "guide" -> GuideScreen { screen = "scripts" }
-                          "logs" -> LogScreen { screen = "browser" }
-                          else -> BrowserScreen(
+                      Box(Modifier.fillMaxSize()) {
+                          BrowserScreen(
                               tabs,
                               startEdit = startEdit,
                               onEditStarted = { startEdit = false },
@@ -1817,6 +1783,54 @@ jobs:
                               onScripts = { screen = "scripts" },
                               onLogs = { screen = "logs" }
                           )
+                          if (screen != "browser") {
+                              Box(
+                                  Modifier
+                                      .fillMaxSize()
+                                      .background(BG)
+                                      .pointerInput(Unit) { detectTapGestures { } }
+                              ) {
+                                  when (screen) {
+                                      "tabs" -> TabManagerScreen(
+                                          tabs,
+                                          onBack = { screen = "browser" },
+                                          onNewTab = {
+                                              tabs.newTab("about:blank", true)
+                                              startEdit = true
+                                              screen = "browser"
+                                          },
+                                          onSelect = { t ->
+                                              tabs.select(t)
+                                              screen = "browser"
+                                          }
+                                      )
+                                      "history" -> HistoryScreen(
+                                          onBack = { screen = "browser" },
+                                          onOpen = { u ->
+                                              tabs.current?.session?.loadUri(u)
+                                              screen = "browser"
+                                          }
+                                      )
+                                      "bookmarks" -> BookmarksScreen(
+                                          tabs,
+                                          onBack = { screen = "browser" },
+                                          onOpen = { u ->
+                                              tabs.current?.session?.loadUri(u)
+                                              screen = "browser"
+                                          }
+                                      )
+                                      "scripts" -> ScriptsScreen(
+                                          onBack = { screen = "browser" },
+                                          onEdit = { id -> editId = id; screen = "editor" },
+                                          onGuide = { screen = "guide" }
+                                      )
+                                      "editor" -> EditorScreen(editId) { screen = "scripts" }
+                                      "guide" -> GuideScreen { screen = "scripts" }
+                                      "logs" -> LogScreen { screen = "browser" }
+                                      else -> {}
+                                  }
+                              }
+                          }
                       }
                   }
               }
@@ -1834,11 +1848,13 @@ jobs:
               onLogs: () -> Unit
           ) {
               val cur = tabs.current
+              val scope = rememberCoroutineScope()
               var menu by remember { mutableStateOf(false) }
               var editing by remember { mutableStateOf(false) }
               var text by remember { mutableStateOf(TextFieldValue("")) }
               var grabberOn by remember { mutableStateOf(Videos.enabled) }
               var panelOpen by remember { mutableStateOf(false) }
+              var lastSubmit by remember { mutableStateOf(0L) }
               val focusManager = LocalFocusManager.current
               val vids = cur?.videos
 
@@ -1855,10 +1871,16 @@ jobs:
               }
 
               fun submit(raw: String) {
+                  val now = System.currentTimeMillis()
+                  if (now - lastSubmit < 600) return
+                  lastSubmit = now
                   val t = tabs.current
                   if (raw.isNotBlank() && t != null) t.session.loadUri(normalize(raw))
-                  editing = false
-                  focusManager.clearFocus()
+                  scope.launch {
+                      delay(300)
+                      editing = false
+                      focusManager.clearFocus()
+                  }
               }
 
               Box(Modifier.fillMaxSize()) {
@@ -2361,11 +2383,11 @@ jobs:
                           Modifier
                               .size(36.dp)
                               .clip(CircleShape)
-                              .background(TmAccent)
+                              .background(Color.White)
                               .clickable { onNewTab() },
                           contentAlignment = Alignment.Center
                       ) {
-                          Text("+", color = Color.White, fontSize = 24.sp)
+                          Text("+", color = Color.Black, fontSize = 24.sp)
                       }
                   }
                   Box(Modifier.fillMaxWidth().height(1.dp).background(TmSurface2))
