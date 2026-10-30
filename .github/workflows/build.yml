@@ -1275,24 +1275,32 @@ jobs:
           package com.grey.gecko
 
           import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
           import android.os.Handler
           import android.os.Looper
+          import android.util.Log
           import androidx.compose.runtime.getValue
           import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateMapOf
           import androidx.compose.runtime.mutableStateOf
           import androidx.compose.runtime.setValue
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
           import org.json.JSONArray
           import org.json.JSONObject
           import org.mozilla.geckoview.AllowOrDeny
           import org.mozilla.geckoview.GeckoResult
           import org.mozilla.geckoview.GeckoRuntime
           import org.mozilla.geckoview.GeckoSession
+          import org.mozilla.geckoview.GeckoView
 
           class BrowserTab(val id: Int, val session: GeckoSession) {
               var url by mutableStateOf("")
               var title by mutableStateOf("")
               var progress by mutableStateOf(0)
               var loading by mutableStateOf(false)
+              var thumb by mutableStateOf<ImageBitmap?>(null)
               var extId = -1
               val videos = mutableStateListOf<VideoItem>()
               val seen = HashSet<String>()
@@ -1314,10 +1322,57 @@ jobs:
               return if (u == "about:blank") "" else u
           }
 
+          object Favicons {
+              private val map = mutableStateMapOf<String, ImageBitmap>()
+              private val requested = HashSet<String>()
+              private val main = Handler(Looper.getMainLooper())
+
+              fun get(key: String): ImageBitmap? = map[key]
+
+              fun request(key: String) {
+                  if (key.isBlank() || key == "newtab" || key == "other") return
+                  synchronized(requested) {
+                      if (!requested.add(key)) return
+                  }
+                  Thread {
+                      var bmp = download("https://" + key + "/favicon.ico")
+                      if (bmp == null || bmp.width < 16) {
+                          bmp = download("https://www.google.com/s2/favicons?sz=64&domain=" + key)
+                      }
+                      val b = bmp
+                      if (b != null) {
+                          val ib = b.asImageBitmap()
+                          main.post { map[key] = ib }
+                      } else {
+                          synchronized(requested) { requested.remove(key) }
+                      }
+                  }.start()
+              }
+
+              private fun download(u: String): Bitmap? {
+                  return try {
+                      val c = java.net.URL(u).openConnection() as java.net.HttpURLConnection
+                      c.connectTimeout = 8000
+                      c.readTimeout = 8000
+                      c.instanceFollowRedirects = true
+                      c.setRequestProperty("User-Agent", DEFAULT_UA)
+                      try {
+                          if (c.responseCode in 200..299) c.inputStream.use { BitmapFactory.decodeStream(it) } else null
+                      } finally {
+                          c.disconnect()
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+          }
+
           class TabManager(private val runtime: GeckoRuntime) {
               val tabs = mutableStateListOf<BrowserTab>()
               var current by mutableStateOf<BrowserTab?>(null)
+              var view: GeckoView? = null
               private var counter = 0
+              private val main = Handler(Looper.getMainLooper())
 
               fun newTab(url: String, select: Boolean = true): BrowserTab {
                   val s = GeckoSession()
@@ -1344,7 +1399,7 @@ jobs:
                   } else if (current === t) {
                       current = tabs[minOf(i, tabs.size - 1)]
                   }
-                  Handler(Looper.getMainLooper()).postDelayed({ t.session.close() }, 400)
+                  main.postDelayed({ t.session.close() }, 400)
               }
 
               fun closeAll() {
@@ -1353,6 +1408,31 @@ jobs:
                   }
                   tabs.clear()
                   current = null
+              }
+
+              fun capture(t: BrowserTab) {
+                  val v = view ?: return
+                  if (current !== t) return
+                  if (v.session !== t.session) return
+                  try {
+                      v.capturePixels().accept(
+                          { bmp ->
+                              try {
+                                  if (bmp != null && bmp.width > 0 && bmp.height > 0) {
+                                      val side = minOf(bmp.width, bmp.height)
+                                      val sq = Bitmap.createBitmap(bmp, 0, 0, side, side)
+                                      val sc = Bitmap.createScaledBitmap(sq, 240, 240, true)
+                                      t.thumb = sc.asImageBitmap()
+                                  }
+                              } catch (e: Exception) {
+                                  Log.d("GreyScript", "thumb failed: " + e)
+                              }
+                          },
+                          { e -> Log.d("GreyScript", "capture failed: " + e) }
+                      )
+                  } catch (e: Exception) {
+                      Log.d("GreyScript", "capture threw: " + e)
+                  }
               }
 
               private fun attach(t: BrowserTab) {
@@ -1364,6 +1444,7 @@ jobs:
                           hasUserGesture: Boolean
                       ) {
                           t.url = url ?: ""
+                          Favicons.request(groupKeyOf(t))
                       }
 
                       override fun onLoadRequest(
@@ -1383,6 +1464,7 @@ jobs:
                           t.progress = 8
                           t.title = ""
                           t.url = url
+                          t.thumb = null
                           t.videos.clear()
                           t.seen.clear()
                       }
@@ -1396,6 +1478,7 @@ jobs:
                           t.loading = false
                           t.progress = 0
                           if (success) HistoryStore.add(t.url, t.title)
+                          main.postDelayed({ capture(t) }, 800)
                       }
                   }
                   t.session.contentDelegate = object : GeckoSession.ContentDelegate {
@@ -1504,6 +1587,7 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.enableEdgeToEdge
           import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
@@ -1532,6 +1616,7 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.SolidColor
           import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalFocusManager
           import androidx.compose.ui.text.TextRange
@@ -1541,8 +1626,8 @@ jobs:
           import androidx.compose.ui.text.input.ImeAction
           import androidx.compose.ui.text.input.KeyboardType
           import androidx.compose.ui.text.input.TextFieldValue
-          import androidx.compose.ui.text.style.TextAlign
           import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.Dp
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
@@ -1563,13 +1648,8 @@ jobs:
           val Btn = Color(0xFF4A4A4A)
           val Soft = Color(0xFFAAAAAA)
           val Danger = Color(0xFFE49A9A)
-
-          val TmBg = Color(0xFF1C1C1E)
-          val TmSurface = Color(0xFF2C2C2E)
-          val TmSurface2 = Color(0xFF3A3A3C)
-          val TmAccent = Color(0xFF0A84FF)
-          val TmDim = Color(0xFF8E8E93)
           val TmGreen = Color(0xFF30D158)
+          val HeaderH = 60.dp
 
           val GroupPalette = listOf(
               Color(0xFF3B82F6),
@@ -1744,6 +1824,19 @@ jobs:
           )
 
           @Composable
+          fun Header(content: @Composable RowScope.() -> Unit) {
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .height(HeaderH)
+                      .background(Bar)
+                      .padding(horizontal = 4.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+                  content = content
+              )
+          }
+
+          @Composable
           fun App(tabs: TabManager) {
               MaterialTheme(
                   colorScheme = darkColorScheme(
@@ -1886,27 +1979,34 @@ jobs:
               Box(Modifier.fillMaxSize()) {
                   Column(Modifier.fillMaxSize()) {
                       Row(
-                          Modifier.fillMaxWidth().background(Bar).padding(6.dp),
+                          Modifier
+                              .fillMaxWidth()
+                              .height(HeaderH)
+                              .background(Bar)
+                              .padding(horizontal = 8.dp),
                           verticalAlignment = Alignment.CenterVertically
                       ) {
                           Box(
                               Modifier
-                                  .size(40.dp)
-                                  .clip(RoundedCornerShape(8.dp))
+                                  .size(44.dp)
+                                  .clip(RoundedCornerShape(10.dp))
                                   .background(Field)
-                                  .clickable { onTabs() },
+                                  .clickable {
+                                      cur?.let { tabs.capture(it) }
+                                      onTabs()
+                                  },
                               contentAlignment = Alignment.Center
                           ) {
                               Box(
                                   Modifier
-                                      .size(20.dp)
-                                      .border(2.dp, Color.White, RoundedCornerShape(5.dp)),
+                                      .size(22.dp)
+                                      .border(2.dp, Color.White, RoundedCornerShape(6.dp)),
                                   contentAlignment = Alignment.Center
                               ) {
-                                  Text(tabs.tabs.size.toString(), color = Color.White, fontSize = 11.sp)
+                                  Text(tabs.tabs.size.toString(), color = Color.White, fontSize = 12.sp)
                               }
                           }
-                          Spacer(Modifier.width(6.dp))
+                          Spacer(Modifier.width(8.dp))
                           UrlBar(
                               tab = cur,
                               editing = editing,
@@ -1927,7 +2027,7 @@ jobs:
                           }
                           Box {
                               TextButton(onClick = { menu = true }) {
-                                  Text("⋮", fontSize = 22.sp, color = Color.White)
+                                  Text("⋮", fontSize = 24.sp, color = Color.White)
                               }
                               DropdownMenu(
                                   expanded = menu,
@@ -1971,12 +2071,15 @@ jobs:
                           }
                       }
                       AndroidView(
-                          factory = { ctx -> GeckoView(ctx) },
+                          factory = { ctx -> GeckoView(ctx).also { tabs.view = it } },
                           update = { v ->
                               val s = cur?.session
                               if (s != null && v.session !== s) v.setSession(s)
                           },
-                          onRelease = { it.releaseSession() },
+                          onRelease = { v ->
+                              if (tabs.view === v) tabs.view = null
+                              v.releaseSession()
+                          },
                           modifier = Modifier.fillMaxSize()
                       )
                   }
@@ -2092,23 +2195,22 @@ jobs:
               onSubmit: () -> Unit,
               modifier: Modifier = Modifier
           ) {
-              val shape = RoundedCornerShape(8.dp)
+              val shape = RoundedCornerShape(10.dp)
               val url = shownUrl(tab)
               val loading = tab?.loading ?: false
               val fill by animateFloatAsState(targetValue = (tab?.progress ?: 0) / 100f, label = "urlProgress")
               val focus = remember { FocusRequester() }
-              var hadFocus by remember { mutableStateOf(false) }
+              var hadFocus by remember(editing) { mutableStateOf(false) }
 
               LaunchedEffect(editing) {
                   if (editing) {
-                      hadFocus = false
                       focus.requestFocus()
                   }
               }
 
               Box(
                   modifier
-                      .height(40.dp)
+                      .height(44.dp)
                       .clip(shape)
                       .background(Field)
                       .border(0.5.dp, Color(0xFF555555), shape)
@@ -2203,48 +2305,77 @@ jobs:
               if (key == "newtab") "+" else key.take(1).uppercase()
 
           @Composable
+          fun FaviconBox(key: String, size: Dp, radius: Dp, letterSize: Int) {
+              LaunchedEffect(key) { Favicons.request(key) }
+              val ib = Favicons.get(key)
+              val shape = RoundedCornerShape(radius)
+              if (ib != null) {
+                  Box(
+                      Modifier
+                          .size(size)
+                          .clip(shape)
+                          .background(Color(0xFFEFEFEF)),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Image(
+                          bitmap = ib,
+                          contentDescription = null,
+                          modifier = Modifier.fillMaxSize().padding(size * 0.12f)
+                      )
+                  }
+              } else {
+                  Box(
+                      Modifier
+                          .size(size)
+                          .clip(shape)
+                          .background(groupColor(key)),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text(
+                          groupLetter(key),
+                          color = Color.White,
+                          fontSize = letterSize.sp,
+                          fontWeight = FontWeight.Bold
+                      )
+                  }
+              }
+          }
+
+          @Composable
           fun GroupItem(g: TabGroup, active: Boolean, foreground: Boolean, onClick: () -> Unit) {
               val n = g.tabs.size
               Row(
                   Modifier
                       .fillMaxWidth()
-                      .background(if (active) TmSurface2 else Color.Transparent)
+                      .background(if (active) Field else Color.Transparent)
                       .clickable { onClick() }
-                      .padding(end = 12.dp, top = 12.dp, bottom = 12.dp),
+                      .padding(end = 14.dp, top = 12.dp, bottom = 12.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
                   Box(
                       Modifier
                           .width(3.dp)
-                          .height(34.dp)
+                          .height(36.dp)
                           .background(
-                              if (active) TmAccent else Color.Transparent,
+                              if (active) Color.White else Color.Transparent,
                               RoundedCornerShape(topEnd = 3.dp, bottomEnd = 3.dp)
                           )
                   )
                   Spacer(Modifier.width(9.dp))
-                  Box(Modifier.size(22.dp)) {
-                      Box(
-                          Modifier
-                              .fillMaxSize()
-                              .clip(RoundedCornerShape(5.dp))
-                              .background(groupColor(g.key)),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text(groupLetter(g.key), color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                      }
+                  Box(Modifier.size(28.dp)) {
+                      FaviconBox(g.key, 28.dp, 6.dp, 13)
                       if (foreground) {
                           Box(
                               Modifier
                                   .align(Alignment.BottomEnd)
-                                  .offset(3.dp, 3.dp)
-                                  .size(9.dp)
+                                  .offset(6.dp, 6.dp)
+                                  .size(16.dp)
                                   .background(TmGreen, CircleShape)
-                                  .border(2.dp, if (active) TmSurface2 else TmSurface, CircleShape)
+                                  .border(2.5.dp, if (active) Field else Bar, CircleShape)
                           )
                       }
                   }
-                  Spacer(Modifier.width(8.dp))
+                  Spacer(Modifier.width(12.dp))
                   Column(Modifier.weight(1f)) {
                       Text(
                           g.label,
@@ -2256,7 +2387,7 @@ jobs:
                       )
                       Text(
                           n.toString() + (if (n == 1) " tab" else " tabs"),
-                          color = TmDim,
+                          color = Soft,
                           fontSize = 10.sp
                       )
                   }
@@ -2268,12 +2399,13 @@ jobs:
               val shape = RoundedCornerShape(12.dp)
               val key = groupKeyOf(t)
               val title = t.title.ifBlank { shownUrl(t).ifBlank { "New tab" } }
+              val thumb = t.thumb
               Row(
                   Modifier
                       .fillMaxWidth()
                       .padding(bottom = 10.dp)
                       .clip(shape)
-                      .background(TmSurface)
+                      .background(Bar)
                       .then(if (foreground) Modifier.border(2.dp, TmGreen, shape) else Modifier)
                       .clickable { onClick() }
                       .padding(10.dp),
@@ -2283,17 +2415,18 @@ jobs:
                       Modifier
                           .size(72.dp)
                           .clip(RoundedCornerShape(8.dp))
-                          .background(TmSurface2),
+                          .background(Field),
                       contentAlignment = Alignment.Center
                   ) {
-                      Box(
-                          Modifier
-                              .size(52.dp)
-                              .clip(RoundedCornerShape(8.dp))
-                              .background(groupColor(key)),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text(groupLetter(key), color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                      if (thumb != null) {
+                          Image(
+                              bitmap = thumb,
+                              contentDescription = null,
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier.fillMaxSize()
+                          )
+                      } else {
+                          FaviconBox(key, 44.dp, 8.dp, 20)
                       }
                   }
                   Spacer(Modifier.width(12.dp))
@@ -2306,24 +2439,16 @@ jobs:
                           maxLines = 2,
                           overflow = TextOverflow.Ellipsis
                       )
-                      if (foreground) {
-                          Row(
-                              Modifier
-                                  .clip(RoundedCornerShape(20.dp))
-                                  .background(Color(0x2630D158))
-                                  .padding(horizontal = 8.dp, vertical = 3.dp),
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              Box(Modifier.size(6.dp).background(TmGreen, CircleShape))
-                              Spacer(Modifier.width(5.dp))
-                              Text(
-                                  "OPEN NOW",
-                                  color = TmGreen,
-                                  fontSize = 10.sp,
-                                  fontWeight = FontWeight.Bold,
-                                  letterSpacing = 0.3.sp
-                              )
-                          }
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          FaviconBox(key, 14.dp, 3.dp, 8)
+                          Spacer(Modifier.width(6.dp))
+                          Text(
+                              if (key == "newtab") "New tab" else key,
+                              color = Soft,
+                              fontSize = 11.sp,
+                              maxLines = 1,
+                              overflow = TextOverflow.Ellipsis
+                          )
                       }
                   }
                   Spacer(Modifier.width(8.dp))
@@ -2331,11 +2456,11 @@ jobs:
                       Modifier
                           .size(26.dp)
                           .clip(CircleShape)
-                          .background(TmSurface2)
+                          .background(Field)
                           .clickable { onClose() },
                       contentAlignment = Alignment.Center
                   ) {
-                      Text("×", color = TmDim, fontSize = 16.sp)
+                      Text("×", color = Soft, fontSize = 16.sp)
                   }
               }
           }
@@ -2354,34 +2479,13 @@ jobs:
                   ?: groups.firstOrNull { it.key == curKey }
                   ?: groups.firstOrNull()
 
-              Column(Modifier.fillMaxSize().background(TmBg)) {
-                  Row(
-                      Modifier
-                          .fillMaxWidth()
-                          .padding(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 12.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
+              Column(Modifier.fillMaxSize().background(BG)) {
+                  Header {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Tab Manager", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                       Box(
                           Modifier
-                              .size(36.dp)
-                              .clip(CircleShape)
-                              .background(TmSurface)
-                              .clickable { onBack() },
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text("‹", color = Color.White, fontSize = 24.sp)
-                      }
-                      Text(
-                          "Tab Manager",
-                          color = Color.White,
-                          fontSize = 20.sp,
-                          fontWeight = FontWeight.Bold,
-                          textAlign = TextAlign.Center,
-                          modifier = Modifier.weight(1f)
-                      )
-                      Box(
-                          Modifier
-                              .size(36.dp)
+                              .size(38.dp)
                               .clip(CircleShape)
                               .background(Color.White)
                               .clickable { onNewTab() },
@@ -2389,8 +2493,9 @@ jobs:
                       ) {
                           Text("+", color = Color.Black, fontSize = 24.sp)
                       }
+                      Spacer(Modifier.width(8.dp))
                   }
-                  Box(Modifier.fillMaxWidth().height(1.dp).background(TmSurface2))
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
                   BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
                       val railW = (maxWidth * 0.38f).coerceIn(120.dp, 160.dp)
                       Row(Modifier.fillMaxSize()) {
@@ -2398,7 +2503,7 @@ jobs:
                               Modifier
                                   .width(railW)
                                   .fillMaxHeight()
-                                  .background(TmSurface)
+                                  .background(Bar)
                                   .verticalScroll(rememberScrollState())
                                   .padding(vertical = 8.dp)
                           ) {
@@ -2411,7 +2516,7 @@ jobs:
                                   )
                               }
                           }
-                          Box(Modifier.width(1.dp).fillMaxHeight().background(TmSurface2))
+                          Box(Modifier.width(0.5.dp).fillMaxHeight().background(Field))
                           Column(
                               Modifier
                                   .weight(1f)
@@ -2422,7 +2527,7 @@ jobs:
                               if (active != null) {
                                   Text(
                                       active.label.uppercase(),
-                                      color = TmDim,
+                                      color = Soft,
                                       fontSize = 11.sp,
                                       fontWeight = FontWeight.SemiBold,
                                       letterSpacing = 0.5.sp,
@@ -2489,10 +2594,7 @@ jobs:
                   java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
               }
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
+                  Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("History", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                       if (hist.isNotEmpty()) {
@@ -2522,10 +2624,7 @@ jobs:
           fun BookmarksScreen(tabs: TabManager, onBack: () -> Unit, onOpen: (String) -> Unit) {
               var marks by remember { mutableStateOf<List<PageEntry>>(BookmarkStore.load()) }
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
+                  Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Bookmarks", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                       TextButton(onClick = {
@@ -2566,16 +2665,13 @@ jobs:
               val updates = scripts.count { it.remoteVersion.isNotBlank() }
 
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
+                  Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Scripts", color = Color.White, fontSize = 18.sp)
                       Spacer(Modifier.width(8.dp))
                       Box(
                           Modifier
-                              .size(24.dp)
+                              .size(26.dp)
                               .border(1.dp, Color(0xFF888888), CircleShape)
                               .clickable { onGuide() },
                           contentAlignment = Alignment.Center
@@ -2812,10 +2908,7 @@ jobs:
               }
 
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
+                  Header {
                       TextButton(onClick = { if (dirty) showDiscard = true else onBack() }) {
                           Text("←", color = Color.White, fontSize = 20.sp)
                       }
@@ -2991,10 +3084,7 @@ jobs:
                   }
               }
               Column(Modifier.fillMaxSize()) {
-                  Row(
-                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 4.dp, vertical = 6.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
+                  Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Script guide", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                       Button(onClick = {
@@ -3039,40 +3129,43 @@ jobs:
                   scroll.scrollTo(scroll.maxValue)
               }
 
-              Column(Modifier.fillMaxSize().padding(10.dp)) {
-                  Row(verticalAlignment = Alignment.CenterVertically) {
+              Column(Modifier.fillMaxSize()) {
+                  Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
-                      Spacer(Modifier.weight(1f))
+                      Text("Logcat", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                       Button(onClick = { refresh() }) { Text("Refresh") }
                       Spacer(Modifier.width(8.dp))
                       Button(onClick = {
                           val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                           cm.setPrimaryClip(ClipData.newPlainText("logcat", shown))
                       }) { Text("Copy") }
+                      Spacer(Modifier.width(6.dp))
                   }
-                  OutlinedTextField(
-                      value = filter,
-                      onValueChange = { filter = it },
-                      modifier = Modifier.fillMaxWidth(),
-                      singleLine = true,
-                      placeholder = { Text("Filter (e.g. GreyScript)", color = Color(0xFF999999)) },
-                      colors = fieldColors()
-                  )
-                  Spacer(Modifier.height(6.dp))
-                  Box(
-                      Modifier
-                          .fillMaxSize()
-                          .background(Field)
-                          .padding(6.dp)
-                          .verticalScroll(scroll)
-                  ) {
-                      SelectionContainer {
-                          Text(
-                              shown,
-                              color = Color.White,
-                              fontFamily = FontFamily.Monospace,
-                              fontSize = 11.sp
-                          )
+                  Column(Modifier.fillMaxSize().padding(10.dp)) {
+                      OutlinedTextField(
+                          value = filter,
+                          onValueChange = { filter = it },
+                          modifier = Modifier.fillMaxWidth(),
+                          singleLine = true,
+                          placeholder = { Text("Filter (e.g. GreyScript)", color = Color(0xFF999999)) },
+                          colors = fieldColors()
+                      )
+                      Spacer(Modifier.height(6.dp))
+                      Box(
+                          Modifier
+                              .fillMaxSize()
+                              .background(Field)
+                              .padding(6.dp)
+                              .verticalScroll(scroll)
+                      ) {
+                          SelectionContainer {
+                              Text(
+                                  shown,
+                                  color = Color.White,
+                                  fontFamily = FontFamily.Monospace,
+                                  fontSize = 11.sp
+                              )
+                          }
                       }
                   }
               }
