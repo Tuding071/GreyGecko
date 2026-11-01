@@ -1320,14 +1320,19 @@ jobs:
               }
           }
 
+          class CtxInfo(val url: String, val isImage: Boolean)
+
           fun shownUrl(t: BrowserTab?): String {
               val u = t?.url ?: ""
               return if (u == "about:blank") "" else u
           }
 
+          fun normUrl(u: String): String = u.substringBefore('#').trimEnd('/').lowercase()
+
           object Favicons {
               private val map = mutableStateMapOf<String, ImageBitmap>()
               private val requested = HashSet<String>()
+              private val failed = HashMap<String, Long>()
               private val main = Handler(Looper.getMainLooper())
 
               fun get(key: String): ImageBitmap? = map[key]
@@ -1335,6 +1340,8 @@ jobs:
               fun request(key: String) {
                   if (key.isBlank() || key == "newtab" || key == "other") return
                   synchronized(requested) {
+                      val ft = failed[key]
+                      if (ft != null && System.currentTimeMillis() - ft < 600000L) return
                       if (!requested.add(key)) return
                   }
                   Thread {
@@ -1347,7 +1354,10 @@ jobs:
                           val ib = b.asImageBitmap()
                           main.post { map[key] = ib }
                       } else {
-                          synchronized(requested) { requested.remove(key) }
+                          synchronized(requested) {
+                              requested.remove(key)
+                              failed[key] = System.currentTimeMillis()
+                          }
                       }
                   }.start()
               }
@@ -1374,9 +1384,12 @@ jobs:
               val tabs = mutableStateListOf<BrowserTab>()
               var current by mutableStateOf<BrowserTab?>(null)
               var maxBg by mutableStateOf(6)
+              var ctxMenu by mutableStateOf<CtxInfo?>(null)
               var view: GeckoView? = null
               private var counter = 0
+              private var closing = false
               private val main = Handler(Looper.getMainLooper())
+              private val saveRunnable = Runnable { saveNow() }
               private val idleTick = object : Runnable {
                   override fun run() {
                       discardIdle()
@@ -1389,12 +1402,95 @@ jobs:
                   main.postDelayed(idleTick, 60000L)
               }
 
+              private fun thumbFile(id: Int): java.io.File {
+                  val dir = java.io.File(Gecko.appCtx.filesDir, "thumbs")
+                  dir.mkdirs()
+                  return java.io.File(dir, "t" + id + ".jpg")
+              }
+
+              fun persist() {
+                  if (closing) return
+                  main.removeCallbacks(saveRunnable)
+                  main.postDelayed(saveRunnable, 700L)
+              }
+
+              fun saveNow() {
+                  if (closing) return
+                  try {
+                      val arr = JSONArray()
+                      for (t in tabs) {
+                          val o = JSONObject()
+                          o.put("id", t.id)
+                          o.put("u", t.url)
+                          o.put("t", t.title)
+                          o.put("o", t.openerId)
+                          arr.put(o)
+                      }
+                      val root = JSONObject()
+                      root.put("cur", current?.id ?: 0)
+                      root.put("next", counter)
+                      root.put("list", arr)
+                      Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+                          .edit().putString("tabs", root.toString()).apply()
+                  } catch (e: Exception) {
+                      Log.d("GreyScript", "save tabs failed: " + e)
+                  }
+              }
+
+              fun restore(): Boolean {
+                  try {
+                      val raw = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+                          .getString("tabs", null) ?: return false
+                      val root = JSONObject(raw)
+                      val arr = root.getJSONArray("list")
+                      if (arr.length() == 0) return false
+                      var maxId = root.optInt("next", 0)
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          val id = o.getInt("id")
+                          val t = BrowserTab(id, null, o.optInt("o", 0))
+                          t.url = o.optString("u")
+                          t.title = o.optString("t")
+                          val f = thumbFile(id)
+                          if (f.exists()) {
+                              val bmp = BitmapFactory.decodeFile(f.path)
+                              if (bmp != null) t.thumb = bmp.asImageBitmap()
+                          }
+                          if (id > maxId) maxId = id
+                          tabs.add(t)
+                      }
+                      counter = maxId
+                      val curId = root.optInt("cur", 0)
+                      val c = tabs.firstOrNull { it.id == curId } ?: tabs.last()
+                      select(c)
+                      return true
+                  } catch (e: Exception) {
+                      Log.d("GreyScript", "restore failed: " + e)
+                      tabs.clear()
+                      current = null
+                      return false
+                  }
+              }
+
               fun newTab(url: String, makeCurrent: Boolean = true, openerId: Int = 0): BrowserTab {
+                  var opener = openerId
+                  if (url.isNotBlank() && !url.startsWith("about:")) {
+                      val key = normUrl(url)
+                      for (d in tabs.toList()) {
+                          if (d.url.isNotBlank() && normUrl(d.url) == key) {
+                              if (d.id == opener) opener = d.openerId
+                              removeTab(d, false)
+                          }
+                      }
+                  }
                   counter += 1
-                  val t = BrowserTab(counter, null, openerId)
+                  val t = BrowserTab(counter, null, opener)
+                  t.url = url
                   tabs.add(t)
                   ensureLive(t, url)
                   if (makeCurrent || current == null) select(t)
+                  enforceLimit()
+                  persist()
                   return t
               }
 
@@ -1421,6 +1517,7 @@ jobs:
                   t.lastUsed = System.currentTimeMillis()
                   current = t
                   enforceLimit()
+                  persist()
               }
 
               fun load(t: BrowserTab, url: String) {
@@ -1438,21 +1535,32 @@ jobs:
               }
 
               fun close(t: BrowserTab) {
+                  removeTab(t, true)
+              }
+
+              private fun removeTab(t: BrowserTab, keepOne: Boolean) {
                   val i = tabs.indexOf(t)
                   if (i < 0) return
                   tabs.removeAt(i)
                   val s = t.session
                   t.session = null
+                  try {
+                      thumbFile(t.id).delete()
+                  } catch (e: Exception) {
+                  }
                   if (tabs.isEmpty()) {
                       current = null
-                      newTab("about:blank", true)
+                      if (keepOne) newTab("about:blank", true)
                   } else if (current === t) {
                       select(tabs[minOf(i, tabs.size - 1)])
                   }
                   if (s != null) main.postDelayed({ s.close() }, 400)
+                  persist()
               }
 
               fun closeAll() {
+                  closing = true
+                  main.removeCallbacks(saveRunnable)
                   main.removeCallbacks(idleTick)
                   for (t in tabs.toList()) {
                       t.session?.close()
@@ -1525,6 +1633,15 @@ jobs:
                                       val sq = Bitmap.createBitmap(bmp, 0, 0, side, side)
                                       val sc = Bitmap.createScaledBitmap(sq, 240, 240, true)
                                       t.thumb = sc.asImageBitmap()
+                                      val f = thumbFile(t.id)
+                                      Thread {
+                                          try {
+                                              java.io.FileOutputStream(f).use { out ->
+                                                  sc.compress(Bitmap.CompressFormat.JPEG, 75, out)
+                                              }
+                                          } catch (e: Exception) {
+                                          }
+                                      }.start()
                                   }
                               } catch (e: Exception) {
                                   Log.d("GreyScript", "thumb failed: " + e)
@@ -1547,6 +1664,7 @@ jobs:
                       ) {
                           t.url = url ?: ""
                           Favicons.request(groupKeyOf(t))
+                          persist()
                       }
 
                       override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
@@ -1585,6 +1703,7 @@ jobs:
                           t.progress = 0
                           if (success) HistoryStore.add(t.url, t.title)
                           main.postDelayed({ capture(t) }, 800)
+                          persist()
                       }
 
                       override fun onSessionStateChange(
@@ -1598,6 +1717,21 @@ jobs:
                       override fun onTitleChange(session: GeckoSession, title: String?) {
                           t.title = title ?: ""
                           HistoryStore.setTitle(t.url, t.title)
+                          persist()
+                      }
+
+                      override fun onContextMenu(
+                          session: GeckoSession,
+                          screenX: Int,
+                          screenY: Int,
+                          element: GeckoSession.ContentDelegate.ContextElement
+                      ) {
+                          val link = element.linkUri
+                          val src = element.srcUri
+                          val target = if (!link.isNullOrBlank()) link else src
+                          if (!target.isNullOrBlank()) {
+                              ctxMenu = CtxInfo(target, link.isNullOrBlank())
+                          }
                       }
                   }
               }
@@ -1643,7 +1777,7 @@ jobs:
                   val l = readEntries("history")
                   if (l.isNotEmpty() && l[0].url == url) l.removeAt(0)
                   l.add(0, PageEntry(url, title, System.currentTimeMillis()))
-                  while (l.size > 300) l.removeAt(l.size - 1)
+                  while (l.size > 1000) l.removeAt(l.size - 1)
                   writeEntries("history", l)
               }
 
@@ -1884,8 +2018,13 @@ jobs:
                   Thread { Updater.autoCheck() }.start()
                   tabs = TabManager(runtime)
                   Videos.tabs = tabs
-                  tabs.newTab("https://example.com", true)
+                  if (!tabs.restore()) tabs.newTab("https://example.com", true)
                   setContent { App(tabs) }
+              }
+
+              override fun onStop() {
+                  if (::tabs.isInitialized) tabs.saveNow()
+                  super.onStop()
               }
 
               override fun onTrimMemory(level: Int) {
@@ -1895,6 +2034,7 @@ jobs:
 
               override fun onDestroy() {
                   Videos.tabs = null
+                  tabs.saveNow()
                   tabs.closeAll()
                   super.onDestroy()
               }
@@ -2058,6 +2198,19 @@ jobs:
           }
 
           @Composable
+          fun MenuRow(label: String, onClick: () -> Unit) {
+              Text(
+                  label,
+                  color = Color.White,
+                  fontSize = 15.sp,
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .clickable { onClick() }
+                      .padding(vertical = 14.dp)
+              )
+          }
+
+          @Composable
           fun BrowserScreen(
               tabs: TabManager,
               active: Boolean,
@@ -2080,6 +2233,7 @@ jobs:
               var lastSubmit by remember { mutableStateOf(0L) }
               val focusManager = LocalFocusManager.current
               val vids = cur?.videos
+              val cm = tabs.ctxMenu
 
               LaunchedEffect(cur, vids?.isEmpty()) {
                   if (vids == null || vids.isEmpty()) panelOpen = false
@@ -2241,6 +2395,41 @@ jobs:
                           modifier = Modifier.align(Alignment.CenterEnd)
                       )
                   }
+              }
+
+              if (cm != null) {
+                  AlertDialog(
+                      onDismissRequest = { tabs.ctxMenu = null },
+                      containerColor = Bar,
+                      title = {
+                          Text(
+                              cm.url,
+                              color = Soft,
+                              fontSize = 12.sp,
+                              maxLines = 3,
+                              overflow = TextOverflow.Ellipsis
+                          )
+                      },
+                      text = {
+                          Column {
+                              MenuRow("Open in new tab") {
+                                  tabs.ctxMenu = null
+                                  tabs.newTab(cm.url, true, tabs.current?.id ?: 0)
+                              }
+                              MenuRow("Open in Background") {
+                                  tabs.ctxMenu = null
+                                  tabs.newTab(cm.url, false, tabs.current?.id ?: 0)
+                                  toast(ctx, "Opened in background")
+                              }
+                              MenuRow("Copy link") {
+                                  tabs.ctxMenu = null
+                                  copyText(ctx, cm.url)
+                                  toast(ctx, "Link copied")
+                              }
+                          }
+                      },
+                      confirmButton = {}
+                  )
               }
           }
 
@@ -2424,13 +2613,14 @@ jobs:
 
           class TabGroup(val key: String, val label: String, val tabs: List<BrowserTab>)
 
-          fun groupKeyOf(t: BrowserTab?): String {
-              val u = t?.url ?: ""
+          fun keyOfUrl(u: String): String {
               if (u.isBlank() || u.startsWith("about:")) return "newtab"
               val h = try { android.net.Uri.parse(u).host ?: "" } catch (e: Exception) { "" }
               val d = h.removePrefix("www.")
               return if (d.isBlank()) "other" else d
           }
+
+          fun groupKeyOf(t: BrowserTab?): String = keyOfUrl(t?.url ?: "")
 
           fun groupTabs(all: List<BrowserTab>): List<TabGroup> {
               val order = ArrayList<String>()
@@ -2704,7 +2894,8 @@ jobs:
               sub: String,
               active: Boolean,
               onClick: () -> Unit,
-              onRemove: (() -> Unit)?
+              onRemove: (() -> Unit)?,
+              leading: (@Composable () -> Unit)? = null
           ) {
               Row(
                   Modifier
@@ -2714,6 +2905,10 @@ jobs:
                       .padding(start = 14.dp, top = 9.dp, bottom = 9.dp, end = 6.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
+                  if (leading != null) {
+                      leading()
+                      Spacer(Modifier.width(12.dp))
+                  }
                   Column(Modifier.weight(1f)) {
                       Text(title, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                       Text(sub, color = Soft, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -2740,6 +2935,7 @@ jobs:
           @Composable
           fun HistoryScreen(onBack: () -> Unit, onOpen: (String) -> Unit) {
               var hist by remember { mutableStateOf<List<PageEntry>>(HistoryStore.load()) }
+              var confirmClear by remember { mutableStateOf(false) }
               val fmt = remember {
                   java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
               }
@@ -2748,25 +2944,41 @@ jobs:
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("History", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                       if (hist.isNotEmpty()) {
-                          TextButton(onClick = {
-                              HistoryStore.clear()
-                              hist = emptyList()
-                          }) { Text("Clear", color = Danger) }
+                          TextButton(onClick = { confirmClear = true }) { Text("Clear", color = Danger) }
                       }
                   }
                   if (hist.isEmpty()) EmptyNote("No history yet.")
                   LazyColumn(Modifier.weight(1f)) {
-                      items(hist.take(300)) { e ->
+                      items(hist) { e ->
                           val host = android.net.Uri.parse(e.url).host ?: e.url
                           SheetRow(
                               title = e.title.ifBlank { e.url },
                               sub = host + " · " + fmt.format(java.util.Date(e.time)),
                               active = false,
                               onClick = { onOpen(e.url) },
-                              onRemove = null
+                              onRemove = null,
+                              leading = { FaviconBox(keyOfUrl(e.url), 24.dp, 6.dp, 12) }
                           )
                       }
                   }
+              }
+              if (confirmClear) {
+                  AlertDialog(
+                      onDismissRequest = { confirmClear = false },
+                      containerColor = Bar,
+                      title = { Text("Clear history?", color = Color.White) },
+                      text = { Text("All " + hist.size + " entries will be deleted.", color = Soft) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              HistoryStore.clear()
+                              hist = emptyList()
+                              confirmClear = false
+                          }) { Text("Clear", color = Danger) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { confirmClear = false }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
               }
           }
 
