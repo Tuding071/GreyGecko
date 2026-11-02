@@ -1305,6 +1305,7 @@ jobs:
               var thumb by mutableStateOf<ImageBitmap?>(null)
               var extId = -1
               var lastRecover = 0L
+              var scrollY = 0
               var lastUsed = System.currentTimeMillis()
               var savedState: GeckoSession.SessionState? = null
               val videos = mutableStateListOf<VideoItem>()
@@ -1347,9 +1348,13 @@ jobs:
                       if (!requested.add(key)) return
                   }
                   Thread {
-                      var bmp = download("https://" + key + "/favicon.ico")
-                      if (bmp == null || bmp.width < 16) {
-                          bmp = download("https://www.google.com/s2/favicons?sz=64&domain=" + key)
+                      var bmp = readDisk(key)
+                      if (bmp == null) {
+                          bmp = download("https://" + key + "/favicon.ico")
+                          if (bmp == null || bmp.width < 16) {
+                              bmp = download("https://www.google.com/s2/favicons?sz=64&domain=" + key)
+                          }
+                          if (bmp != null) writeDisk(key, bmp)
                       }
                       val b = bmp
                       if (b != null) {
@@ -1362,6 +1367,38 @@ jobs:
                           }
                       }
                   }.start()
+              }
+
+              private fun favDir(): java.io.File {
+                  val d = java.io.File(Gecko.appCtx.filesDir, "favicons")
+                  d.mkdirs()
+                  return d
+              }
+
+              private fun favFile(key: String): java.io.File =
+                  java.io.File(favDir(), key.replace(Regex("[^A-Za-z0-9.-]"), "_") + ".png")
+
+              private fun readDisk(key: String): Bitmap? {
+                  return try {
+                      val f = favFile(key)
+                      if (f.exists()) BitmapFactory.decodeFile(f.path) else null
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              private fun writeDisk(key: String, b: Bitmap) {
+                  try {
+                      java.io.FileOutputStream(favFile(key)).use { out ->
+                          b.compress(Bitmap.CompressFormat.PNG, 100, out)
+                      }
+                      val files = favDir().listFiles() ?: return
+                      if (files.size > 100) {
+                          val sorted = files.sortedBy { it.lastModified() }
+                          for (i in 0 until sorted.size - 100) sorted[i].delete()
+                      }
+                  } catch (e: Exception) {
+                  }
               }
 
               private fun download(u: String): Bitmap? {
@@ -1773,6 +1810,7 @@ jobs:
                           t.url = url
                           t.thumb = null
                           t.videos.clear()
+                          t.scrollY = 0
                           t.seen.clear()
                       }
 
@@ -1794,6 +1832,11 @@ jobs:
                           sessionState: GeckoSession.SessionState
                       ) {
                           t.savedState = sessionState
+                      }
+                  }
+                  s.scrollDelegate = object : GeckoSession.ScrollDelegate {
+                      override fun onScrollChanged(session: GeckoSession, scrollX: Int, scrollY: Int) {
+                          t.scrollY = scrollY
                       }
                   }
                   s.contentDelegate = object : GeckoSession.ContentDelegate {
@@ -1955,6 +1998,7 @@ jobs:
           import androidx.compose.foundation.basicMarquee
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.layout.*
@@ -1979,9 +2023,11 @@ jobs:
           import androidx.compose.ui.focus.onFocusChanged
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.input.pointer.PointerEventPass
           import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalDensity
           import androidx.compose.ui.platform.LocalFocusManager
           import androidx.compose.ui.platform.LocalView
           import androidx.compose.ui.text.TextRange
@@ -1993,6 +2039,7 @@ jobs:
           import androidx.compose.ui.text.input.TextFieldValue
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.IntOffset
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
@@ -2004,6 +2051,7 @@ jobs:
           import org.json.JSONObject
           import org.mozilla.geckoview.GeckoResult
           import org.mozilla.geckoview.GeckoRuntime
+          import org.mozilla.geckoview.GeckoRuntimeSettings
           import org.mozilla.geckoview.GeckoView
           import org.mozilla.geckoview.WebExtension
 
@@ -2106,7 +2154,16 @@ jobs:
               fun runtime(ctx: Context): GeckoRuntime {
                   rt?.let { return it }
                   appCtx = ctx.applicationContext
-                  val r = GeckoRuntime.create(appCtx)
+                  val cfg = java.io.File(appCtx.filesDir, "gecko-config.yaml")
+                  try {
+                      cfg.writeText("prefs:\n  ui.click_hold_context_menus.delay: 350\n")
+                  } catch (e: Exception) {
+                      Log.e("GreyScript", "config write failed", e)
+                  }
+                  val settings = GeckoRuntimeSettings.Builder()
+                      .configFilePath(cfg.absolutePath)
+                      .build()
+                  val r = GeckoRuntime.create(appCtx, settings)
                   rt = r
                   r.webExtensionController
                       .ensureBuiltIn("resource://android/assets/ext/", "scripts@grey.gecko")
@@ -2362,6 +2419,15 @@ jobs:
               val vids = cur?.videos
               val cm = tabs.ctxMenu
               val hostView = LocalView.current
+              val density = LocalDensity.current
+              val pullTrigger = with(density) { 80.dp.toPx() }
+              var pull by remember { mutableStateOf(0f) }
+              val bmRev = BookmarkStore.rev
+              val curUrl = cur?.url ?: ""
+              val marked = remember(bmRev, curUrl) {
+                  curUrl.isNotBlank() && curUrl != "about:blank" &&
+                      BookmarkStore.load().any { normUrl(it.url) == normUrl(curUrl) }
+              }
 
               LaunchedEffect(active) {
                   if (!active) {
@@ -2465,6 +2531,9 @@ jobs:
                           if (editing) {
                               Spacer(Modifier.width(6.dp))
                               Button(onClick = { submit(text.text) }) { Text("Go") }
+                          } else if (!tabs.home && cur?.loading == true) {
+                              Spacer(Modifier.width(6.dp))
+                              Button(onClick = { cur?.session?.stop() }) { Text("×", fontSize = 20.sp) }
                           }
                           Box {
                               TextButton(onClick = { menu = true }) {
@@ -2529,7 +2598,41 @@ jobs:
                               }
                           }
                       }
-                      Box(Modifier.weight(1f).fillMaxWidth()) {
+                      Box(
+                          Modifier
+                              .weight(1f)
+                              .fillMaxWidth()
+                              .pointerInput(Unit) {
+                                  awaitPointerEventScope {
+                                      while (true) {
+                                          val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                          val c0 = tabs.current
+                                          var armed = !tabs.home && c0 != null && c0.session != null && c0.scrollY == 0
+                                          val startX = down.position.x
+                                          val startY = down.position.y
+                                          var dy = 0f
+                                          while (true) {
+                                              val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                              if (ev.changes.size > 1) armed = false
+                                              val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                              if (!ch.pressed) {
+                                                  if (armed && dy >= pullTrigger) {
+                                                      tabs.current?.session?.reload()
+                                                  }
+                                                  break
+                                              }
+                                              val c1 = tabs.current
+                                              if (c1 == null || c1.scrollY > 0) armed = false
+                                              dy = ch.position.y - startY
+                                              val dx = ch.position.x - startX
+                                              if (armed && kotlin.math.abs(dx) > 40f && kotlin.math.abs(dx) > kotlin.math.abs(dy)) armed = false
+                                              pull = if (armed && dy > 0f) minOf(dy, pullTrigger * 1.4f) else 0f
+                                          }
+                                          pull = 0f
+                                      }
+                                  }
+                              }
+                      ) {
                           AndroidView(
                               factory = { c -> GeckoView(c).also { tabs.view = it } },
                               update = { v ->
@@ -2548,8 +2651,47 @@ jobs:
                           )
                           if (tabs.home) {
                               HomeScreen(Modifier.fillMaxSize())
-                          }
-                      }
+                              }
+                              if (pull > 0f) {
+                                  val prog = (pull / pullTrigger).coerceIn(0f, 1f)
+                                  Box(
+                                      Modifier
+                                          .align(Alignment.TopCenter)
+                                          .offset { IntOffset(0, (pull * 0.4f).toInt()) }
+                                          .size(36.dp)
+                                          .clip(CircleShape)
+                                          .background(Bar)
+                                          .border(0.5.dp, Color(0xFF555555), CircleShape),
+                                      contentAlignment = Alignment.Center
+                                  ) {
+                                      CircularProgressIndicator(
+                                          progress = { prog },
+                                          modifier = Modifier.size(20.dp),
+                                          color = if (prog >= 1f) TmGreen else Color.White,
+                                          strokeWidth = 2.dp
+                                      )
+                                  }
+                              }
+                              }
+                              if (!tabs.home && marked) {
+                                  Box(
+                                      Modifier
+                                          .fillMaxWidth()
+                                          .height(14.dp)
+                                          .background(Color.White)
+                                          .clipToBounds(),
+                                      contentAlignment = Alignment.CenterStart
+                                  ) {
+                                      Text(
+                                          "Bookmarked  •  ".repeat(30),
+                                          color = Color.Black,
+                                          fontSize = 9.sp,
+                                          maxLines = 1,
+                                          softWrap = false,
+                                          modifier = Modifier.basicMarquee(iterations = Int.MAX_VALUE)
+                                      )
+                                  }
+                              }
                   }
                   if (!tabs.home && grabberOn && vids != null && vids.isNotEmpty()) {
                       VideoPanel(
