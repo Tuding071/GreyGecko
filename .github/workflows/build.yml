@@ -1295,7 +1295,8 @@ jobs:
           import org.mozilla.geckoview.GeckoSession
           import org.mozilla.geckoview.GeckoView
 
-          class BrowserTab(val id: Int, var session: GeckoSession?, var openerId: Int) {
+          class BrowserTab(val id: Int, initialSession: GeckoSession?, var openerId: Int) {
+              var session by mutableStateOf(initialSession)
               var url by mutableStateOf("")
               var title by mutableStateOf("")
               var progress by mutableStateOf(0)
@@ -1385,6 +1386,7 @@ jobs:
               var current by mutableStateOf<BrowserTab?>(null)
               var maxBg by mutableStateOf(6)
               var ctxMenu by mutableStateOf<CtxInfo?>(null)
+              var home by mutableStateOf(true)
               var view: GeckoView? = null
               private var counter = 0
               private var closing = false
@@ -1462,7 +1464,8 @@ jobs:
                       counter = maxId
                       val curId = root.optInt("cur", 0)
                       val c = tabs.firstOrNull { it.id == curId } ?: tabs.last()
-                      select(c)
+                      current = c
+                      c.lastUsed = System.currentTimeMillis()
                       val seenKeys = HashSet<String>()
                       for (x in listOf(c) + tabs.filter { it !== c }) {
                           if (x.url.isBlank() || x.url.startsWith("about:")) continue
@@ -1490,6 +1493,7 @@ jobs:
                           removeTab(d, false)
                       }
                   }
+                  if (makeCurrent) home = false
                   counter += 1
                   val t = BrowserTab(counter, null, opener)
                   t.url = url
@@ -1544,7 +1548,8 @@ jobs:
               }
 
               fun load(t: BrowserTab, url: String) {
-                  ensureLive(t)
+              home = false
+              ensureLive(t)
                   t.session?.loadUri(url)
               }
 
@@ -1573,7 +1578,7 @@ jobs:
                   }
                   if (tabs.isEmpty()) {
                       current = null
-                      if (keepOne) newTab("about:blank", true)
+                      if (keepOne) home = true
                   } else if (current === t) {
                       select(tabs[minOf(i, tabs.size - 1)])
                   }
@@ -1645,6 +1650,7 @@ jobs:
 
               fun capture(t: BrowserTab) {
                   val v = view ?: return
+                  if (home || t.session == null) return
                   if (current !== t) return
                   if (v.session !== t.session) return
                   try {
@@ -1857,6 +1863,7 @@ jobs:
           import androidx.activity.compose.BackHandler
           import androidx.activity.compose.setContent
           import androidx.activity.enableEdgeToEdge
+          import androidx.compose.animation.animateColorAsState
           import androidx.compose.animation.core.animateFloatAsState
           import androidx.compose.foundation.ExperimentalFoundationApi
           import androidx.compose.foundation.Image
@@ -2044,7 +2051,7 @@ jobs:
                   Thread { Updater.autoCheck() }.start()
                   tabs = TabManager(runtime)
                   Videos.tabs = tabs
-                  if (!tabs.restore()) tabs.newTab("https://example.com", true)
+                  tabs.restore()
                   setContent { App(tabs) }
               }
 
@@ -2182,28 +2189,31 @@ jobs:
                                           tabs,
                                           onBack = { screen = "browser" },
                                           onNewTab = {
-                                              tabs.newTab("about:blank", true)
+                                              tabs.home = true
                                               startEdit = true
                                               screen = "browser"
                                           },
                                           onSelect = { t ->
-                                              tabs.select(t)
-                                              screen = "browser"
+                                          tabs.select(t)
+                                          tabs.home = false
+                                          screen = "browser"
                                           }
                                       )
                                       "history" -> HistoryScreen(
                                           onBack = { screen = "browser" },
                                           onOpen = { u ->
-                                              tabs.current?.let { c -> tabs.load(c, u) }
-                                              screen = "browser"
+                                          val c = tabs.current
+                                          if (tabs.home || c == null) tabs.newTab(u, true) else tabs.load(c, u)
+                                          screen = "browser"
                                           }
                                       )
                                       "bookmarks" -> BookmarksScreen(
                                           tabs,
                                           onBack = { screen = "browser" },
                                           onOpen = { u ->
-                                              tabs.current?.let { c -> tabs.load(c, u) }
-                                              screen = "browser"
+                                          val c = tabs.current
+                                          if (tabs.home || c == null) tabs.newTab(u, true) else tabs.load(c, u)
+                                          screen = "browser"
                                           }
                                       )
                                       "scripts" -> ScriptsScreen(
@@ -2280,7 +2290,9 @@ jobs:
                       editing = false
                       focusManager.clearFocus()
                   } else if (panelOpen) {
-                      panelOpen = false
+                  panelOpen = false
+                  } else if (tabs.home) {
+                  ctx.findActivity()?.moveTaskToBack(true)
                   } else if (c != null && c.canGoBack) {
                       c.session?.goBack()
                   } else if (c != null && tabs.openerOf(c) != null) {
@@ -2295,7 +2307,9 @@ jobs:
                   if (now - lastSubmit < 600) return
                   lastSubmit = now
                   val t = tabs.current
-                  if (raw.isNotBlank() && t != null) tabs.load(t, normalize(raw))
+                  if (raw.isNotBlank()) {
+                      if (tabs.home || t == null) tabs.newTab(normalize(raw), true) else tabs.load(t, normalize(raw))
+                  }
                   scope.launch {
                       delay(300)
                       editing = false
@@ -2335,12 +2349,12 @@ jobs:
                           }
                           Spacer(Modifier.width(8.dp))
                           UrlBar(
-                              tab = cur,
+                          tab = if (tabs.home) null else cur,
                               editing = editing,
                               text = text,
                               onText = { text = it },
                               onStart = {
-                                  val u = shownUrl(tabs.current)
+                                  val u = if (tabs.home) "" else shownUrl(tabs.current)
                                   text = TextFieldValue(u, TextRange(0, u.length))
                                   editing = true
                               },
@@ -2388,8 +2402,8 @@ jobs:
                                           menu = false
                                           val t = tabs.current
                                           val u = shownUrl(t)
-                                          if (t != null && u.isNotBlank()) {
-                                              BookmarkStore.add(u, t.title.ifBlank { u })
+                                          if (!tabs.home && t != null && u.isNotBlank()) {
+                                          BookmarkStore.add(u, t.title.ifBlank { u })
                                               toast(ctx, "Bookmark added")
                                           } else {
                                               toast(ctx, "Nothing to bookmark")
@@ -2415,20 +2429,32 @@ jobs:
                               }
                           }
                       }
-                      AndroidView(
-                          factory = { c -> GeckoView(c).also { tabs.view = it } },
-                          update = { v ->
-                              val s = cur?.session
-                              if (s != null && v.session !== s) v.setSession(s)
-                          },
-                          onRelease = { v ->
-                              if (tabs.view === v) tabs.view = null
-                              v.releaseSession()
-                          },
-                          modifier = Modifier.fillMaxSize()
-                      )
+                      Box(Modifier.weight(1f).fillMaxWidth()) {
+                          AndroidView(
+                              factory = { c -> GeckoView(c).also { tabs.view = it } },
+                              update = { v ->
+                                  val s = cur?.session
+                                  if (s != null) {
+                                      if (v.session !== s) v.setSession(s)
+                                  } else if (v.session != null) {
+                                      v.releaseSession()
+                                  }
+                              },
+                              onRelease = { v ->
+                                  if (tabs.view === v) tabs.view = null
+                                  v.releaseSession()
+                              },
+                              modifier = Modifier.fillMaxSize()
+                          )
+                          if (tabs.home) {
+                              HomeScreen(
+                                  onOpen = { u -> tabs.newTab(u, true) },
+                                  modifier = Modifier.fillMaxSize()
+                              )
+                          }
+                      }
                   }
-                  if (grabberOn && vids != null && vids.isNotEmpty()) {
+                  if (!tabs.home && grabberOn && vids != null && vids.isNotEmpty()) {
                       VideoPanel(
                           videos = vids,
                           open = panelOpen,
@@ -2789,9 +2815,97 @@ jobs:
           }
 
           @Composable
+          fun UndoClose(closing: Boolean, onClick: () -> Unit) {
+              if (closing) {
+                  Box(
+                      Modifier
+                          .height(26.dp)
+                          .clip(RoundedCornerShape(13.dp))
+                          .background(Color.White)
+                          .clickable { onClick() }
+                          .padding(horizontal = 10.dp),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text("Undo", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                  }
+              } else {
+                  Box(
+                      Modifier
+                          .size(26.dp)
+                          .clip(CircleShape)
+                          .background(Field)
+                          .clickable { onClick() },
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text("×", color = Soft, fontSize = 16.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun HomeTile(e: PageEntry, onOpen: (String) -> Unit) {
+              val key = keyOfUrl(e.url)
+              Column(
+                  Modifier
+                      .width(72.dp)
+                      .clip(RoundedCornerShape(10.dp))
+                      .clickable { onOpen(e.url) }
+                      .padding(vertical = 6.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  FaviconBox(key, 48.dp, 12.dp, 20)
+                  Spacer(Modifier.height(6.dp))
+                  Text(
+                      key,
+                      color = Soft,
+                      fontSize = 11.sp,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis
+                  )
+              }
+          }
+
+          @Composable
+          fun HomeScreen(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+              val marks = remember { BookmarkStore.load().take(8) }
+              Column(
+                  modifier
+                      .background(BG)
+                      .pointerInput(Unit) { detectTapGestures { } }
+                      .padding(20.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Spacer(Modifier.height(72.dp))
+                  Text("GreyGecko", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
+                  Spacer(Modifier.height(4.dp))
+                  Text("Search or enter an address above", color = Soft, fontSize = 13.sp)
+                  Spacer(Modifier.height(36.dp))
+                  for (row in marks.chunked(4)) {
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                          for (e in row) {
+                              HomeTile(e, onOpen)
+                          }
+                          for (i in row.size until 4) {
+                              Spacer(Modifier.width(72.dp))
+                          }
+                      }
+                      Spacer(Modifier.height(12.dp))
+                  }
+              }
+          }
+
+          @Composable
           fun TabCard(t: BrowserTab, foreground: Boolean, onClick: () -> Unit, onClose: () -> Unit) {
               val shape = RoundedCornerShape(12.dp)
               val key = groupKeyOf(t)
+              var closing by remember { mutableStateOf(false) }
+              LaunchedEffect(closing) {
+                  if (closing) {
+                      delay(2000)
+                      onClose()
+                  }
+              }
+              val cardBg by animateColorAsState(if (closing) Color(0xFF4A2A2A) else Bar, label = "cardBg")
               val title = t.title.ifBlank { shownUrl(t).ifBlank { "New tab" } }
               val thumb = t.thumb
               Row(
@@ -2799,9 +2913,9 @@ jobs:
                       .fillMaxWidth()
                       .padding(bottom = 10.dp)
                       .clip(shape)
-                      .background(Bar)
+                      .background(cardBg)
                       .then(if (foreground) Modifier.border(2.dp, TmGreen, shape) else Modifier)
-                      .clickable { onClick() }
+                      .clickable(enabled = !closing) { onClick() }
                       .padding(10.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
@@ -2846,16 +2960,7 @@ jobs:
                       }
                   }
                   Spacer(Modifier.width(8.dp))
-                  Box(
-                      Modifier
-                          .size(26.dp)
-                          .clip(CircleShape)
-                          .background(Field)
-                          .clickable { onClose() },
-                      contentAlignment = Alignment.Center
-                  ) {
-                      Text("×", color = Soft, fontSize = 16.sp)
-                  }
+                  UndoClose(closing) { closing = !closing }
               }
           }
 
@@ -2928,12 +3033,14 @@ jobs:
                                       modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp)
                                   )
                                   for (t in active.tabs) {
-                                      TabCard(
-                                          t,
-                                          foreground = t === tabs.current,
-                                          onClick = { onSelect(t) },
-                                          onClose = { tabs.close(t) }
-                                      )
+                                      key(t.id) {
+                                          TabCard(
+                                              t,
+                                              foreground = t === tabs.current,
+                                              onClick = { onSelect(t) },
+                                              onClose = { tabs.close(t) }
+                                          )
+                                      }
                                   }
                               }
                           }
@@ -3056,13 +3163,21 @@ jobs:
           fun BookmarkCard(e: PageEntry, onClick: () -> Unit, onRemove: () -> Unit) {
               val shape = RoundedCornerShape(12.dp)
               val key = keyOfUrl(e.url)
+              var closing by remember { mutableStateOf(false) }
+              LaunchedEffect(closing) {
+                  if (closing) {
+                      delay(2000)
+                      onRemove()
+                  }
+              }
+              val cardBg by animateColorAsState(if (closing) Color(0xFF4A2A2A) else Bar, label = "cardBg")
               Row(
                   Modifier
                       .fillMaxWidth()
                       .padding(bottom = 10.dp)
                       .clip(shape)
-                      .background(Bar)
-                      .clickable { onClick() }
+                      .background(cardBg)
+                      .clickable(enabled = !closing) { onClick() }
                       .padding(10.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
@@ -3086,16 +3201,7 @@ jobs:
                       )
                   }
                   Spacer(Modifier.width(8.dp))
-                  Box(
-                      Modifier
-                          .size(26.dp)
-                          .clip(CircleShape)
-                          .background(Field)
-                          .clickable { onRemove() },
-                      contentAlignment = Alignment.Center
-                  ) {
-                      Text("×", color = Soft, fontSize = 16.sp)
-                  }
+                  UndoClose(closing) { closing = !closing }
               }
           }
 
@@ -3156,14 +3262,16 @@ jobs:
                                           modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp)
                                       )
                                       for (e in active.items) {
-                                          BookmarkCard(
-                                              e,
-                                              onClick = { onOpen(e.url) },
-                                              onRemove = {
-                                                  BookmarkStore.remove(e.url)
-                                                  marks = BookmarkStore.load()
-                                              }
-                                          )
+                                          key(e.url) {
+                                              BookmarkCard(
+                                                  e,
+                                                  onClick = { onOpen(e.url) },
+                                                  onRemove = {
+                                                      BookmarkStore.remove(e.url)
+                                                      marks = BookmarkStore.load()
+                                                  }
+                                              )
+                                          }
                                       }
                                   }
                               }
