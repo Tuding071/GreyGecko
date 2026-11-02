@@ -1304,6 +1304,7 @@ jobs:
               var canGoBack by mutableStateOf(false)
               var thumb by mutableStateOf<ImageBitmap?>(null)
               var extId = -1
+              var lastRecover = 0L
               var lastUsed = System.currentTimeMillis()
               var savedState: GeckoSession.SessionState? = null
               val videos = mutableStateListOf<VideoItem>()
@@ -1387,6 +1388,8 @@ jobs:
               var maxBg by mutableStateOf(6)
               var ctxMenu by mutableStateOf<CtxInfo?>(null)
               var home by mutableStateOf(true)
+              val closingIds = mutableStateListOf<Int>()
+              private val closeJobs = HashMap<Int, Runnable>()
               var view: GeckoView? = null
               private var counter = 0
               private var closing = false
@@ -1522,7 +1525,11 @@ jobs:
               }
 
               private fun ensureLive(t: BrowserTab, initialUrl: String? = null) {
-                  if (t.session != null) return
+              val old = t.session
+              if (old != null) {
+                  if (old.isOpen) return
+                  t.session = null
+              }
                   val s = GeckoSession()
                   t.session = s
                   attach(t, s)
@@ -1539,6 +1546,7 @@ jobs:
 
               fun select(t: BrowserTab) {
                   val prev = current
+                  Log.d("GreyScript", "select tab " + t.id + " " + t.url + " session=" + System.identityHashCode(t.session))
                   if (prev != null && prev !== t) prev.lastUsed = System.currentTimeMillis()
                   ensureLive(t)
                   t.lastUsed = System.currentTimeMillis()
@@ -1596,6 +1604,51 @@ jobs:
                   }
                   tabs.clear()
                   current = null
+              }
+
+              fun requestClose(t: BrowserTab) {
+                  if (closingIds.contains(t.id)) return
+                  closingIds.add(t.id)
+                  val r = Runnable {
+                      closeJobs.remove(t.id)
+                      closingIds.remove(t.id)
+                      close(t)
+                  }
+                  closeJobs[t.id] = r
+                  main.postDelayed(r, 2000L)
+              }
+
+              fun undoClose(t: BrowserTab) {
+                  val r = closeJobs.remove(t.id)
+                  if (r != null) main.removeCallbacks(r)
+                  closingIds.remove(t.id)
+              }
+
+              private fun recover(t: BrowserTab, dead: GeckoSession) {
+                  if (t.session !== dead) return
+                  Log.d("GreyScript", "session died for tab " + t.id + " " + t.url)
+                  t.session = null
+                  t.loading = false
+                  t.progress = 0
+                  t.extId = -1
+                  val now = System.currentTimeMillis()
+                  if (now - t.lastRecover < 5000L) t.savedState = null
+                  t.lastRecover = now
+                  if (t === current && !home && t.url.isNotBlank() && t.url != "about:blank") ensureLive(t)
+              }
+
+              fun refreshView() {
+                  val c = current
+                  if (c == null || c.session == null) return
+                  main.postDelayed({
+                      ensureLive(c)
+                      val v = view
+                      val s = c.session
+                      if (v != null && s != null) {
+                          v.releaseSession()
+                          v.setSession(s)
+                      }
+                  }, 200L)
               }
 
               fun cycleMaxBg() {
@@ -1744,6 +1797,13 @@ jobs:
                       }
                   }
                   s.contentDelegate = object : GeckoSession.ContentDelegate {
+                      override fun onCrash(session: GeckoSession) {
+                          recover(t, session)
+                      }
+
+                      override fun onKill(session: GeckoSession) {
+                          recover(t, session)
+                      }
                       override fun onTitleChange(session: GeckoSession, title: String?) {
                           t.title = title ?: ""
                           HistoryStore.setTitle(t.url, t.title)
@@ -1829,6 +1889,28 @@ jobs:
           }
 
           object BookmarkStore {
+              var rev by mutableStateOf(0)
+              val closing = mutableStateListOf<String>()
+              private val jobs = HashMap<String, Runnable>()
+              private val main = Handler(Looper.getMainLooper())
+
+              fun requestRemove(url: String) {
+                  if (closing.contains(url)) return
+                  closing.add(url)
+                  val r = Runnable {
+                      jobs.remove(url)
+                      closing.remove(url)
+                      remove(url)
+                  }
+                  jobs[url] = r
+                  main.postDelayed(r, 2000L)
+              }
+
+              fun undoRemove(url: String) {
+                  val r = jobs.remove(url)
+                  if (r != null) main.removeCallbacks(r)
+                  closing.remove(url)
+              }
               @Synchronized
               fun load(): List<PageEntry> = readEntries("bookmarks")
 
@@ -1839,6 +1921,7 @@ jobs:
                   l.removeAll { it.url == url }
                   l.add(0, PageEntry(url, title, System.currentTimeMillis()))
                   writeEntries("bookmarks", l)
+                  rev++
               }
 
               @Synchronized
@@ -1846,6 +1929,7 @@ jobs:
                   val l = readEntries("bookmarks")
                   l.removeAll { it.url == url }
                   writeEntries("bookmarks", l)
+                  rev++
               }
           }
           EOF
@@ -1899,6 +1983,7 @@ jobs:
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalFocusManager
+          import androidx.compose.ui.platform.LocalView
           import androidx.compose.ui.text.TextRange
           import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.font.FontFamily
@@ -2055,8 +2140,13 @@ jobs:
                   setContent { App(tabs) }
               }
 
+              override fun onStart() {
+                  super.onStart()
+                  if (::tabs.isInitialized) tabs.refreshView()
+              }
+
               override fun onStop() {
-                  if (::tabs.isInitialized) tabs.saveNow()
+              if (::tabs.isInitialized) tabs.saveNow()
                   super.onStop()
               }
 
@@ -2271,6 +2361,16 @@ jobs:
               val focusManager = LocalFocusManager.current
               val vids = cur?.videos
               val cm = tabs.ctxMenu
+              val hostView = LocalView.current
+
+              LaunchedEffect(active) {
+                  if (!active) {
+                      editing = false
+                      focusManager.clearFocus(true)
+                      val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                      imm.hideSoftInputFromWindow(hostView.windowToken, 0)
+                  }
+              }
 
               LaunchedEffect(cur, vids?.isEmpty()) {
                   if (vids == null || vids.isEmpty()) panelOpen = false
@@ -2447,10 +2547,7 @@ jobs:
                               modifier = Modifier.fillMaxSize()
                           )
                           if (tabs.home) {
-                              HomeScreen(
-                                  onOpen = { u -> tabs.newTab(u, true) },
-                                  modifier = Modifier.fillMaxSize()
-                              )
+                              HomeScreen(Modifier.fillMaxSize())
                           }
                       }
                   }
@@ -2843,31 +2940,7 @@ jobs:
           }
 
           @Composable
-          fun HomeTile(e: PageEntry, onOpen: (String) -> Unit) {
-              val key = keyOfUrl(e.url)
-              Column(
-                  Modifier
-                      .width(72.dp)
-                      .clip(RoundedCornerShape(10.dp))
-                      .clickable { onOpen(e.url) }
-                      .padding(vertical = 6.dp),
-                  horizontalAlignment = Alignment.CenterHorizontally
-              ) {
-                  FaviconBox(key, 48.dp, 12.dp, 20)
-                  Spacer(Modifier.height(6.dp))
-                  Text(
-                      key,
-                      color = Soft,
-                      fontSize = 11.sp,
-                      maxLines = 1,
-                      overflow = TextOverflow.Ellipsis
-                  )
-              }
-          }
-
-          @Composable
-          fun HomeScreen(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
-              val marks = remember { BookmarkStore.load().take(8) }
+          fun HomeScreen(modifier: Modifier = Modifier) {
               Column(
                   modifier
                       .background(BG)
@@ -2879,32 +2952,13 @@ jobs:
                   Text("GreyGecko", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
                   Spacer(Modifier.height(4.dp))
                   Text("Search or enter an address above", color = Soft, fontSize = 13.sp)
-                  Spacer(Modifier.height(36.dp))
-                  for (row in marks.chunked(4)) {
-                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                          for (e in row) {
-                              HomeTile(e, onOpen)
-                          }
-                          for (i in row.size until 4) {
-                              Spacer(Modifier.width(72.dp))
-                          }
-                      }
-                      Spacer(Modifier.height(12.dp))
-                  }
               }
           }
 
           @Composable
-          fun TabCard(t: BrowserTab, foreground: Boolean, onClick: () -> Unit, onClose: () -> Unit) {
+          fun TabCard(t: BrowserTab, foreground: Boolean, closing: Boolean, onClick: () -> Unit, onToggleClose: () -> Unit) {
               val shape = RoundedCornerShape(12.dp)
               val key = groupKeyOf(t)
-              var closing by remember { mutableStateOf(false) }
-              LaunchedEffect(closing) {
-                  if (closing) {
-                      delay(2000)
-                      onClose()
-                  }
-              }
               val cardBg by animateColorAsState(if (closing) Color(0xFF4A2A2A) else Bar, label = "cardBg")
               val title = t.title.ifBlank { shownUrl(t).ifBlank { "New tab" } }
               val thumb = t.thumb
@@ -2960,7 +3014,7 @@ jobs:
                       }
                   }
                   Spacer(Modifier.width(8.dp))
-                  UndoClose(closing) { closing = !closing }
+                  UndoClose(closing) { onToggleClose() }
               }
           }
 
@@ -3037,8 +3091,11 @@ jobs:
                                           TabCard(
                                               t,
                                               foreground = t === tabs.current,
+                                              closing = tabs.closingIds.contains(t.id),
                                               onClick = { onSelect(t) },
-                                              onClose = { tabs.close(t) }
+                                              onToggleClose = {
+                                                  if (tabs.closingIds.contains(t.id)) tabs.undoClose(t) else tabs.requestClose(t)
+                                              }
                                           )
                                       }
                                   }
@@ -3160,16 +3217,9 @@ jobs:
           }
 
           @Composable
-          fun BookmarkCard(e: PageEntry, onClick: () -> Unit, onRemove: () -> Unit) {
+          fun BookmarkCard(e: PageEntry, closing: Boolean, onClick: () -> Unit, onToggleClose: () -> Unit) {
               val shape = RoundedCornerShape(12.dp)
               val key = keyOfUrl(e.url)
-              var closing by remember { mutableStateOf(false) }
-              LaunchedEffect(closing) {
-                  if (closing) {
-                      delay(2000)
-                      onRemove()
-                  }
-              }
               val cardBg by animateColorAsState(if (closing) Color(0xFF4A2A2A) else Bar, label = "cardBg")
               Row(
                   Modifier
@@ -3201,13 +3251,14 @@ jobs:
                       )
                   }
                   Spacer(Modifier.width(8.dp))
-                  UndoClose(closing) { closing = !closing }
+                  UndoClose(closing) { onToggleClose() }
               }
           }
 
           @Composable
           fun BookmarksScreen(tabs: TabManager, onBack: () -> Unit, onOpen: (String) -> Unit) {
-              var marks by remember { mutableStateOf<List<PageEntry>>(BookmarkStore.load()) }
+              val rev = BookmarkStore.rev
+              val marks = remember(rev) { BookmarkStore.load() }
               val groups = groupBookmarks(marks)
               var activeKey by remember { mutableStateOf(groupKeyOf(tabs.current)) }
               val active = groups.firstOrNull { it.key == activeKey } ?: groups.firstOrNull()
@@ -3265,10 +3316,11 @@ jobs:
                                           key(e.url) {
                                               BookmarkCard(
                                                   e,
+                                                  closing = BookmarkStore.closing.contains(e.url),
                                                   onClick = { onOpen(e.url) },
-                                                  onRemove = {
-                                                      BookmarkStore.remove(e.url)
-                                                      marks = BookmarkStore.load()
+                                                  onToggleClose = {
+                                                      if (BookmarkStore.closing.contains(e.url)) BookmarkStore.undoRemove(e.url)
+                                                      else BookmarkStore.requestRemove(e.url)
                                                   }
                                               )
                                           }
