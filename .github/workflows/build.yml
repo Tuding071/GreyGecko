@@ -174,7 +174,7 @@ jobs:
           {
             "manifest_version": 2,
             "name": "GreyScripts",
-            "version": "3.0",
+            "version": "4.0",
             "browser_specific_settings": { "gecko": { "id": "scripts@grey.gecko" } },
             "background": { "scripts": ["background.js"] },
             "content_scripts": [
@@ -184,7 +184,7 @@ jobs:
                 "run_at": "document_start"
               }
             ],
-            "permissions": ["nativeMessaging", "geckoViewAddons", "tabs", "webRequest", "<all_urls>"]
+            "permissions": ["nativeMessaging", "geckoViewAddons", "tabs", "webRequest", "webRequestBlocking", "<all_urls>"]
           }
           EOF
 
@@ -192,6 +192,56 @@ jobs:
           browser.runtime.sendMessage({ type: "page", url: location.href }).catch(function (e) {
             console.log("GreyScript content error: " + e);
           });
+          (function () {
+            var seenC = Object.create(null);
+            var seenI = Object.create(null);
+            var scans = 0;
+            var got = false;
+            var timer = null;
+            function inject(css) {
+              if (!css) return;
+              var s = document.createElement("style");
+              s.textContent = css;
+              (document.head || document.documentElement).appendChild(s);
+            }
+            function askDomain() {
+              browser.runtime.sendMessage({ type: "cos", host: location.hostname }).then(function (r) {
+                if (r && r.css) { got = true; inject(r.css); }
+              }).catch(function () {});
+            }
+            function scan() {
+              timer = null;
+              if (scans > 25 || !document.documentElement) return;
+              var ids = [];
+              var cls = [];
+              var els = document.querySelectorAll("[class],[id]");
+              var lim = Math.min(els.length, 6000);
+              for (var i = 0; i < lim; i++) {
+                var e = els[i];
+                if (e.id && !seenI[e.id]) { seenI[e.id] = 1; ids.push(e.id); }
+                var cl = e.classList;
+                if (cl) {
+                  for (var j = 0; j < cl.length; j++) {
+                    var c = cl[j];
+                    if (!seenC[c]) { seenC[c] = 1; cls.push(c); }
+                  }
+                }
+              }
+              if (!ids.length && !cls.length) return;
+              scans++;
+              browser.runtime.sendMessage({
+                type: "cosg",
+                host: location.hostname,
+                ids: ids.slice(0, 3000),
+                classes: cls.slice(0, 3000)
+              }).then(function (r) { if (r && r.css) inject(r.css); }).catch(function () {});
+            }
+            function later() { if (!timer) timer = setTimeout(scan, 900); }
+            askDomain();
+            document.addEventListener("DOMContentLoaded", function () { if (!got) askDomain(); scan(); });
+            window.addEventListener("load", later);
+            try { new MutationObserver(later).observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+          })();
           EOF
 
           cat > app/src/main/assets/ext/background.js <<'EOF'
@@ -463,6 +513,7 @@ jobs:
             if (!sender.tab) { nlog("no sender.tab"); return Promise.resolve({}); }
             return native({ type: "get", url: msg.url, tabId: sender.tab.id }).then(function (res) {
               if (typeof res.grabber === "boolean") grabberOn = res.grabber;
+              if (typeof res.adv === "number" && res.adv !== adVer) adLoad().catch(function () {});
               var list = res.scripts || [];
               if (!list.length) { return {}; }
               return Promise.all(list.map(function (s) { return runScript(s, sender, msg.url); })).then(function () { return {}; });
@@ -478,6 +529,8 @@ jobs:
             if (msg.type === "setValue" || msg.type === "deleteValue") { native(msg); return; }
             if (msg.type === "xhr") { return doXhr(msg.details); }
             if (msg.type === "page") { return handlePage(msg, sender); }
+            if (msg.type === "cos") { return Promise.resolve({ css: adCosDomain(String(msg.host || "")) }); }
+            if (msg.type === "cosg") { return Promise.resolve({ css: adCosGeneric(msg.ids || [], msg.classes || [], String(msg.host || "")) }); }
           });
 
           // ---- Video grabber (network sniffing) ----
@@ -568,6 +621,351 @@ jobs:
           } catch (e) {
             nlog("grabber unavailable: " + e);
           }
+
+          // ---- Ad blocker (EasyList / ABP syntax) ----
+          var adOn = false;
+          var adCos = true;
+          var adVer = -1;
+          var adIdx = null;
+          var adLoading = null;
+          var adBlockedN = 0;
+          var adStatTimer = null;
+          var adValid = Object.create(null);
+          var adProbe = document.createElement("div");
+          var AD_TYPES = {
+            script: "script", image: "image", imageset: "image", stylesheet: "stylesheet", css: "stylesheet",
+            xmlhttprequest: "xmlhttprequest", xhr: "xmlhttprequest", sub_frame: "subdocument", subdocument: "subdocument",
+            frame: "subdocument", media: "media", font: "font", object: "object", object_subrequest: "object",
+            "object-subrequest": "object", ping: "ping", beacon: "ping", websocket: "websocket", other: "other"
+          };
+          var AD_COS_SKIP = ["+js(", ":-abp", ":has-text", ":xpath", ":matches", ":upward", ":remove", ":style", ":nth-ancestor", ":min-text", ":watch", ":others", ":contains(", ":-moz-", ":if(", ":if-not("];
+
+          function adHost(u) {
+            try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ""; }
+          }
+
+          function adBase(h) {
+            var p = h.split(".");
+            var n = p.length;
+            if (n <= 2) return h;
+            var l2 = p[n - 2];
+            if (p[n - 1].length === 2 && (l2 === "co" || l2 === "com" || l2 === "org" || l2 === "net" || l2 === "gov" || l2 === "edu" || l2 === "ac" || l2 === "ne" || l2 === "or")) {
+              return p.slice(-3).join(".");
+            }
+            return p.slice(-2).join(".");
+          }
+
+          function adHostIn(h, list) {
+            for (var i = 0; i < list.length; i++) {
+              var d = list[i];
+              if (h === d) return true;
+              if (h.length > d.length && h.slice(h.length - d.length - 1) === "." + d) return true;
+            }
+            return false;
+          }
+
+          function adToken(p) {
+            p = p.toLowerCase();
+            var best = "";
+            var re = /[a-z0-9]{3,}/g;
+            var m;
+            while ((m = re.exec(p))) {
+              var s = m.index;
+              var e = s + m[0].length;
+              var pc = s > 0 ? p.charAt(s - 1) : "";
+              var nc = e < p.length ? p.charAt(e) : "";
+              if (pc === "" || pc === "*" || nc === "" || nc === "*") continue;
+              if (m[0].length > best.length) best = m[0];
+            }
+            return best;
+          }
+
+          function adAddNet(idx, line) {
+            var exc = false;
+            if (line.charAt(0) === "@" && line.charAt(1) === "@") { exc = true; line = line.slice(2); }
+            var pat = line;
+            var opts = "";
+            var di = line.lastIndexOf("$");
+            if (di >= 0) {
+              var cand = line.slice(di + 1);
+              if (/^[a-z0-9_~,=|.*:-]+$/i.test(cand) && !(line.charAt(0) === "/" && line.charAt(line.length - 1) === "/")) {
+                pat = line.slice(0, di);
+                opts = cand;
+              }
+            }
+            if (!pat) return;
+            var r = { p: pat, re: undefined, rx: false, tp: 0, types: null, ntypes: null, dinc: null, dexc: null, imp: false };
+            if (opts) {
+              var parts = opts.split(",");
+              for (var i = 0; i < parts.length; i++) {
+                var o = parts[i];
+                if (!o) continue;
+                var val = "";
+                var neg = false;
+                var eq = o.indexOf("=");
+                if (eq > 0) { val = o.slice(eq + 1); o = o.slice(0, eq); }
+                if (o.charAt(0) === "~") { neg = true; o = o.slice(1); }
+                o = o.toLowerCase();
+                if (o === "third-party" || o === "3p") {
+                  r.tp = neg ? -1 : 1;
+                } else if (o === "first-party" || o === "1p") {
+                  r.tp = neg ? 1 : -1;
+                } else if (AD_TYPES[o]) {
+                  var t = AD_TYPES[o];
+                  if (neg) { (r.ntypes = r.ntypes || {})[t] = 1; } else { (r.types = r.types || {})[t] = 1; }
+                } else if (o === "domain") {
+                  var ds = val.split("|");
+                  for (var j = 0; j < ds.length; j++) {
+                    var d = ds[j].toLowerCase();
+                    if (!d) continue;
+                    if (d.charAt(0) === "~") { (r.dexc = r.dexc || []).push(d.slice(1)); } else { (r.dinc = r.dinc || []).push(d); }
+                  }
+                } else if (o === "important") {
+                  r.imp = true;
+                } else if (o === "match-case" || o === "all") {
+                  // ignored
+                } else {
+                  return;
+                }
+              }
+            }
+            if (pat.length > 2 && pat.charAt(0) === "/" && pat.charAt(pat.length - 1) === "/") r.rx = true;
+            var tok = r.rx ? "" : adToken(pat);
+            var bucket = exc ? idx.allow : idx.block;
+            var gen = exc ? idx.allowGen : idx.blockGen;
+            if (tok) { (bucket[tok] = bucket[tok] || []).push(r); } else { gen.push(r); }
+            idx.n++;
+          }
+
+          function adParse(text) {
+            var idx = {
+              block: Object.create(null), blockGen: [], allow: Object.create(null), allowGen: [],
+              cosDom: Object.create(null), cosEx: Object.create(null), cosGen: Object.create(null), n: 0, c: 0
+            };
+            var lines = text.split("\n");
+            for (var i = 0; i < lines.length; i++) {
+              var line = lines[i].trim();
+              if (!line) continue;
+              var c0 = line.charAt(0);
+              if (c0 === "!" || c0 === "[") continue;
+              if (c0 === "#" && line.charAt(1) !== "#" && line.charAt(1) !== "@") continue;
+              var hm = /^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([^\s#]+)/.exec(line);
+              if (hm) {
+                if (hm[1] !== "localhost" && hm[1].indexOf(".") > 0) adAddNet(idx, "||" + hm[1] + "^");
+                continue;
+              }
+              if (/^[a-z0-9.,~*_-]*#@?[?$%]/i.test(line)) continue;
+              var k = line.indexOf("##");
+              var ex = false;
+              var k2 = line.indexOf("#@#");
+              if (k2 >= 0 && (k < 0 || k2 < k)) { k = k2; ex = true; }
+              if (k >= 0 && /^[a-z0-9.,~*_-]*$/i.test(line.slice(0, k))) {
+                var pre = line.slice(0, k);
+                var sel = line.slice(k + (ex ? 3 : 2));
+                if (!sel) continue;
+                var skip = false;
+                for (var q = 0; q < AD_COS_SKIP.length; q++) {
+                  if (sel.indexOf(AD_COS_SKIP[q]) >= 0) { skip = true; break; }
+                }
+                if (skip) continue;
+                var pos = [];
+                if (pre) {
+                  var ds = pre.split(",");
+                  for (var a = 0; a < ds.length; a++) {
+                    var d = ds[a].toLowerCase();
+                    if (d && d.charAt(0) !== "~") pos.push(d);
+                  }
+                }
+                if (ex) {
+                  for (var b = 0; b < pos.length; b++) { (idx.cosEx[pos[b]] = idx.cosEx[pos[b]] || Object.create(null))[sel] = 1; }
+                  continue;
+                }
+                if (pos.length) {
+                  for (var e2 = 0; e2 < pos.length; e2++) { (idx.cosDom[pos[e2]] = idx.cosDom[pos[e2]] || []).push(sel); }
+                } else {
+                  var km = /[.#][A-Za-z0-9_-]+/.exec(sel);
+                  if (!km) continue;
+                  (idx.cosGen[km[0]] = idx.cosGen[km[0]] || []).push(sel);
+                }
+                idx.c++;
+                continue;
+              }
+              adAddNet(idx, line);
+            }
+            return idx;
+          }
+
+          function adRegex(r) {
+            var p = r.p;
+            try {
+              if (r.rx) return new RegExp(p.slice(1, -1), "i");
+              var s = "";
+              var i = 0;
+              if (p.indexOf("||") === 0) { s = "^[a-z][a-z0-9+.-]*:\\/\\/(?:[^\\/?#]*\\.)?"; i = 2; }
+              else if (p.charAt(0) === "|") { s = "^"; i = 1; }
+              var end = p.length;
+              var tail = "";
+              if (end > i && p.charAt(end - 1) === "|") { tail = "$"; end--; }
+              for (; i < end; i++) {
+                var c = p.charAt(i);
+                if (c === "*") s += ".*";
+                else if (c === "^") s += "(?:[^a-zA-Z0-9_.%-]|$)";
+                else s += c.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&");
+              }
+              return new RegExp(s + tail, "i");
+            } catch (e) {
+              return null;
+            }
+          }
+
+          function adTest(r, url, ctx) {
+            if (r.tp === 1 && !ctx.third) return false;
+            if (r.tp === -1 && ctx.third) return false;
+            if (r.types && !r.types[ctx.type]) return false;
+            if (r.ntypes && r.ntypes[ctx.type]) return false;
+            if (r.dexc && adHostIn(ctx.host, r.dexc)) return false;
+            if (r.dinc && !adHostIn(ctx.host, r.dinc)) return false;
+            if (r.re === undefined) r.re = adRegex(r);
+            return r.re ? r.re.test(url) : false;
+          }
+
+          function adMatch(map, gen, url, ctx) {
+            var toks = url.toLowerCase().match(/[a-z0-9]{3,}/g) || [];
+            var seen = Object.create(null);
+            for (var i = 0; i < toks.length; i++) {
+              var t = toks[i];
+              if (seen[t]) continue;
+              seen[t] = 1;
+              var b = map[t];
+              if (b) {
+                for (var j = 0; j < b.length; j++) {
+                  if (adTest(b[j], url, ctx)) return b[j];
+                }
+              }
+            }
+            for (var k = 0; k < gen.length; k++) {
+              if (adTest(gen[k], url, ctx)) return gen[k];
+            }
+            return null;
+          }
+
+          function adBlockReq(d) {
+            if (!adOn || !adIdx) return;
+            if (d.tabId < 0 || d.type === "main_frame") return;
+            var u = d.url;
+            var c = u.charAt(0);
+            if (c !== "h" && c !== "w") return;
+            var host = adHost(u);
+            var ph = adHost(d.documentUrl || d.originUrl || "");
+            var ctx = {
+              type: AD_TYPES[d.type] || "other",
+              third: ph ? adBase(host) !== adBase(ph) : false,
+              host: ph || host
+            };
+            var r = adMatch(adIdx.block, adIdx.blockGen, u, ctx);
+            if (!r) return;
+            if (!r.imp && adMatch(adIdx.allow, adIdx.allowGen, u, ctx)) return;
+            adBlockedN++;
+            if (adBlockedN <= 30) nlog("ad blocked " + u);
+            if (!adStatTimer) {
+              adStatTimer = setTimeout(function () {
+                adStatTimer = null;
+                native({ type: "adstat", n: adBlockedN }).catch(function () {});
+              }, 1500);
+            }
+            return { cancel: true };
+          }
+
+          function adHostEx(host) {
+            var ex = Object.create(null);
+            var labels = host.split(".");
+            for (var i = 0; i < labels.length - 1; i++) {
+              var e = adIdx.cosEx[labels.slice(i).join(".")];
+              if (e) { for (var k in e) ex[k] = 1; }
+            }
+            return ex;
+          }
+
+          function adCss(sels, ex) {
+            var ok = [];
+            var seen = Object.create(null);
+            for (var i = 0; i < sels.length; i++) {
+              var s = sels[i];
+              if (seen[s] || ex[s]) continue;
+              seen[s] = 1;
+              if (adValid[s] === undefined) {
+                try { adProbe.matches(s); adValid[s] = true; } catch (e) { adValid[s] = false; }
+              }
+              if (adValid[s]) ok.push(s);
+            }
+            var css = "";
+            for (var a = 0; a < ok.length; a += 20) {
+              css += ok.slice(a, a + 20).join(",") + "{display:none!important}\n";
+            }
+            return css;
+          }
+
+          function adCosDomain(host) {
+            if (!adIdx || !adOn || !adCos || !host) return "";
+            var sels = [];
+            var labels = host.toLowerCase().split(".");
+            for (var i = 0; i < labels.length - 1; i++) {
+              var s = adIdx.cosDom[labels.slice(i).join(".")];
+              if (s) { for (var j = 0; j < s.length; j++) sels.push(s[j]); }
+            }
+            return adCss(sels, adHostEx(host.toLowerCase()));
+          }
+
+          function adCosGeneric(ids, classes, host) {
+            if (!adIdx || !adOn || !adCos) return "";
+            var sels = [];
+            function add(key) {
+              var s = adIdx.cosGen[key];
+              if (s) { for (var j = 0; j < s.length && sels.length < 4000; j++) sels.push(s[j]); }
+            }
+            for (var i = 0; i < ids.length; i++) add("#" + ids[i]);
+            for (var k = 0; k < classes.length; k++) add("." + classes[k]);
+            return adCss(sels, adHostEx(host.toLowerCase()));
+          }
+
+          function adFetch(off, acc) {
+            return native({ type: "rules", off: off }).then(function (r) {
+              acc.push(r.text || "");
+              if (typeof r.next === "number" && r.next > off) return adFetch(r.next, acc);
+              return acc;
+            });
+          }
+
+          function adLoad() {
+            if (adLoading) return adLoading;
+            adLoading = native({ type: "adcfg" }).then(function (c) {
+              adOn = !!c.on;
+              adCos = !!c.cos;
+              if (!adOn) { adIdx = null; adVer = c.ver; return; }
+              if (c.ver === adVer && adIdx) return;
+              return adFetch(0, []).then(function (parts) {
+                adIdx = adParse(parts.join(""));
+                adVer = c.ver;
+                nlog("adblock loaded: " + adIdx.n + " network rules, " + adIdx.c + " cosmetic rules");
+                native({ type: "adinfo", n: adIdx.n, c: adIdx.c }).catch(function () {});
+              });
+            }).then(function () { adLoading = null; }, function (e) { adLoading = null; throw e; });
+            return adLoading;
+          }
+
+          function adBoot(n) {
+            adLoad().catch(function () {
+              if (n < 15) setTimeout(function () { adBoot(n + 1); }, 2000);
+            });
+          }
+
+          try {
+            browser.webRequest.onBeforeRequest.addListener(adBlockReq, { urls: ["<all_urls>"] }, ["blocking"]);
+            nlog("adblock listener ready");
+          } catch (e) {
+            nlog("adblock unavailable: " + e);
+          }
+          adBoot(0);
 
           nlog("background started");
           EOF
@@ -1267,6 +1665,234 @@ jobs:
                   } catch (e: Exception) {
                       "Could not send link"
                   }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/Filters.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.content.Context
+          import android.util.Log
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class FilterList(
+              val id: String,
+              var name: String,
+              var url: String,
+              var enabled: Boolean,
+              var count: Int,
+              var updated: Long
+          )
+
+          object Filters {
+              @Volatile
+              var ver = 1
+              @Volatile
+              var blocked = 0
+              @Volatile
+              var loadedNet = 0
+              @Volatile
+              var loadedCos = 0
+              private var cache: String? = null
+              private var cacheVer = -1
+
+              private fun sp() = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+
+              private fun dir(): java.io.File {
+                  val d = java.io.File(Gecko.appCtx.filesDir, "filters")
+                  d.mkdirs()
+                  return d
+              }
+
+              private fun file(id: String): java.io.File = java.io.File(dir(), id + ".txt")
+
+              @Synchronized
+              private fun bump() {
+                  ver += 1
+              }
+
+              fun isOn(): Boolean = sp().getBoolean("adblock", true)
+
+              fun cosOn(): Boolean = sp().getBoolean("adcos", true)
+
+              fun setOn(v: Boolean) {
+                  sp().edit().putBoolean("adblock", v).apply()
+                  bump()
+              }
+
+              fun setCos(v: Boolean) {
+                  sp().edit().putBoolean("adcos", v).apply()
+                  bump()
+              }
+
+              @Synchronized
+              fun load(): MutableList<FilterList> {
+                  val out = mutableListOf<FilterList>()
+                  try {
+                      val arr = JSONArray(sp().getString("filters", "[]") ?: "[]")
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          out.add(
+                              FilterList(
+                                  o.getString("id"),
+                                  o.optString("name"),
+                                  o.optString("url"),
+                                  o.optBoolean("on", true),
+                                  o.optInt("n"),
+                                  o.optLong("t")
+                              )
+                          )
+                      }
+                  } catch (e: Exception) {
+                      Log.e("GreyScript", "filters load failed", e)
+                  }
+                  return out
+              }
+
+              @Synchronized
+              private fun save(l: List<FilterList>) {
+                  val arr = JSONArray()
+                  for (f in l) {
+                      val o = JSONObject()
+                      o.put("id", f.id)
+                      o.put("name", f.name)
+                      o.put("url", f.url)
+                      o.put("on", f.enabled)
+                      o.put("n", f.count)
+                      o.put("t", f.updated)
+                      arr.put(o)
+                  }
+                  sp().edit().putString("filters", arr.toString()).apply()
+              }
+
+              fun countRules(text: String): Int {
+                  var n = 0
+                  for (ln in text.lineSequence()) {
+                      val t = ln.trim()
+                      if (t.isEmpty()) continue
+                      val c = t[0]
+                      if (c == '!' || c == '[') continue
+                      if (c == '#' && !(t.length > 1 && (t[1] == '#' || t[1] == '@'))) continue
+                      n++
+                  }
+                  return n
+              }
+
+              @Synchronized
+              fun add(name: String, url: String, text: String): String {
+                  val l = load()
+                  var f = if (url.isBlank()) null else l.firstOrNull { it.url == url }
+                  if (f == null) {
+                      f = FilterList(Store.newId(), name, url, true, 0, 0L)
+                      l.add(f)
+                  }
+                  file(f.id).writeText(text)
+                  f.count = countRules(text)
+                  f.updated = System.currentTimeMillis()
+                  save(l)
+                  bump()
+                  return f.id
+              }
+
+              @Synchronized
+              fun remove(id: String) {
+                  val l = load()
+                  l.removeAll { it.id == id }
+                  save(l)
+                  try {
+                      file(id).delete()
+                  } catch (e: Exception) {
+                  }
+                  bump()
+              }
+
+              @Synchronized
+              fun setEnabled(id: String, v: Boolean) {
+                  val l = load()
+                  for (f in l) {
+                      if (f.id == id) f.enabled = v
+                  }
+                  save(l)
+                  bump()
+              }
+
+              private fun nameFromUrl(url: String): String = try {
+                  val u = java.net.URL(url)
+                  val s = u.path.substringAfterLast('/').removeSuffix(".txt")
+                  if (s.isBlank()) u.host else s
+              } catch (e: Exception) {
+                  url
+              }
+
+              fun addFromUrl(url: String, name: String): String {
+                  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                      return "Link must start with http:// or https://"
+                  }
+                  return try {
+                      val t = httpGet(url)
+                      if (countRules(t) == 0) {
+                          "No rules found at that URL"
+                      } else {
+                          add(name.ifBlank { nameFromUrl(url) }, url, t)
+                          ""
+                      }
+                  } catch (e: Exception) {
+                      e.message ?: "Download failed"
+                  }
+              }
+
+              fun refresh(id: String): String {
+                  val f = load().firstOrNull { it.id == id } ?: return "List not found"
+                  if (f.url.isBlank()) return "No URL for this list"
+                  return try {
+                      val t = httpGet(f.url)
+                      if (countRules(t) == 0) {
+                          "No rules found at that URL"
+                      } else {
+                          add(f.name, f.url, t)
+                          ""
+                      }
+                  } catch (e: Exception) {
+                      e.message ?: "Download failed"
+                  }
+              }
+
+              @Synchronized
+              fun combined(): String {
+                  val c = cache
+                  if (c != null && cacheVer == ver) return c
+                  val sb = StringBuilder()
+                  if (isOn()) {
+                      for (f in load()) {
+                          if (!f.enabled) continue
+                          try {
+                              sb.append(file(f.id).readText())
+                              sb.append('\n')
+                          } catch (e: Exception) {
+                          }
+                      }
+                  }
+                  val s = sb.toString()
+                  cache = s
+                  cacheVer = ver
+                  return s
+              }
+
+              @Synchronized
+              fun dropCache() {
+                  cache = null
+              }
+
+              fun chunk(all: String, off: Int): Pair<String, Int> {
+                  if (off >= all.length) return Pair("", -1)
+                  var end = minOf(all.length, off + 300000)
+                  if (end < all.length) {
+                      val nl = all.lastIndexOf('\n', end)
+                      if (nl > off) end = nl + 1
+                  }
+                  return Pair(all.substring(off, end), if (end >= all.length) -1 else end)
               }
           }
           EOF
@@ -1988,7 +2614,9 @@ jobs:
           import android.util.Log
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
           import androidx.activity.enableEdgeToEdge
           import androidx.compose.animation.animateColorAsState
           import androidx.compose.animation.core.animateFloatAsState
@@ -2120,9 +2748,29 @@ jobs:
                                   }
                                   reply.put("scripts", arr)
                                   reply.put("grabber", Videos.enabled)
+                                  reply.put("adv", Filters.ver)
                                   Log.d("GreyScript", "scripts for " + url + ": " + arr.length())
                               }
                               "cfg" -> reply.put("grabber", Videos.enabled)
+                              "adcfg" -> {
+                                  reply.put("on", Filters.isOn())
+                                  reply.put("cos", Filters.cosOn())
+                                  reply.put("ver", Filters.ver)
+                              }
+                              "rules" -> {
+                                  val all = Filters.combined()
+                                  val ch = Filters.chunk(all, m.optInt("off", 0))
+                                  reply.put("text", ch.first)
+                                  reply.put("next", ch.second)
+                                  if (ch.second < 0) Filters.dropCache()
+                              }
+                              "adstat" -> {
+                                  Filters.blocked = m.optInt("n")
+                              }
+                              "adinfo" -> {
+                                  Filters.loadedNet = m.optInt("n")
+                                  Filters.loadedCos = m.optInt("c")
+                              }
                               "video" -> {
                                   reply.put("grabber", Videos.enabled)
                                   if (Videos.enabled) {
@@ -2301,6 +2949,7 @@ jobs:
                   BackHandler(screen != "browser") {
                       screen = when (screen) {
                           "guide", "editor" -> "scripts"
+                          "filterguide" -> "filters"
                           else -> "browser"
                       }
                   }
@@ -2322,6 +2971,7 @@ jobs:
                               onHistory = { screen = "history" },
                               onBookmarks = { screen = "bookmarks" },
                               onScripts = { screen = "scripts" },
+                              onFilters = { screen = "filters" },
                               onLogs = { screen = "logs" }
                           )
                           if (screen != "browser") {
@@ -2370,6 +3020,11 @@ jobs:
                                       )
                                       "editor" -> EditorScreen(editId) { screen = "scripts" }
                                       "guide" -> GuideScreen { screen = "scripts" }
+                                      "filters" -> FiltersScreen(
+                                          onBack = { screen = "browser" },
+                                          onGuide = { screen = "filterguide" }
+                                      )
+                                      "filterguide" -> FilterGuideScreen { screen = "filters" }
                                       "logs" -> LogScreen { screen = "browser" }
                                       else -> {}
                                   }
@@ -2404,6 +3059,7 @@ jobs:
               onHistory: () -> Unit,
               onBookmarks: () -> Unit,
               onScripts: () -> Unit,
+              onFilters: () -> Unit,
               onLogs: () -> Unit
           ) {
               val cur = tabs.current
@@ -2592,6 +3248,10 @@ jobs:
                                       onClick = { menu = false; onScripts() }
                                   )
                                   DropdownMenuItem(
+                                      text = { Text("Ad filters", color = Color.White) },
+                                      onClick = { menu = false; onFilters() }
+                                  )
+                                  DropdownMenuItem(
                                       text = { Text("Logcat", color = Color.White) },
                                       onClick = { menu = false; onLogs() }
                                   )
@@ -2677,7 +3337,7 @@ jobs:
                                   Box(
                                       Modifier
                                           .fillMaxWidth()
-                                          .height(14.dp)
+                                          .height(12.dp)
                                           .background(Color.White)
                                           .clipToBounds(),
                                       contentAlignment = Alignment.CenterStart
@@ -2686,6 +3346,8 @@ jobs:
                                           "Bookmarked  •  ".repeat(30),
                                           color = Color.Black,
                                           fontSize = 9.sp,
+                                          lineHeight = 12.sp,
+                                          fontWeight = FontWeight.Bold,
                                           maxLines = 1,
                                           softWrap = false,
                                           modifier = Modifier.basicMarquee(iterations = Int.MAX_VALUE)
@@ -3896,6 +4558,361 @@ jobs:
                           TextButton(onClick = { showDelete = false }) { Text("Cancel", color = Color.White) }
                       }
                   )
+              }
+          }
+
+          const val FILTER_GUIDE = """WHAT IT DOES
+          Blocks ad and tracker requests before they load, and hides leftover ad boxes on the page. It reads the standard EasyList (Adblock Plus) rule format.
+
+          HOW TO ADD A LIST
+          1. Tap Add next to a list below. Or copy its link, tap URL on the Ad filters screen, paste it and tap Download.
+          2. Or save a rules .txt file on your phone and tap Import.
+          3. Reload the page. The Ad filters screen shows how many rules loaded and how many requests were blocked.
+
+          TIPS
+          - EasyList plus EasyPrivacy is a good start. More lists means more memory and a slower start.
+          - Use the switch on a list to turn it off without deleting it. Tap a list to update or delete it.
+          - If a site breaks, turn Ad blocking off, reload, and see if the filters caused it.
+
+          SUPPORTED
+          Domain rules (||example.com^), anchors, wildcards, exceptions (@@), the options script, image, stylesheet, xmlhttprequest, subdocument, media, font, ping, other, third-party, domain= and important, hosts-format lines, and simple element hiding (##.ad).
+
+          NOT SUPPORTED (these rules are skipped)
+          Scriptlets (##+js), redirect, csp and removeparam rules, and extended selectors like :has-text. So YouTube video ads and some anti-adblock walls will still show.
+
+          The lists below belong to their maintainers. Links are not checked by this app."""
+
+          class FilterLink(val name: String, val url: String, val note: String)
+
+          val FILTER_LINKS = listOf(
+              FilterLink("EasyList", "https://easylist.to/easylist/easylist.txt", "Main ad list. Start here."),
+              FilterLink("EasyPrivacy", "https://ublockorigin.github.io/uAssets/thirdparties/easyprivacy.txt", "Trackers and analytics."),
+              FilterLink("uBlock filters", "https://ublockorigin.github.io/uAssets/filters/filters.min.txt", "uBlock Origin's own ad rules."),
+              FilterLink("uBlock annoyances", "https://ublockorigin.github.io/uAssets/filters/annoyances.txt", "Popups, cookie banners, overlays."),
+              FilterLink("AdGuard Base", "https://filters.adtidy.org/extension/ublock/filters/2_without_easylist.txt", "AdGuard's ad rules. Use together with EasyList."),
+              FilterLink("AdGuard Mobile Ads", "https://filters.adtidy.org/extension/ublock/filters/11.txt", "Extra rules for mobile ads."),
+              FilterLink("AdGuard Tracking Protection", "https://filters.adtidy.org/extension/ublock/filters/3.txt", "Tracker rules."),
+              FilterLink("AdGuard Popup Overlays", "https://filters.adtidy.org/extension/ublock/filters/19.txt", "Popups and overlays."),
+              FilterLink("StevenBlack hosts", "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", "Ad and malware domains in hosts format. Large.")
+          )
+
+          fun displayName(ctx: Context, uri: android.net.Uri): String {
+              var n = ""
+              try {
+                  ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      if (c.moveToFirst()) {
+                          val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                          if (i >= 0) n = c.getString(i) ?: ""
+                      }
+                  }
+              } catch (e: Exception) {
+              }
+              return n.removeSuffix(".txt").ifBlank { "Imported list" }
+          }
+
+          @Composable
+          fun FilterToggleRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(label, color = Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                  Switch(checked = checked, onCheckedChange = onChange, colors = switchColors())
+              }
+          }
+
+          @Composable
+          fun UrlListDialog(onDismiss: () -> Unit, onAdded: () -> Unit) {
+              val scope = rememberCoroutineScope()
+              var url by remember { mutableStateOf("") }
+              var err by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+              AlertDialog(
+                  onDismissRequest = { if (!busy) onDismiss() },
+                  containerColor = Bar,
+                  title = { Text("Add filter list from URL", color = Color.White) },
+                  text = {
+                      Column {
+                          OutlinedTextField(
+                              value = url,
+                              onValueChange = { url = it; err = "" },
+                              singleLine = true,
+                              colors = fieldColors(),
+                              placeholder = { Text("https://easylist.to/easylist/easylist.txt", color = Color(0xFF999999)) }
+                          )
+                          if (err.isNotBlank()) {
+                              Text(err, color = Danger, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = {
+                          val u = url.trim()
+                          if (u.isNotEmpty() && !busy) {
+                              busy = true
+                              err = "Downloading…"
+                              scope.launch {
+                                  val r = withContext(Dispatchers.IO) { Filters.addFromUrl(u, "") }
+                                  busy = false
+                                  if (r.isEmpty()) onAdded() else err = r
+                              }
+                          }
+                      }) { Text("Download", color = Color.White) }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = { if (!busy) onDismiss() }) { Text("Cancel", color = Color.White) }
+                  }
+              )
+          }
+
+          @Composable
+          fun FiltersScreen(onBack: () -> Unit, onGuide: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var lists by remember { mutableStateOf(Filters.load()) }
+              var on by remember { mutableStateOf(Filters.isOn()) }
+              var cos by remember { mutableStateOf(Filters.cosOn()) }
+              var status by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+              var showUrl by remember { mutableStateOf(false) }
+              var sel by remember { mutableStateOf<FilterList?>(null) }
+              var blocked by remember { mutableStateOf(Filters.blocked) }
+              var loadedNet by remember { mutableStateOf(Filters.loadedNet) }
+              var loadedCos by remember { mutableStateOf(Filters.loadedCos) }
+              val fmt = remember { java.text.DateFormat.getDateInstance(java.text.DateFormat.SHORT) }
+              fun reload() { lists = Filters.load() }
+
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      blocked = Filters.blocked
+                      loadedNet = Filters.loadedNet
+                      loadedCos = Filters.loadedCos
+                      delay(1000)
+                  }
+              }
+
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri != null && !busy) {
+                      busy = true
+                      status = "Importing…"
+                      scope.launch {
+                          val r = withContext(Dispatchers.IO) {
+                              try {
+                                  val t = ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+                                  if (Filters.countRules(t) == 0) {
+                                      "ERR:No rules found in that file"
+                                  } else {
+                                      Filters.add(displayName(ctx, uri), "", t)
+                                      "OK"
+                                  }
+                              } catch (e: Exception) {
+                                  "ERR:" + (e.message ?: "Could not read file")
+                              }
+                          }
+                          busy = false
+                          reload()
+                          status = if (r.startsWith("ERR:")) r.substring(4) else "Imported. Reload the page."
+                      }
+                  }
+              }
+
+              Column(Modifier.fillMaxSize()) {
+                  Header {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Ad filters", color = Color.White, fontSize = 18.sp)
+                      Spacer(Modifier.width(8.dp))
+                      Box(
+                          Modifier
+                              .size(26.dp)
+                              .border(1.dp, Color(0xFF888888), CircleShape)
+                              .clickable { onGuide() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text("?", color = Color.White, fontSize = 14.sp)
+                      }
+                      Spacer(Modifier.weight(1f))
+                      TextButton(onClick = { picker.launch(arrayOf("*/*")) }) { Text("Import", color = Color.White) }
+                      TextButton(onClick = { showUrl = true }) { Text("URL", color = Color.White) }
+                  }
+                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                      FilterToggleRow("Ad blocking", on) { v ->
+                          on = v
+                          Filters.setOn(v)
+                      }
+                      FilterToggleRow("Hide page elements", cos) { v ->
+                          cos = v
+                          Filters.setCos(v)
+                      }
+                      Text(
+                          "Rules loaded: " + loadedNet + " network, " + loadedCos + " hiding · blocked this session: " + blocked,
+                          color = Soft,
+                          fontSize = 12.sp,
+                          modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                      )
+                      Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                          if (lists.any { it.url.isNotBlank() }) {
+                              TextButton(onClick = {
+                                  if (!busy) {
+                                      busy = true
+                                      status = "Updating…"
+                                      scope.launch {
+                                          val res = withContext(Dispatchers.IO) {
+                                              var ok = 0
+                                              var tot = 0
+                                              for (f in Filters.load()) {
+                                                  if (f.url.isBlank()) continue
+                                                  tot++
+                                                  if (Filters.refresh(f.id).isEmpty()) ok++
+                                              }
+                                              ok.toString() + "/" + tot
+                                          }
+                                          busy = false
+                                          reload()
+                                          status = "Updated " + res + ". Reload the page."
+                                      }
+                                  }
+                              }) { Text("Update all", color = Color.White, fontSize = 12.sp) }
+                          }
+                      }
+                      if (status.isNotBlank()) {
+                          Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
+                      }
+                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                      if (lists.isEmpty()) {
+                          EmptyNote("No filter lists yet. Tap URL to download one or Import to load a .txt file. Tap ? for links to popular lists.")
+                      }
+                      for (f in lists) {
+                          key(f.id) {
+                              Row(
+                                  Modifier.fillMaxWidth().clickable { sel = f }.padding(horizontal = 12.dp, vertical = 10.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Column(Modifier.weight(1f)) {
+                                      Text(
+                                          f.name,
+                                          color = if (f.enabled) Color.White else Color(0xFF888888),
+                                          fontSize = 14.sp,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis
+                                      )
+                                      Text(
+                                          f.count.toString() + " rules" +
+                                              (if (f.updated > 0) " · " + fmt.format(java.util.Date(f.updated)) else "") +
+                                              (if (f.url.isBlank()) " · imported file" else " · " + hostOf(f.url)),
+                                          color = Soft,
+                                          fontSize = 12.sp,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis
+                                      )
+                                  }
+                                  Switch(
+                                      checked = f.enabled,
+                                      onCheckedChange = { v ->
+                                          Filters.setEnabled(f.id, v)
+                                          reload()
+                                      },
+                                      colors = switchColors()
+                                  )
+                              }
+                              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                          }
+                      }
+                  }
+              }
+
+              if (showUrl) {
+                  UrlListDialog(
+                      onDismiss = { showUrl = false },
+                      onAdded = {
+                          showUrl = false
+                          reload()
+                          status = "Added. Reload the page."
+                      }
+                  )
+              }
+
+              val s = sel
+              if (s != null) {
+                  AlertDialog(
+                      onDismissRequest = { sel = null },
+                      containerColor = Bar,
+                      title = { Text(s.name, color = Color.White, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                      text = {
+                          Column {
+                              if (s.url.isNotBlank()) {
+                                  MenuRow("Update now") {
+                                      sel = null
+                                      if (!busy) {
+                                          busy = true
+                                          status = "Updating…"
+                                          scope.launch {
+                                              val e = withContext(Dispatchers.IO) { Filters.refresh(s.id) }
+                                              busy = false
+                                              reload()
+                                              status = if (e.isEmpty()) "Updated " + s.name + ". Reload the page." else e
+                                          }
+                                      }
+                                  }
+                              }
+                              MenuRow("Delete") {
+                                  sel = null
+                                  Filters.remove(s.id)
+                                  reload()
+                              }
+                          }
+                      },
+                      confirmButton = {},
+                      dismissButton = {
+                          TextButton(onClick = { sel = null }) { Text("Close", color = Color.White) }
+                      }
+                  )
+              }
+          }
+
+          @Composable
+          fun FilterGuideScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var status by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+              Column(Modifier.fillMaxSize()) {
+                  Header {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Filter guide", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                  }
+                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
+                      Text(FILTER_GUIDE, color = Color.White, fontSize = 13.sp)
+                      Spacer(Modifier.height(14.dp))
+                      Text("LISTS", color = Soft, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                      if (status.isNotBlank()) {
+                          Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
+                      }
+                      for (l in FILTER_LINKS) {
+                          Column(Modifier.fillMaxWidth().padding(top = 10.dp)) {
+                              Text(l.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                              Text(l.note, color = Soft, fontSize = 12.sp)
+                              Text(l.url, color = Color(0xFFBBBBBB), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                              Row {
+                                  TextButton(onClick = {
+                                      copyText(ctx, l.url)
+                                      toast(ctx, "Link copied")
+                                  }) { Text("Copy", color = Color.White, fontSize = 13.sp) }
+                                  TextButton(onClick = {
+                                      if (!busy) {
+                                          busy = true
+                                          status = "Downloading " + l.name + "…"
+                                          scope.launch {
+                                              val e = withContext(Dispatchers.IO) { Filters.addFromUrl(l.url, l.name) }
+                                              busy = false
+                                              status = if (e.isEmpty()) l.name + " added. Reload the page." else e
+                                          }
+                                      }
+                                  }) { Text("Add", color = Color.White, fontSize = 13.sp) }
+                              }
+                              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                          }
+                      }
+                  }
               }
           }
 
