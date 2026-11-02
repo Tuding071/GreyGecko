@@ -1295,7 +1295,7 @@ jobs:
           import org.mozilla.geckoview.GeckoSession
           import org.mozilla.geckoview.GeckoView
 
-          class BrowserTab(val id: Int, var session: GeckoSession?, val openerId: Int) {
+          class BrowserTab(val id: Int, var session: GeckoSession?, var openerId: Int) {
               var url by mutableStateOf("")
               var title by mutableStateOf("")
               var progress by mutableStateOf(0)
@@ -1463,6 +1463,11 @@ jobs:
                       val curId = root.optInt("cur", 0)
                       val c = tabs.firstOrNull { it.id == curId } ?: tabs.last()
                       select(c)
+                      val seenKeys = HashSet<String>()
+                      for (x in listOf(c) + tabs.filter { it !== c }) {
+                          if (x.url.isBlank() || x.url.startsWith("about:")) continue
+                          if (!seenKeys.add(normUrl(x.url))) removeTab(x, false)
+                      }
                       return true
                   } catch (e: Exception) {
                       Log.d("GreyScript", "restore failed: " + e)
@@ -1476,11 +1481,13 @@ jobs:
                   var opener = openerId
                   if (url.isNotBlank() && !url.startsWith("about:")) {
                       val key = normUrl(url)
-                      for (d in tabs.toList()) {
-                          if (d.url.isNotBlank() && normUrl(d.url) == key) {
-                              if (d.id == opener) opener = d.openerId
-                              removeTab(d, false)
-                          }
+                      val dups = tabs.filter { it.url.isNotBlank() && normUrl(it.url) == key }
+                      val cd = dups.firstOrNull { it === current }
+                      if (!makeCurrent && cd != null) return cd
+                      for (d in dups) {
+                          if (d.id == opener) opener = d.openerId
+                          if (d === current) current = null
+                          removeTab(d, false)
                       }
                   }
                   counter += 1
@@ -1492,6 +1499,22 @@ jobs:
                   enforceLimit()
                   persist()
                   return t
+              }
+
+              private fun dedupe(t: BrowserTab) {
+                  if (t.url.isBlank() || t.url.startsWith("about:")) return
+                  if (!tabs.contains(t)) return
+                  val key = normUrl(t.url)
+                  val dups = tabs.filter { it !== t && it.url.isNotBlank() && normUrl(it.url) == key }
+                  if (dups.isEmpty()) return
+                  if (t !== current && dups.any { it === current }) {
+                      removeTab(t, false)
+                      return
+                  }
+                  for (d in dups) {
+                      if (t.openerId == d.id) t.openerId = d.openerId
+                      removeTab(d, false)
+                  }
               }
 
               private fun ensureLive(t: BrowserTab, initialUrl: String? = null) {
@@ -1663,6 +1686,7 @@ jobs:
                           hasUserGesture: Boolean
                       ) {
                           t.url = url ?: ""
+                          dedupe(t)
                           Favicons.request(groupKeyOf(t))
                           persist()
                       }
@@ -1834,8 +1858,10 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.enableEdgeToEdge
           import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.foundation.ExperimentalFoundationApi
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
+          import androidx.compose.foundation.basicMarquee
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.gestures.detectTapGestures
@@ -2210,6 +2236,7 @@ jobs:
               )
           }
 
+          @OptIn(ExperimentalFoundationApi::class)
           @Composable
           fun BrowserScreen(
               tabs: TabManager,
@@ -2356,6 +2383,20 @@ jobs:
                                       onClick = { tabs.cycleMaxBg() }
                                   )
                                   DropdownMenuItem(
+                                      text = { Text("Add to bookmark", color = Color.White) },
+                                      onClick = {
+                                          menu = false
+                                          val t = tabs.current
+                                          val u = shownUrl(t)
+                                          if (t != null && u.isNotBlank()) {
+                                              BookmarkStore.add(u, t.title.ifBlank { u })
+                                              toast(ctx, "Bookmark added")
+                                          } else {
+                                              toast(ctx, "Nothing to bookmark")
+                                          }
+                                      }
+                                  )
+                                  DropdownMenuItem(
                                       text = { Text("History", color = Color.White) },
                                       onClick = { menu = false; onHistory() }
                                   )
@@ -2406,8 +2447,9 @@ jobs:
                               cm.url,
                               color = Soft,
                               fontSize = 12.sp,
-                              maxLines = 3,
-                              overflow = TextOverflow.Ellipsis
+                              maxLines = 1,
+                              softWrap = false,
+                              modifier = Modifier.basicMarquee(iterations = Int.MAX_VALUE)
                           )
                       },
                       text = {
@@ -2682,8 +2724,15 @@ jobs:
           }
 
           @Composable
-          fun GroupItem(g: TabGroup, active: Boolean, foreground: Boolean, onClick: () -> Unit) {
-              val n = g.tabs.size
+          fun RailItem(
+              key: String,
+              label: String,
+              count: Int,
+              noun: String,
+              active: Boolean,
+              foreground: Boolean,
+              onClick: () -> Unit
+          ) {
               Row(
                   Modifier
                       .fillMaxWidth()
@@ -2703,7 +2752,7 @@ jobs:
                   )
                   Spacer(Modifier.width(9.dp))
                   Box(Modifier.size(28.dp)) {
-                      FaviconBox(g.key, 28.dp, 6.dp, 13)
+                      FaviconBox(key, 28.dp, 6.dp, 13)
                       if (foreground) {
                           Box(
                               Modifier
@@ -2718,7 +2767,7 @@ jobs:
                   Spacer(Modifier.width(12.dp))
                   Column(Modifier.weight(1f)) {
                       Text(
-                          g.label,
+                          label,
                           color = Color.White,
                           fontSize = 12.sp,
                           fontWeight = FontWeight.SemiBold,
@@ -2726,12 +2775,17 @@ jobs:
                           overflow = TextOverflow.Ellipsis
                       )
                       Text(
-                          n.toString() + (if (n == 1) " tab" else " tabs"),
+                          count.toString() + " " + (if (count == 1) noun else noun + "s"),
                           color = Soft,
                           fontSize = 10.sp
                       )
                   }
               }
+          }
+
+          @Composable
+          fun GroupItem(g: TabGroup, active: Boolean, foreground: Boolean, onClick: () -> Unit) {
+              RailItem(g.key, g.label, g.tabs.size, "tab", active, foreground, onClick)
           }
 
           @Composable
@@ -2982,35 +3036,138 @@ jobs:
               }
           }
 
+          class BookGroup(val key: String, val items: List<PageEntry>)
+
+          fun groupBookmarks(all: List<PageEntry>): List<BookGroup> {
+              val order = ArrayList<String>()
+              val map = HashMap<String, MutableList<PageEntry>>()
+              for (e in all) {
+                  val k = keyOfUrl(e.url)
+                  val l = map.getOrPut(k) {
+                      order.add(k)
+                      mutableListOf()
+                  }
+                  l.add(e)
+              }
+              return order.map { k -> BookGroup(k, map[k] ?: mutableListOf()) }
+          }
+
+          @Composable
+          fun BookmarkCard(e: PageEntry, onClick: () -> Unit, onRemove: () -> Unit) {
+              val shape = RoundedCornerShape(12.dp)
+              val key = keyOfUrl(e.url)
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .padding(bottom = 10.dp)
+                      .clip(shape)
+                      .background(Bar)
+                      .clickable { onClick() }
+                      .padding(10.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  FaviconBox(key, 36.dp, 8.dp, 16)
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                      Text(
+                          e.title.ifBlank { e.url },
+                          color = Color.White,
+                          fontSize = 13.sp,
+                          fontWeight = FontWeight.SemiBold,
+                          maxLines = 2,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Text(
+                          e.url,
+                          color = Soft,
+                          fontSize = 11.sp,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                  }
+                  Spacer(Modifier.width(8.dp))
+                  Box(
+                      Modifier
+                          .size(26.dp)
+                          .clip(CircleShape)
+                          .background(Field)
+                          .clickable { onRemove() },
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text("×", color = Soft, fontSize = 16.sp)
+                  }
+              }
+          }
+
           @Composable
           fun BookmarksScreen(tabs: TabManager, onBack: () -> Unit, onOpen: (String) -> Unit) {
               var marks by remember { mutableStateOf<List<PageEntry>>(BookmarkStore.load()) }
-              Column(Modifier.fillMaxSize()) {
+              val groups = groupBookmarks(marks)
+              var activeKey by remember { mutableStateOf(groupKeyOf(tabs.current)) }
+              val active = groups.firstOrNull { it.key == activeKey } ?: groups.firstOrNull()
+
+              Column(Modifier.fillMaxSize().background(BG)) {
                   Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Bookmarks", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
-                      TextButton(onClick = {
-                          val t = tabs.current
-                          val u = shownUrl(t)
-                          if (t != null && u.isNotBlank()) {
-                              BookmarkStore.add(u, t.title.ifBlank { u })
-                              marks = BookmarkStore.load()
-                          }
-                      }) { Text("+ Add current", color = Color.White) }
                   }
-                  if (marks.isEmpty()) EmptyNote("No bookmarks yet. Open a page, come back here and tap + Add current.")
-                  LazyColumn(Modifier.weight(1f)) {
-                      items(marks) { e ->
-                          SheetRow(
-                              title = e.title.ifBlank { e.url },
-                              sub = e.url,
-                              active = false,
-                              onClick = { onOpen(e.url) },
-                              onRemove = {
-                                  BookmarkStore.remove(e.url)
-                                  marks = BookmarkStore.load()
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
+                  if (groups.isEmpty()) {
+                      EmptyNote("No bookmarks yet. Open a page, then use the menu and tap Add to bookmark.")
+                  } else {
+                      BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                          val railW = (maxWidth * 0.38f).coerceIn(120.dp, 160.dp)
+                          Row(Modifier.fillMaxSize()) {
+                              Column(
+                                  Modifier
+                                      .width(railW)
+                                      .fillMaxHeight()
+                                      .background(Bar)
+                                      .verticalScroll(rememberScrollState())
+                                      .padding(vertical = 8.dp)
+                              ) {
+                                  for (g in groups) {
+                                      RailItem(
+                                          g.key,
+                                          if (g.key == "newtab") "Other" else g.key,
+                                          g.items.size,
+                                          "bookmark",
+                                          g.key == active?.key,
+                                          false,
+                                          { activeKey = g.key }
+                                      )
+                                  }
                               }
-                          )
+                              Box(Modifier.width(0.5.dp).fillMaxHeight().background(Field))
+                              Column(
+                                  Modifier
+                                      .weight(1f)
+                                      .fillMaxHeight()
+                                      .verticalScroll(rememberScrollState())
+                                      .padding(12.dp)
+                              ) {
+                                  if (active != null) {
+                                      Text(
+                                          (if (active.key == "newtab") "Other" else active.key).uppercase(),
+                                          color = Soft,
+                                          fontSize = 11.sp,
+                                          fontWeight = FontWeight.SemiBold,
+                                          letterSpacing = 0.5.sp,
+                                          modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp)
+                                      )
+                                      for (e in active.items) {
+                                          BookmarkCard(
+                                              e,
+                                              onClick = { onOpen(e.url) },
+                                              onRemove = {
+                                                  BookmarkStore.remove(e.url)
+                                                  marks = BookmarkStore.load()
+                                              }
+                                          )
+                                      }
+                                  }
+                              }
+                          }
                       }
                   }
               }
@@ -3231,6 +3388,7 @@ jobs:
           @Composable
           fun EditorScreen(id: String?, onBack: () -> Unit) {
               val scope = rememberCoroutineScope()
+              val ctx = LocalContext.current
               val existing = remember { if (id == null) null else Store.load().firstOrNull { it.id == id } }
               var curId by remember { mutableStateOf(existing?.id) }
               var code by remember { mutableStateOf(existing?.code ?: NEW_TEMPLATE) }
@@ -3280,7 +3438,11 @@ jobs:
                           fontSize = 18.sp,
                           modifier = Modifier.weight(1f)
                       )
-                      Button(onClick = { save() }) { Text("Save") }
+                      Button(onClick = {
+                          save()
+                          toast(ctx, "Saved. Reload the page to run it.")
+                          onBack()
+                      }) { Text("Save") }
                       Spacer(Modifier.width(6.dp))
                   }
                   Column(
@@ -3306,15 +3468,6 @@ jobs:
                               modifier = Modifier.padding(top = 6.dp)
                           )
                       }
-                      Spacer(Modifier.height(10.dp))
-                      OutlinedTextField(
-                          value = code,
-                          onValueChange = { code = it },
-                          modifier = Modifier.fillMaxWidth(),
-                          minLines = 12,
-                          textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
-                          colors = fieldColors()
-                      )
                       Spacer(Modifier.height(10.dp))
                       Row(verticalAlignment = Alignment.CenterVertically) {
                           Text("Enabled", color = Color.White, modifier = Modifier.weight(1f))
@@ -3398,6 +3551,15 @@ jobs:
                                   .clickable { showDelete = true }
                           )
                       }
+                      Spacer(Modifier.height(10.dp))
+                      OutlinedTextField(
+                          value = code,
+                          onValueChange = { code = it },
+                          modifier = Modifier.fillMaxWidth(),
+                          minLines = 12,
+                          textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
+                          colors = fieldColors()
+                      )
                   }
               }
               if (showDiscard) {
