@@ -193,54 +193,199 @@ jobs:
             console.log("GreyScript content error: " + e);
           });
           (function () {
-            var seenC = Object.create(null);
-            var seenI = Object.create(null);
-            var scans = 0;
-            var got = false;
-            var timer = null;
-            function inject(css) {
-              if (!css) return;
-              var s = document.createElement("style");
-              s.textContent = css;
-              (document.head || document.documentElement).appendChild(s);
+            var on = false;
+            var sel = null;
+            var trail = [];
+            var box = null;
+            var shield = null;
+            var previewing = false;
+            var savedDisp = "";
+            var savedPrio = "";
+            var curDesc = "";
+
+            function stableName(s) {
+              return !!s && s.length <= 32 && !/\d{3,}/.test(s) && !/^(css|sc|jsx|styled|emotion)-/i.test(s);
             }
-            function askDomain() {
-              browser.runtime.sendMessage({ type: "cos", host: location.hostname }).then(function (r) {
-                if (r && r.css) { got = true; inject(r.css); }
-              }).catch(function () {});
+            function esc(s) {
+              return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
             }
-            function scan() {
-              timer = null;
-              if (scans > 25 || !document.documentElement) return;
-              var ids = [];
-              var cls = [];
-              var els = document.querySelectorAll("[class],[id]");
-              var lim = Math.min(els.length, 6000);
-              for (var i = 0; i < lim; i++) {
-                var e = els[i];
-                if (e.id && !seenI[e.id]) { seenI[e.id] = 1; ids.push(e.id); }
-                var cl = e.classList;
-                if (cl) {
-                  for (var j = 0; j < cl.length; j++) {
-                    var c = cl[j];
-                    if (!seenC[c]) { seenC[c] = 1; cls.push(c); }
-                  }
+            function describe(el) {
+              var s = el.tagName.toLowerCase();
+              if (el.id) s += "#" + el.id;
+              else if (el.classList && el.classList.length) s += "." + el.classList[0];
+              return s.length > 40 ? s.slice(0, 40) : s;
+            }
+            function seg(el) {
+              var tag = el.tagName.toLowerCase();
+              if (el.id && stableName(el.id)) return "#" + esc(el.id);
+              var s = tag;
+              var n = 0;
+              if (el.classList) {
+                for (var i = 0; i < el.classList.length && n < 2; i++) {
+                  if (stableName(el.classList[i])) { s += "." + esc(el.classList[i]); n++; }
                 }
               }
-              if (!ids.length && !cls.length) return;
-              scans++;
-              browser.runtime.sendMessage({
-                type: "cosg",
-                host: location.hostname,
-                ids: ids.slice(0, 3000),
-                classes: cls.slice(0, 3000)
-              }).then(function (r) { if (r && r.css) inject(r.css); }).catch(function () {});
+              var p = el.parentElement;
+              if (p) {
+                var same = 0;
+                var idx = 0;
+                for (var k = 0; k < p.children.length; k++) {
+                  var c = p.children[k];
+                  if (c.tagName === el.tagName) { same++; if (c === el) idx = same; }
+                }
+                var cnt = 2;
+                try { cnt = p.querySelectorAll(":scope > " + s).length; } catch (e) {}
+                if (cnt > 1) s += ":nth-of-type(" + idx + ")";
+              }
+              return s;
             }
-            function later() { if (!timer) timer = setTimeout(scan, 900); }
-            askDomain();
-            document.addEventListener("DOMContentLoaded", function () { if (!got) askDomain(); scan(); });
-            window.addEventListener("load", later);
-            try { new MutationObserver(later).observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+            function cssPath(el) {
+              var parts = [];
+              var cur = el;
+              var depth = 0;
+              while (cur && cur.nodeType === 1 && cur !== document.documentElement && depth < 8) {
+                var s = seg(cur);
+                parts.unshift(s);
+                var q = parts.join(" > ");
+                try { if (document.querySelectorAll(q).length === 1) return q; } catch (e) {}
+                if (s.charAt(0) === "#") break;
+                cur = cur.parentElement;
+                depth++;
+              }
+              return parts.join(" > ");
+            }
+            function sendState(note) {
+              browser.runtime.sendMessage({
+                type: "pickstate",
+                has: !!sel,
+                desc: curDesc,
+                previewing: previewing,
+                note: note || ""
+              }).catch(function () {});
+            }
+            function place() {
+              if (!box) return;
+              if (!on || !sel || previewing) { box.style.display = "none"; return; }
+              var r = sel.getBoundingClientRect();
+              box.style.display = "block";
+              box.style.left = r.left + "px";
+              box.style.top = r.top + "px";
+              box.style.width = r.width + "px";
+              box.style.height = r.height + "px";
+            }
+            function setPreview(v) {
+              if (!sel) return;
+              if (v && !previewing) {
+                savedDisp = sel.style.getPropertyValue("display");
+                savedPrio = sel.style.getPropertyPriority("display");
+                sel.style.setProperty("display", "none", "important");
+                previewing = true;
+              } else if (!v && previewing) {
+                if (savedDisp) sel.style.setProperty("display", savedDisp, savedPrio);
+                else sel.style.removeProperty("display");
+                previewing = false;
+              }
+            }
+            function refresh() {
+              var r = sel.getBoundingClientRect();
+              curDesc = describe(sel) + " · " + Math.round(r.width) + "x" + Math.round(r.height);
+              place();
+              sendState("");
+            }
+            function select(el) {
+              setPreview(false);
+              sel = el;
+              trail = [];
+              refresh();
+            }
+            function start() {
+              if (on) { sendState("Tap an element on the page"); return; }
+              on = true;
+              box = document.createElement("div");
+              box.setAttribute("data-grey-pick", "1");
+              box.style.cssText = "position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #ff3b30;background:rgba(255,59,48,.18);box-sizing:border-box;display:none;";
+              document.documentElement.appendChild(box);
+              shield = document.createElement("style");
+              shield.setAttribute("data-grey-pick", "1");
+              shield.textContent = "iframe,embed,object,video{pointer-events:none!important}";
+              document.documentElement.appendChild(shield);
+              sel = null;
+              trail = [];
+              curDesc = "";
+              sendState("Tap an element on the page");
+            }
+            function stop() {
+              setPreview(false);
+              on = false;
+              sel = null;
+              trail = [];
+              curDesc = "";
+              if (box) { box.remove(); box = null; }
+              if (shield) { shield.remove(); shield = null; }
+              sendState("");
+            }
+            function parent() {
+              if (!sel) return;
+              var p = sel.parentElement;
+              if (!p || p === document.documentElement) return;
+              setPreview(false);
+              trail.push(sel);
+              sel = p;
+              refresh();
+            }
+            function child() {
+              if (!sel) return;
+              var c = trail.length ? trail.pop() : sel.firstElementChild;
+              if (!c) return;
+              setPreview(false);
+              sel = c;
+              refresh();
+            }
+            function hide() {
+              if (!sel) return;
+              if (sel === document.body || sel === document.documentElement) { sendState("Can't hide the whole page"); return; }
+              var q = cssPath(sel);
+              setPreview(false);
+              var st = document.createElement("style");
+              st.setAttribute("data-grey-hide", "1");
+              st.textContent = q + "{display:none!important}";
+              document.documentElement.appendChild(st);
+              browser.runtime.sendMessage({ type: "hidesave", host: location.hostname, sel: q }).catch(function () {});
+              sel = null;
+              trail = [];
+              curDesc = "";
+              place();
+              sendState("Hidden. Tap another element or Close.");
+            }
+            function reset() {
+              setPreview(false);
+              var st = document.querySelectorAll("style[data-grey-hide]");
+              for (var i = 0; i < st.length; i++) st[i].remove();
+              browser.runtime.sendMessage({ type: "hidereset", host: location.hostname }).catch(function () {});
+              sendState("Hidden elements for this site were cleared.");
+            }
+            function onClick(e) {
+              if (!on) return;
+              var t = e.target;
+              if (!t || t.nodeType !== 1) return;
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              select(t);
+            }
+            document.addEventListener("click", onClick, true);
+            window.addEventListener("scroll", place, true);
+            window.addEventListener("resize", place);
+            browser.runtime.onMessage.addListener(function (m) {
+              if (!m || m.type !== "pick") return;
+              if (m.cmd === "start") start();
+              else if (m.cmd === "stop") stop();
+              else if (m.cmd === "parent") parent();
+              else if (m.cmd === "child") child();
+              else if (m.cmd === "preview") { if (sel) { setPreview(!previewing); place(); sendState(""); } }
+              else if (m.cmd === "hide") hide();
+              else if (m.cmd === "reset") reset();
+            });
           })();
           EOF
 
@@ -514,9 +659,14 @@ jobs:
             return native({ type: "get", url: msg.url, tabId: sender.tab.id }).then(function (res) {
               if (typeof res.grabber === "boolean") grabberOn = res.grabber;
               if (typeof res.adv === "number" && res.adv !== adVer) adLoad().catch(function () {});
+              connectPort();
+              var jobs = [];
+              var hide = res.hide || [];
+              if (hide.length) jobs.push(injectHide(sender, hide));
               var list = res.scripts || [];
-              if (!list.length) { return {}; }
-              return Promise.all(list.map(function (s) { return runScript(s, sender, msg.url); })).then(function () { return {}; });
+              for (var i = 0; i < list.length; i++) jobs.push(runScript(list[i], sender, msg.url));
+              if (!jobs.length) { return {}; }
+              return Promise.all(jobs).then(function () { return {}; });
             }).catch(function (e) {
               nlog("native error: " + e);
               return {};
@@ -529,8 +679,7 @@ jobs:
             if (msg.type === "setValue" || msg.type === "deleteValue") { native(msg); return; }
             if (msg.type === "xhr") { return doXhr(msg.details); }
             if (msg.type === "page") { return handlePage(msg, sender); }
-            if (msg.type === "cos") { return Promise.resolve({ css: adCosDomain(String(msg.host || "")) }); }
-            if (msg.type === "cosg") { return Promise.resolve({ css: adCosGeneric(msg.ids || [], msg.classes || [], String(msg.host || "")) }); }
+            if (msg.type === "pickstate" || msg.type === "hidesave" || msg.type === "hidereset") { native(msg).catch(function () {}); return; }
           });
 
           // ---- Video grabber (network sniffing) ----
@@ -622,23 +771,19 @@ jobs:
             nlog("grabber unavailable: " + e);
           }
 
-          // ---- Ad blocker (EasyList / ABP syntax) ----
+          // ---- Ad blocker (network level, EasyList / ABP syntax) ----
           var adOn = false;
-          var adCos = true;
           var adVer = -1;
           var adIdx = null;
           var adLoading = null;
           var adBlockedN = 0;
           var adStatTimer = null;
-          var adValid = Object.create(null);
-          var adProbe = document.createElement("div");
           var AD_TYPES = {
             script: "script", image: "image", imageset: "image", stylesheet: "stylesheet", css: "stylesheet",
             xmlhttprequest: "xmlhttprequest", xhr: "xmlhttprequest", sub_frame: "subdocument", subdocument: "subdocument",
             frame: "subdocument", media: "media", font: "font", object: "object", object_subrequest: "object",
             "object-subrequest": "object", ping: "ping", beacon: "ping", websocket: "websocket", other: "other"
           };
-          var AD_COS_SKIP = ["+js(", ":-abp", ":has-text", ":xpath", ":matches", ":upward", ":remove", ":style", ":nth-ancestor", ":min-text", ":watch", ":others", ":contains(", ":-moz-", ":if(", ":if-not("];
 
           function adHost(u) {
             try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ""; }
@@ -738,10 +883,7 @@ jobs:
           }
 
           function adParse(text) {
-            var idx = {
-              block: Object.create(null), blockGen: [], allow: Object.create(null), allowGen: [],
-              cosDom: Object.create(null), cosEx: Object.create(null), cosGen: Object.create(null), n: 0, c: 0
-            };
+            var idx = { block: Object.create(null), blockGen: [], allow: Object.create(null), allowGen: [], n: 0 };
             var lines = text.split("\n");
             for (var i = 0; i < lines.length; i++) {
               var line = lines[i].trim();
@@ -754,42 +896,7 @@ jobs:
                 if (hm[1] !== "localhost" && hm[1].indexOf(".") > 0) adAddNet(idx, "||" + hm[1] + "^");
                 continue;
               }
-              if (/^[a-z0-9.,~*_-]*#@?[?$%]/i.test(line)) continue;
-              var k = line.indexOf("##");
-              var ex = false;
-              var k2 = line.indexOf("#@#");
-              if (k2 >= 0 && (k < 0 || k2 < k)) { k = k2; ex = true; }
-              if (k >= 0 && /^[a-z0-9.,~*_-]*$/i.test(line.slice(0, k))) {
-                var pre = line.slice(0, k);
-                var sel = line.slice(k + (ex ? 3 : 2));
-                if (!sel) continue;
-                var skip = false;
-                for (var q = 0; q < AD_COS_SKIP.length; q++) {
-                  if (sel.indexOf(AD_COS_SKIP[q]) >= 0) { skip = true; break; }
-                }
-                if (skip) continue;
-                var pos = [];
-                if (pre) {
-                  var ds = pre.split(",");
-                  for (var a = 0; a < ds.length; a++) {
-                    var d = ds[a].toLowerCase();
-                    if (d && d.charAt(0) !== "~") pos.push(d);
-                  }
-                }
-                if (ex) {
-                  for (var b = 0; b < pos.length; b++) { (idx.cosEx[pos[b]] = idx.cosEx[pos[b]] || Object.create(null))[sel] = 1; }
-                  continue;
-                }
-                if (pos.length) {
-                  for (var e2 = 0; e2 < pos.length; e2++) { (idx.cosDom[pos[e2]] = idx.cosDom[pos[e2]] || []).push(sel); }
-                } else {
-                  var km = /[.#][A-Za-z0-9_-]+/.exec(sel);
-                  if (!km) continue;
-                  (idx.cosGen[km[0]] = idx.cosGen[km[0]] || []).push(sel);
-                }
-                idx.c++;
-                continue;
-              }
+              if (/^[a-z0-9.,~*_-]*#[@?$%]*#/i.test(line)) continue;
               adAddNet(idx, line);
             }
             return idx;
@@ -876,58 +983,6 @@ jobs:
             return { cancel: true };
           }
 
-          function adHostEx(host) {
-            var ex = Object.create(null);
-            var labels = host.split(".");
-            for (var i = 0; i < labels.length - 1; i++) {
-              var e = adIdx.cosEx[labels.slice(i).join(".")];
-              if (e) { for (var k in e) ex[k] = 1; }
-            }
-            return ex;
-          }
-
-          function adCss(sels, ex) {
-            var ok = [];
-            var seen = Object.create(null);
-            for (var i = 0; i < sels.length; i++) {
-              var s = sels[i];
-              if (seen[s] || ex[s]) continue;
-              seen[s] = 1;
-              if (adValid[s] === undefined) {
-                try { adProbe.matches(s); adValid[s] = true; } catch (e) { adValid[s] = false; }
-              }
-              if (adValid[s]) ok.push(s);
-            }
-            var css = "";
-            for (var a = 0; a < ok.length; a += 20) {
-              css += ok.slice(a, a + 20).join(",") + "{display:none!important}\n";
-            }
-            return css;
-          }
-
-          function adCosDomain(host) {
-            if (!adIdx || !adOn || !adCos || !host) return "";
-            var sels = [];
-            var labels = host.toLowerCase().split(".");
-            for (var i = 0; i < labels.length - 1; i++) {
-              var s = adIdx.cosDom[labels.slice(i).join(".")];
-              if (s) { for (var j = 0; j < s.length; j++) sels.push(s[j]); }
-            }
-            return adCss(sels, adHostEx(host.toLowerCase()));
-          }
-
-          function adCosGeneric(ids, classes, host) {
-            if (!adIdx || !adOn || !adCos) return "";
-            var sels = [];
-            function add(key) {
-              var s = adIdx.cosGen[key];
-              if (s) { for (var j = 0; j < s.length && sels.length < 4000; j++) sels.push(s[j]); }
-            }
-            for (var i = 0; i < ids.length; i++) add("#" + ids[i]);
-            for (var k = 0; k < classes.length; k++) add("." + classes[k]);
-            return adCss(sels, adHostEx(host.toLowerCase()));
-          }
-
           function adFetch(off, acc) {
             return native({ type: "rules", off: off }).then(function (r) {
               acc.push(r.text || "");
@@ -940,14 +995,13 @@ jobs:
             if (adLoading) return adLoading;
             adLoading = native({ type: "adcfg" }).then(function (c) {
               adOn = !!c.on;
-              adCos = !!c.cos;
               if (!adOn) { adIdx = null; adVer = c.ver; return; }
               if (c.ver === adVer && adIdx) return;
               return adFetch(0, []).then(function (parts) {
                 adIdx = adParse(parts.join(""));
                 adVer = c.ver;
-                nlog("adblock loaded: " + adIdx.n + " network rules, " + adIdx.c + " cosmetic rules");
-                native({ type: "adinfo", n: adIdx.n, c: adIdx.c }).catch(function () {});
+                nlog("adblock loaded: " + adIdx.n + " network rules");
+                native({ type: "adinfo", n: adIdx.n }).catch(function () {});
               });
             }).then(function () { adLoading = null; }, function (e) { adLoading = null; throw e; });
             return adLoading;
@@ -966,6 +1020,43 @@ jobs:
             nlog("adblock unavailable: " + e);
           }
           adBoot(0);
+
+          // ---- Port to the app (hide element tool commands) ----
+          var nport = null;
+
+          function onPortMsg(m) {
+            if (!m || m.type !== "pick") return;
+            var tid = m.tabId;
+            if (typeof tid !== "number" || tid < 0) return;
+            browser.tabs.sendMessage(tid, m).catch(function (e) { nlog("pick send failed: " + e); });
+          }
+
+          function connectPort() {
+            if (nport) return;
+            try {
+              nport = browser.runtime.connectNative(APP);
+              nport.onMessage.addListener(onPortMsg);
+              nport.onDisconnect.addListener(function () {
+                nport = null;
+                setTimeout(connectPort, 3000);
+              });
+              nlog("port connected");
+            } catch (e) {
+              nport = null;
+              setTimeout(connectPort, 3000);
+            }
+          }
+
+          function injectHide(sender, sels) {
+            var css = "";
+            for (var i = 0; i < sels.length; i++) css += sels[i] + "{display:none!important}\n";
+            var code = "(function(){var s=document.createElement('style');s.setAttribute('data-grey-hide','1');s.textContent=" + JSON.stringify(css) + ";(document.head||document.documentElement).appendChild(s);})();";
+            return browser.tabs.executeScript(sender.tab.id, { code: code, runAt: "document_start", frameId: sender.frameId || 0 }).catch(function (e) {
+              nlog("hide inject failed: " + e);
+            });
+          }
+
+          connectPort();
 
           nlog("background started");
           EOF
@@ -1897,6 +1988,122 @@ jobs:
           }
           EOF
 
+          cat > app/src/main/java/com/grey/gecko/Hide.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.content.Context
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.mozilla.geckoview.WebExtension
+
+          object HideRules {
+              private fun sp() = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+
+              fun hostKey(host: String): String = host.lowercase().removePrefix("www.")
+
+              @Synchronized
+              private fun readAll(): JSONObject = try {
+                  JSONObject(sp().getString("hide", "{}") ?: "{}")
+              } catch (e: Exception) {
+                  JSONObject()
+              }
+
+              @Synchronized
+              fun forHost(host: String): List<String> {
+                  val out = mutableListOf<String>()
+                  val arr = readAll().optJSONArray(hostKey(host)) ?: return out
+                  for (i in 0 until arr.length()) out.add(arr.optString(i))
+                  return out
+              }
+
+              @Synchronized
+              fun add(host: String, sel: String) {
+                  val k = hostKey(host)
+                  if (k.isBlank() || sel.isBlank() || sel.length > 500) return
+                  val all = readAll()
+                  val arr = all.optJSONArray(k) ?: JSONArray()
+                  for (i in 0 until arr.length()) {
+                      if (arr.optString(i) == sel) return
+                  }
+                  if (arr.length() >= 100) return
+                  arr.put(sel)
+                  all.put(k, arr)
+                  sp().edit().putString("hide", all.toString()).apply()
+              }
+
+              @Synchronized
+              fun clear(host: String) {
+                  val all = readAll()
+                  all.remove(hostKey(host))
+                  sp().edit().putString("hide", all.toString()).apply()
+              }
+          }
+
+          object HideTool {
+              var active by mutableStateOf(false)
+              var has by mutableStateOf(false)
+              var desc by mutableStateOf("")
+              var note by mutableStateOf("")
+              var previewing by mutableStateOf(false)
+              var tabId = 0
+              var extId = -1
+              var port: WebExtension.Port? = null
+
+              private fun send(ext: Int, cmd: String): Boolean {
+                  val p = port ?: return false
+                  if (ext < 0) return false
+                  return try {
+                      val o = JSONObject()
+                      o.put("type", "pick")
+                      o.put("cmd", cmd)
+                      o.put("tabId", ext)
+                      p.postMessage(o)
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              fun begin(tab: BrowserTab): Boolean {
+                  if (!send(tab.extId, "start")) return false
+                  tabId = tab.id
+                  extId = tab.extId
+                  has = false
+                  desc = ""
+                  previewing = false
+                  note = "Tap an element on the page"
+                  active = true
+                  return true
+              }
+
+              fun cmd(c: String) {
+                  send(extId, c)
+              }
+
+              fun onState(h: Boolean, d: String, p: Boolean, n: String) {
+                  if (!active) return
+                  has = h
+                  desc = d
+                  previewing = p
+                  if (n.isNotBlank()) note = n
+              }
+
+              fun stop() {
+                  if (active) send(extId, "stop")
+                  deactivateLocal()
+              }
+
+              fun deactivateLocal() {
+                  active = false
+                  has = false
+                  previewing = false
+              }
+          }
+          EOF
+
           cat > app/src/main/java/com/grey/gecko/Browser.kt <<'EOF'
           package com.grey.gecko
 
@@ -1932,6 +2139,7 @@ jobs:
               var extId = -1
               var lastRecover = 0L
               var scrollY = 0
+              var preview by mutableStateOf(false)
               var lastUsed = System.currentTimeMillis()
               var savedState: GeckoSession.SessionState? = null
               val videos = mutableStateListOf<VideoItem>()
@@ -2087,15 +2295,17 @@ jobs:
                   try {
                       val arr = JSONArray()
                       for (t in tabs) {
-                          val o = JSONObject()
-                          o.put("id", t.id)
+                      if (t.preview) continue
+                      val o = JSONObject()
+                      o.put("id", t.id)
                           o.put("u", t.url)
                           o.put("t", t.title)
                           o.put("o", t.openerId)
                           arr.put(o)
                       }
                       val root = JSONObject()
-                      root.put("cur", current?.id ?: 0)
+                      val curTab = current
+                      root.put("cur", if (curTab == null) 0 else if (curTab.preview) curTab.openerId else curTab.id)
                       root.put("next", counter)
                       root.put("list", arr)
                       Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
@@ -2150,7 +2360,7 @@ jobs:
                   var opener = openerId
                   if (url.isNotBlank() && !url.startsWith("about:")) {
                       val key = normUrl(url)
-                      val dups = tabs.filter { it.url.isNotBlank() && normUrl(it.url) == key }
+                      val dups = tabs.filter { !it.preview && it.url.isNotBlank() && normUrl(it.url) == key }
                       val cd = dups.firstOrNull { it === current }
                       if (!makeCurrent && cd != null) return cd
                       for (d in dups) {
@@ -2172,10 +2382,11 @@ jobs:
               }
 
               private fun dedupe(t: BrowserTab) {
+              if (t.preview) return
                   if (t.url.isBlank() || t.url.startsWith("about:")) return
                   if (!tabs.contains(t)) return
                   val key = normUrl(t.url)
-                  val dups = tabs.filter { it !== t && it.url.isNotBlank() && normUrl(it.url) == key }
+                  val dups = tabs.filter { it !== t && !it.preview && it.url.isNotBlank() && normUrl(it.url) == key }
                   if (dups.isEmpty()) return
                   if (t !== current && dups.any { it === current }) {
                       removeTab(t, false)
@@ -2214,6 +2425,7 @@ jobs:
                   ensureLive(t)
                   t.lastUsed = System.currentTimeMillis()
                   current = t
+                  if (prev != null && prev !== t && prev.preview) removeTab(prev, false)
                   enforceLimit()
                   persist()
               }
@@ -2312,6 +2524,27 @@ jobs:
                           v.setSession(s)
                       }
                   }, 200L)
+              }
+
+              fun openPreview(url: String, openerId: Int): BrowserTab {
+                  var op = openerId
+                  val c = current
+                  if (c != null && c.preview) op = c.openerId
+                  counter += 1
+                  val t = BrowserTab(counter, null, op)
+                  t.preview = true
+                  t.url = url
+                  tabs.add(t)
+                  ensureLive(t, url)
+                  home = false
+                  select(t)
+                  return t
+              }
+
+              fun keep(t: BrowserTab) {
+                  t.preview = false
+                  dedupe(t)
+                  persist()
               }
 
               fun cycleMaxBg() {
@@ -2437,6 +2670,7 @@ jobs:
                           t.thumb = null
                           t.videos.clear()
                           t.scrollY = 0
+                          if (HideTool.active && HideTool.tabId == t.id) HideTool.deactivateLocal()
                           t.seen.clear()
                       }
 
@@ -2627,6 +2861,7 @@ jobs:
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.gestures.awaitFirstDown
+          import androidx.compose.foundation.gestures.detectDragGestures
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.layout.*
@@ -2713,6 +2948,16 @@ jobs:
                   c.applicationContext.getSharedPreferences("scripts", Context.MODE_PRIVATE)
 
               private val delegate = object : WebExtension.MessageDelegate {
+                  override fun onConnect(port: WebExtension.Port) {
+                      HideTool.port = port
+                      port.setDelegate(object : WebExtension.PortDelegate {
+                          override fun onPortMessage(message: Any, port: WebExtension.Port) {}
+
+                          override fun onDisconnect(port: WebExtension.Port) {
+                              if (HideTool.port === port) HideTool.port = null
+                          }
+                      })
+                  }
                   override fun onMessage(
                       nativeApp: String,
                       message: Any,
@@ -2749,6 +2994,8 @@ jobs:
                                   reply.put("scripts", arr)
                                   reply.put("grabber", Videos.enabled)
                                   reply.put("adv", Filters.ver)
+                                  val hostName = try { android.net.Uri.parse(url).host ?: "" } catch (e: Exception) { "" }
+                                  reply.put("hide", JSONArray(HideRules.forHost(hostName)))
                                   Log.d("GreyScript", "scripts for " + url + ": " + arr.length())
                               }
                               "cfg" -> reply.put("grabber", Videos.enabled)
@@ -2766,6 +3013,15 @@ jobs:
                               }
                               "adstat" -> {
                                   Filters.blocked = m.optInt("n")
+                              }
+                              "pickstate" -> {
+                                  HideTool.onState(m.optBoolean("has"), m.optString("desc"), m.optBoolean("previewing"), m.optString("note"))
+                              }
+                              "hidesave" -> {
+                                  HideRules.add(m.optString("host"), m.optString("sel"))
+                              }
+                              "hidereset" -> {
+                                  HideRules.clear(m.optString("host"))
                               }
                               "adinfo" -> {
                                   Filters.loadedNet = m.optInt("n")
@@ -3078,6 +3334,12 @@ jobs:
               val density = LocalDensity.current
               val pullTrigger = with(density) { 80.dp.toPx() }
               var pull by remember { mutableStateOf(0f) }
+              val curPreview = cur?.preview == true
+              val stripText = if (curPreview) "Preview tab · Back closes it · Menu > Keep tab  •  " else "Bookmarked  •  "
+
+              LaunchedEffect(cur?.id, tabs.home) {
+                  if (HideTool.active && (tabs.home || cur?.id != HideTool.tabId)) HideTool.stop()
+              }
               val bmRev = BookmarkStore.rev
               val curUrl = cur?.url ?: ""
               val marked = remember(bmRev, curUrl) {
@@ -3089,6 +3351,7 @@ jobs:
                   if (!active) {
                       editing = false
                       focusManager.clearFocus(true)
+                      if (HideTool.active) HideTool.stop()
                       val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
                       imm.hideSoftInputFromWindow(hostView.windowToken, 0)
                   }
@@ -3111,6 +3374,8 @@ jobs:
                   if (editing) {
                       editing = false
                       focusManager.clearFocus()
+                  } else if (HideTool.active) {
+                  HideTool.stop()
                   } else if (panelOpen) {
                   panelOpen = false
                   } else if (tabs.home) {
@@ -3118,7 +3383,9 @@ jobs:
                   } else if (c != null && c.canGoBack) {
                       c.session?.goBack()
                   } else if (c != null && tabs.openerOf(c) != null) {
-                      tabs.closeToOpener(c)
+                  tabs.closeToOpener(c)
+                  } else if (c != null && c.preview) {
+                  tabs.close(c)
                   } else {
                       ctx.findActivity()?.moveTaskToBack(true)
                   }
@@ -3166,7 +3433,7 @@ jobs:
                                       .border(2.dp, Color.White, RoundedCornerShape(6.dp)),
                                   contentAlignment = Alignment.Center
                               ) {
-                                  Text(tabs.tabs.size.toString(), color = Color.White, fontSize = 12.sp)
+                                  Text(tabs.tabs.count { !it.preview }.toString(), color = Color.White, fontSize = 12.sp)
                               }
                           }
                           Spacer(Modifier.width(8.dp))
@@ -3252,6 +3519,28 @@ jobs:
                                       onClick = { menu = false; onFilters() }
                                   )
                                   DropdownMenuItem(
+                                      text = { Text("Hide element", color = Color.White) },
+                                      onClick = {
+                                          menu = false
+                                          val t = tabs.current
+                                          if (tabs.home || t == null) {
+                                              toast(ctx, "Open a page first")
+                                          } else if (!HideTool.begin(t)) {
+                                              toast(ctx, "Tool not ready. Reload the page and try again")
+                                          }
+                                      }
+                                  )
+                                  if (cur?.preview == true) {
+                                      DropdownMenuItem(
+                                          text = { Text("Keep tab", color = Color.White) },
+                                          onClick = {
+                                              menu = false
+                                              tabs.current?.let { tabs.keep(it) }
+                                              toast(ctx, "Tab kept")
+                                          }
+                                      )
+                                  }
+                                  DropdownMenuItem(
                                       text = { Text("Logcat", color = Color.White) },
                                       onClick = { menu = false; onLogs() }
                                   )
@@ -3267,7 +3556,7 @@ jobs:
                                       while (true) {
                                           val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                                           val c0 = tabs.current
-                                          var armed = !tabs.home && c0 != null && c0.session != null && c0.scrollY == 0
+                                          var armed = !tabs.home && !HideTool.active && c0 != null && c0.session != null && c0.scrollY == 0
                                           val startX = down.position.x
                                           val startY = down.position.y
                                           var dy = 0f
@@ -3333,7 +3622,7 @@ jobs:
                                   }
                               }
                               }
-                              if (!tabs.home && marked) {
+                              if (!tabs.home && (marked || curPreview)) {
                                   Box(
                                       Modifier
                                           .fillMaxWidth()
@@ -3343,7 +3632,7 @@ jobs:
                                       contentAlignment = Alignment.CenterStart
                                   ) {
                                       Text(
-                                          "Bookmarked  •  ".repeat(30),
+                                          stripText.repeat(30),
                                           color = Color.Black,
                                           fontSize = 9.sp,
                                           lineHeight = 12.sp,
@@ -3354,6 +3643,9 @@ jobs:
                                       )
                                   }
                               }
+                  }
+                  if (HideTool.active && !tabs.home) {
+                      HideToolPanel()
                   }
                   if (!tabs.home && grabberOn && vids != null && vids.isNotEmpty()) {
                       VideoPanel(
@@ -3390,6 +3682,10 @@ jobs:
                                   tabs.newTab(cm.url, false, tabs.current?.id ?: 0)
                                   toast(ctx, "Opened in background")
                               }
+                              MenuRow("Preview") {
+                                  tabs.ctxMenu = null
+                                  tabs.openPreview(cm.url, tabs.current?.id ?: 0)
+                              }
                               MenuRow("Copy link") {
                                   tabs.ctxMenu = null
                                   copyText(ctx, cm.url)
@@ -3399,6 +3695,108 @@ jobs:
                       },
                       confirmButton = {}
                   )
+              }
+          }
+
+          @Composable
+          fun RowScope.ToolBtn(label: String, enabled: Boolean, highlight: Boolean = false, onClick: () -> Unit) {
+              Button(
+                  onClick = onClick,
+                  enabled = enabled,
+                  modifier = Modifier.weight(1f).height(34.dp),
+                  shape = RoundedCornerShape(8.dp),
+                  contentPadding = PaddingValues(horizontal = 2.dp),
+                  colors = ButtonDefaults.buttonColors(
+                      containerColor = if (highlight) Color.White else Btn,
+                      contentColor = if (highlight) Color.Black else Color.White,
+                      disabledContainerColor = Field,
+                      disabledContentColor = Soft
+                  )
+              ) {
+                  Text(label, fontSize = 12.sp, maxLines = 1)
+              }
+          }
+
+          @OptIn(ExperimentalFoundationApi::class)
+          @Composable
+          fun HideToolPanel() {
+              val density = LocalDensity.current
+              var ox by remember { mutableStateOf(Float.NaN) }
+              var oy by remember { mutableStateOf(Float.NaN) }
+              BoxWithConstraints(Modifier.fillMaxSize()) {
+                  val maxW = constraints.maxWidth.toFloat()
+                  val maxH = constraints.maxHeight.toFloat()
+                  val pw = with(density) { 250.dp.toPx() }
+                  val ph = with(density) { 140.dp.toPx() }
+                  val gap = with(density) { 80.dp.toPx() }
+                  LaunchedEffect(maxW, maxH) {
+                      if (ox.isNaN()) {
+                          ox = (maxW - pw) / 2f
+                          oy = maxH - ph - gap
+                      }
+                  }
+                  val x = if (ox.isNaN()) 0f else ox.coerceIn(0f, maxOf(0f, maxW - pw))
+                  val y = if (oy.isNaN()) 0f else oy.coerceIn(0f, maxOf(0f, maxH - ph))
+                  val shape = RoundedCornerShape(10.dp)
+                  Column(
+                      Modifier
+                          .offset { IntOffset(x.toInt(), y.toInt()) }
+                          .width(250.dp)
+                          .clip(shape)
+                          .background(Bar)
+                          .border(0.5.dp, Color(0xFF666666), shape)
+                          .pointerInput(Unit) { detectTapGestures { } }
+                  ) {
+                      Box(
+                          Modifier
+                              .fillMaxWidth()
+                              .height(20.dp)
+                              .background(Color.White)
+                              .clipToBounds()
+                              .pointerInput(Unit) {
+                                  detectDragGestures { change, drag ->
+                                      change.consume()
+                                      val bx = if (ox.isNaN()) x else ox
+                                      val by = if (oy.isNaN()) y else oy
+                                      ox = (bx + drag.x).coerceIn(0f, maxOf(0f, maxW - pw))
+                                      oy = (by + drag.y).coerceIn(0f, maxOf(0f, maxH - ph))
+                                  }
+                              },
+                          contentAlignment = Alignment.CenterStart
+                      ) {
+                          Text(
+                              "Hide element  •  Drag this bar to move  •  Tap an element on the page to select it  •  ".repeat(6),
+                              color = Color.Black,
+                              fontSize = 10.sp,
+                              lineHeight = 12.sp,
+                              fontWeight = FontWeight.Bold,
+                              maxLines = 1,
+                              softWrap = false,
+                              modifier = Modifier.basicMarquee(iterations = Int.MAX_VALUE)
+                          )
+                      }
+                      Column(Modifier.padding(8.dp)) {
+                          Text(
+                              if (HideTool.has) HideTool.desc else HideTool.note,
+                              color = Color.White,
+                              fontSize = 12.sp,
+                              maxLines = 2,
+                              overflow = TextOverflow.Ellipsis,
+                              modifier = Modifier.heightIn(min = 30.dp)
+                          )
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              ToolBtn("Parent", HideTool.has) { HideTool.cmd("parent") }
+                              ToolBtn("Child", HideTool.has) { HideTool.cmd("child") }
+                              ToolBtn("Preview", HideTool.has, HideTool.previewing) { HideTool.cmd("preview") }
+                          }
+                          Spacer(Modifier.height(6.dp))
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              ToolBtn("Hide", HideTool.has) { HideTool.cmd("hide") }
+                              ToolBtn("Reset", true) { HideTool.cmd("reset") }
+                              ToolBtn("Close", true) { HideTool.stop() }
+                          }
+                      }
+                  }
               }
           }
 
@@ -3829,7 +4227,7 @@ jobs:
               onNewTab: () -> Unit,
               onSelect: (BrowserTab) -> Unit
           ) {
-              val groups = groupTabs(tabs.tabs)
+              val groups = groupTabs(tabs.tabs.filter { !it.preview })
               val curKey = groupKeyOf(tabs.current)
               var activeKey by remember { mutableStateOf(curKey) }
               val active = groups.firstOrNull { it.key == activeKey }
@@ -4562,7 +4960,7 @@ jobs:
           }
 
           const val FILTER_GUIDE = """WHAT IT DOES
-          Blocks ad and tracker requests before they load, and hides leftover ad boxes on the page. It reads the standard EasyList (Adblock Plus) rule format.
+          Blocks ad and tracker network requests before they load, using the standard EasyList (Adblock Plus) rule format.
 
           HOW TO ADD A LIST
           1. Tap Add next to a list below. Or copy its link, tap URL on the Ad filters screen, paste it and tap Download.
@@ -4575,10 +4973,10 @@ jobs:
           - If a site breaks, turn Ad blocking off, reload, and see if the filters caused it.
 
           SUPPORTED
-          Domain rules (||example.com^), anchors, wildcards, exceptions (@@), the options script, image, stylesheet, xmlhttprequest, subdocument, media, font, ping, other, third-party, domain= and important, hosts-format lines, and simple element hiding (##.ad).
+          Domain rules (||example.com^), anchors, wildcards, exceptions (@@), hosts-format lines, and the options script, image, stylesheet, xmlhttprequest, subdocument, media, font, ping, other, third-party, domain= and important.
 
           NOT SUPPORTED (these rules are skipped)
-          Scriptlets (##+js), redirect, csp and removeparam rules, and extended selectors like :has-text. So YouTube video ads and some anti-adblock walls will still show.
+          Element hiding (##), scriptlets (##+js), and redirect, csp and removeparam rules. To remove a leftover empty box yourself, use Hide element in the menu. YouTube video ads and some anti-adblock walls will still show.
 
           The lists below belong to their maintainers. Links are not checked by this app."""
 
@@ -4671,7 +5069,7 @@ jobs:
               val scope = rememberCoroutineScope()
               var lists by remember { mutableStateOf(Filters.load()) }
               var on by remember { mutableStateOf(Filters.isOn()) }
-              var cos by remember { mutableStateOf(Filters.cosOn()) }
+
               var status by remember { mutableStateOf("") }
               var busy by remember { mutableStateOf(false) }
               var showUrl by remember { mutableStateOf(false) }
@@ -4739,12 +5137,9 @@ jobs:
                           on = v
                           Filters.setOn(v)
                       }
-                      FilterToggleRow("Hide page elements", cos) { v ->
-                          cos = v
-                          Filters.setCos(v)
-                      }
+
                       Text(
-                          "Rules loaded: " + loadedNet + " network, " + loadedCos + " hiding · blocked this session: " + blocked,
+                          "Rules loaded: " + loadedNet + " · blocked this session: " + blocked,
                           color = Soft,
                           fontSize = 12.sp,
                           modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
