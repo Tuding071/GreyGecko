@@ -341,7 +341,7 @@ jobs:
               sel = c;
               refresh();
             }
-            function hide() {
+            function hide(page) {
               if (!sel) return;
               if (sel === document.body || sel === document.documentElement) { sendState("Can't hide the whole page"); return; }
               var q = cssPath(sel);
@@ -350,7 +350,7 @@ jobs:
               st.setAttribute("data-grey-hide", "1");
               st.textContent = q + "{display:none!important}";
               document.documentElement.appendChild(st);
-              browser.runtime.sendMessage({ type: "hidesave", host: location.hostname, sel: q }).catch(function () {});
+              browser.runtime.sendMessage({ type: "hidesave", host: location.hostname, sel: q, path: page ? location.pathname : "" }).catch(function () {});
               sel = null;
               trail = [];
               curDesc = "";
@@ -383,7 +383,7 @@ jobs:
               else if (m.cmd === "parent") parent();
               else if (m.cmd === "child") child();
               else if (m.cmd === "preview") { if (sel) { setPreview(!previewing); place(); sendState(""); } }
-              else if (m.cmd === "hide") hide();
+              else if (m.cmd === "hide") hide(!!m.page);
               else if (m.cmd === "reset") reset();
             });
           })();
@@ -1999,10 +1999,18 @@ jobs:
           import org.json.JSONObject
           import org.mozilla.geckoview.WebExtension
 
+          class HideRule(val host: String, val sel: String, val path: String)
+
           object HideRules {
               private fun sp() = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
 
               fun hostKey(host: String): String = host.lowercase().removePrefix("www.")
+
+              fun normPath(p: String): String {
+                  if (p.isEmpty()) return ""
+                  val q = if (p.startsWith("/")) p else "/" + p
+                  return if (q.length > 1) q.trimEnd('/').ifEmpty { "/" } else q
+              }
 
               @Synchronized
               private fun readAll(): JSONObject = try {
@@ -2011,26 +2019,76 @@ jobs:
                   JSONObject()
               }
 
+              private fun parse(host: String, e: Any?): HideRule? {
+                  if (e is JSONObject) return HideRule(host, e.optString("s"), e.optString("p"))
+                  if (e is String) return HideRule(host, e, "")
+                  return null
+              }
+
               @Synchronized
-              fun forHost(host: String): List<String> {
+              fun forPage(host: String, path: String): List<String> {
                   val out = mutableListOf<String>()
                   val arr = readAll().optJSONArray(hostKey(host)) ?: return out
-                  for (i in 0 until arr.length()) out.add(arr.optString(i))
+                  val np = normPath(if (path.isEmpty()) "/" else path)
+                  for (i in 0 until arr.length()) {
+                      val r = parse(host, arr.opt(i)) ?: continue
+                      if (r.sel.isBlank()) continue
+                      if (r.path.isEmpty() || r.path == np) out.add(r.sel)
+                  }
                   return out
               }
 
               @Synchronized
-              fun add(host: String, sel: String) {
+              fun all(): List<HideRule> {
+                  val out = mutableListOf<HideRule>()
+                  val o = readAll()
+                  val keys = o.keys()
+                  while (keys.hasNext()) {
+                      val h = keys.next()
+                      val arr = o.optJSONArray(h) ?: continue
+                      for (i in 0 until arr.length()) {
+                          val r = parse(h, arr.opt(i)) ?: continue
+                          if (r.sel.isNotBlank()) out.add(r)
+                      }
+                  }
+                  return out.sortedBy { it.host }
+              }
+
+              @Synchronized
+              fun add(host: String, sel: String, path: String) {
                   val k = hostKey(host)
                   if (k.isBlank() || sel.isBlank() || sel.length > 500) return
+                  val p = normPath(path)
                   val all = readAll()
                   val arr = all.optJSONArray(k) ?: JSONArray()
                   for (i in 0 until arr.length()) {
-                      if (arr.optString(i) == sel) return
+                      val r = parse(k, arr.opt(i)) ?: continue
+                      if (r.sel == sel && r.path == p) return
                   }
-                  if (arr.length() >= 100) return
-                  arr.put(sel)
+                  if (arr.length() >= 200) return
+                  val o = JSONObject()
+                  o.put("s", sel)
+                  o.put("p", p)
+                  arr.put(o)
                   all.put(k, arr)
+                  sp().edit().putString("hide", all.toString()).apply()
+              }
+
+              @Synchronized
+              fun remove(host: String, sel: String, path: String) {
+                  val all = readAll()
+                  val arr = all.optJSONArray(host) ?: return
+                  val keep = JSONArray()
+                  var removed = false
+                  for (i in 0 until arr.length()) {
+                      val r = parse(host, arr.opt(i))
+                      if (!removed && r != null && r.sel == sel && r.path == path) {
+                          removed = true
+                          continue
+                      }
+                      keep.put(arr.opt(i))
+                  }
+                  if (keep.length() == 0) all.remove(host) else all.put(host, keep)
                   sp().edit().putString("hide", all.toString()).apply()
               }
 
@@ -2048,6 +2106,7 @@ jobs:
               var desc by mutableStateOf("")
               var note by mutableStateOf("")
               var previewing by mutableStateOf(false)
+              var pageScope by mutableStateOf(false)
               var tabId = 0
               var extId = -1
               var port: WebExtension.Port? = null
@@ -2060,6 +2119,7 @@ jobs:
                       o.put("type", "pick")
                       o.put("cmd", cmd)
                       o.put("tabId", ext)
+                      o.put("page", pageScope)
                       p.postMessage(o)
                       true
                   } catch (e: Exception) {
@@ -2074,6 +2134,7 @@ jobs:
                   has = false
                   desc = ""
                   previewing = false
+                  pageScope = false
                   note = "Tap an element on the page"
                   active = true
                   return true
@@ -2853,7 +2914,12 @@ jobs:
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.activity.enableEdgeToEdge
           import androidx.compose.animation.animateColorAsState
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
           import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
           import androidx.compose.foundation.ExperimentalFoundationApi
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
@@ -2879,6 +2945,7 @@ jobs:
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.alpha
           import androidx.compose.ui.draw.clip
           import androidx.compose.ui.draw.clipToBounds
           import androidx.compose.ui.focus.FocusRequester
@@ -2995,7 +3062,8 @@ jobs:
                                   reply.put("grabber", Videos.enabled)
                                   reply.put("adv", Filters.ver)
                                   val hostName = try { android.net.Uri.parse(url).host ?: "" } catch (e: Exception) { "" }
-                                  reply.put("hide", JSONArray(HideRules.forHost(hostName)))
+                                  val pathName = try { android.net.Uri.parse(url).path ?: "/" } catch (e: Exception) { "/" }
+                                  reply.put("hide", JSONArray(HideRules.forPage(hostName, pathName)))
                                   Log.d("GreyScript", "scripts for " + url + ": " + arr.length())
                               }
                               "cfg" -> reply.put("grabber", Videos.enabled)
@@ -3018,7 +3086,7 @@ jobs:
                                   HideTool.onState(m.optBoolean("has"), m.optString("desc"), m.optBoolean("previewing"), m.optString("note"))
                               }
                               "hidesave" -> {
-                                  HideRules.add(m.optString("host"), m.optString("sel"))
+                                  HideRules.add(m.optString("host"), m.optString("sel"), m.optString("path"))
                               }
                               "hidereset" -> {
                                   HideRules.clear(m.optString("host"))
@@ -3228,6 +3296,7 @@ jobs:
                               onBookmarks = { screen = "bookmarks" },
                               onScripts = { screen = "scripts" },
                               onFilters = { screen = "filters" },
+                              onElements = { screen = "elements" },
                               onLogs = { screen = "logs" }
                           )
                           if (screen != "browser") {
@@ -3281,6 +3350,7 @@ jobs:
                                           onGuide = { screen = "filterguide" }
                                       )
                                       "filterguide" -> FilterGuideScreen { screen = "filters" }
+                                      "elements" -> ElementRulesScreen { screen = "browser" }
                                       "logs" -> LogScreen { screen = "browser" }
                                       else -> {}
                                   }
@@ -3316,6 +3386,7 @@ jobs:
               onBookmarks: () -> Unit,
               onScripts: () -> Unit,
               onFilters: () -> Unit,
+              onElements: () -> Unit,
               onLogs: () -> Unit
           ) {
               val cur = tabs.current
@@ -3335,7 +3406,6 @@ jobs:
               val pullTrigger = with(density) { 80.dp.toPx() }
               var pull by remember { mutableStateOf(0f) }
               val curPreview = cur?.preview == true
-              val stripText = if (curPreview) "Preview tab · Back closes it · Menu > Keep tab  •  " else "Bookmarked  •  "
 
               LaunchedEffect(cur?.id, tabs.home) {
                   if (HideTool.active && (tabs.home || cur?.id != HideTool.tabId)) HideTool.stop()
@@ -3489,14 +3559,20 @@ jobs:
                                       onClick = { tabs.cycleMaxBg() }
                                   )
                                   DropdownMenuItem(
-                                      text = { Text("Add to bookmark", color = Color.White) },
+                                      text = { Text(if (marked) "Remove bookmark" else "Add to bookmark", color = Color.White) },
                                       onClick = {
                                           menu = false
                                           val t = tabs.current
                                           val u = shownUrl(t)
                                           if (!tabs.home && t != null && u.isNotBlank()) {
-                                          BookmarkStore.add(u, t.title.ifBlank { u })
-                                              toast(ctx, "Bookmark added")
+                                              val ex = BookmarkStore.load().firstOrNull { normUrl(it.url) == normUrl(u) }
+                                              if (ex != null) {
+                                                  BookmarkStore.remove(ex.url)
+                                                  toast(ctx, "Bookmark removed")
+                                              } else {
+                                                  BookmarkStore.add(u, t.title.ifBlank { u })
+                                                  toast(ctx, "Bookmark added")
+                                              }
                                           } else {
                                               toast(ctx, "Nothing to bookmark")
                                           }
@@ -3529,6 +3605,10 @@ jobs:
                                               toast(ctx, "Tool not ready. Reload the page and try again")
                                           }
                                       }
+                                  )
+                                  DropdownMenuItem(
+                                      text = { Text("Element rules", color = Color.White) },
+                                      onClick = { menu = false; onElements() }
                                   )
                                   if (cur?.preview == true) {
                                       DropdownMenuItem(
@@ -3622,27 +3702,28 @@ jobs:
                                   }
                               }
                               }
-                              if (!tabs.home && (marked || curPreview)) {
+                              if (!tabs.home && marked) {
                                   Box(
                                       Modifier
                                           .fillMaxWidth()
                                           .height(12.dp)
                                           .background(Color.White)
                                           .clipToBounds(),
-                                      contentAlignment = Alignment.CenterStart
+                                          contentAlignment = Alignment.Center
                                   ) {
                                       Text(
-                                          stripText.repeat(30),
+                                          "Bookmarked",
                                           color = Color.Black,
                                           fontSize = 9.sp,
                                           lineHeight = 12.sp,
                                           fontWeight = FontWeight.Bold,
-                                          maxLines = 1,
-                                          softWrap = false,
-                                          modifier = Modifier.basicMarquee(iterations = Int.MAX_VALUE)
+                                          maxLines = 1
                                       )
                                   }
                               }
+                  }
+                  if (curPreview && !tabs.home) {
+                      PreviewBadge(Modifier.align(Alignment.TopCenter).padding(top = HeaderH + 8.dp))
                   }
                   if (HideTool.active && !tabs.home) {
                       HideToolPanel()
@@ -3765,14 +3846,13 @@ jobs:
                           contentAlignment = Alignment.CenterStart
                       ) {
                           Text(
-                              "Hide element  •  Drag this bar to move  •  Tap an element on the page to select it  •  ".repeat(6),
+                              "Hide element · drag this bar to move",
                               color = Color.Black,
                               fontSize = 10.sp,
                               lineHeight = 12.sp,
                               fontWeight = FontWeight.Bold,
                               maxLines = 1,
-                              softWrap = false,
-                              modifier = Modifier.basicMarquee(iterations = Int.MAX_VALUE)
+                              modifier = Modifier.padding(horizontal = 8.dp)
                           )
                       }
                       Column(Modifier.padding(8.dp)) {
@@ -3792,7 +3872,9 @@ jobs:
                           Spacer(Modifier.height(6.dp))
                           Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                               ToolBtn("Hide", HideTool.has) { HideTool.cmd("hide") }
-                              ToolBtn("Reset", true) { HideTool.cmd("reset") }
+                              ToolBtn(if (HideTool.pageScope) "For: Page" else "For: Site", true, HideTool.pageScope) {
+                                  HideTool.pageScope = !HideTool.pageScope
+                              }
                               ToolBtn("Close", true) { HideTool.stop() }
                           }
                       }
@@ -5308,6 +5390,139 @@ jobs:
                           }
                       }
                   }
+              }
+          }
+
+          @Composable
+          fun PreviewBadge(modifier: Modifier = Modifier) {
+              val tr = rememberInfiniteTransition(label = "pv")
+              val a by tr.animateFloat(
+                  initialValue = 0.3f,
+                  targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(650), RepeatMode.Reverse),
+                  label = "pvAlpha"
+              )
+              Box(
+                  modifier
+                      .alpha(a)
+                      .clip(RoundedCornerShape(10.dp))
+                      .background(Color.White)
+                      .padding(horizontal = 18.dp, vertical = 6.dp),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text("Preview", color = Color.Black, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+              }
+          }
+
+          @Composable
+          fun ElementRulesScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              var rules by remember { mutableStateOf(HideRules.all()) }
+              var confirmHost by remember { mutableStateOf<String?>(null) }
+              fun reload() { rules = HideRules.all() }
+              val groups = rules.groupBy { it.host }
+              Column(Modifier.fillMaxSize()) {
+                  Header {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Element rules", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                  }
+                  if (rules.isEmpty()) {
+                      EmptyNote("No hidden elements yet. In the menu tap Hide element, tap something on the page, then tap Hide.")
+                  }
+                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                      for ((host, list) in groups) {
+                          Row(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .background(Bar)
+                                  .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              FaviconBox(host, 22.dp, 6.dp, 11)
+                              Spacer(Modifier.width(10.dp))
+                              Column(Modifier.weight(1f)) {
+                                  Text(
+                                      host,
+                                      color = Color.White,
+                                      fontSize = 13.sp,
+                                      fontWeight = FontWeight.SemiBold,
+                                      maxLines = 1,
+                                      overflow = TextOverflow.Ellipsis
+                                  )
+                                  Text(
+                                      list.size.toString() + (if (list.size == 1) " rule" else " rules"),
+                                      color = Soft,
+                                      fontSize = 11.sp
+                                  )
+                              }
+                              TextButton(onClick = { confirmHost = host }) { Text("Clear", color = Danger, fontSize = 12.sp) }
+                          }
+                          for (r in list) {
+                              key(r.host + "|" + r.path + "|" + r.sel) {
+                                  Row(
+                                      Modifier
+                                          .fillMaxWidth()
+                                          .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 8.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Column(Modifier.weight(1f)) {
+                                          Text(
+                                              r.sel,
+                                              color = Color.White,
+                                              fontSize = 11.sp,
+                                              fontFamily = FontFamily.Monospace,
+                                              maxLines = 2,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                          Text(
+                                              if (r.path.isEmpty()) "Whole site" else "Page: " + r.path,
+                                              color = Soft,
+                                              fontSize = 11.sp,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                      }
+                                      Spacer(Modifier.width(8.dp))
+                                      Box(
+                                          Modifier
+                                              .size(26.dp)
+                                              .clip(CircleShape)
+                                              .background(Field)
+                                              .clickable {
+                                                  HideRules.remove(r.host, r.sel, r.path)
+                                                  reload()
+                                                  toast(ctx, "Removed. Reload the page.")
+                                              },
+                                          contentAlignment = Alignment.Center
+                                      ) {
+                                          Text("×", color = Soft, fontSize = 16.sp)
+                                      }
+                                  }
+                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                              }
+                          }
+                      }
+                  }
+              }
+              val ch = confirmHost
+              if (ch != null) {
+                  AlertDialog(
+                      onDismissRequest = { confirmHost = null },
+                      containerColor = Bar,
+                      title = { Text("Clear rules?", color = Color.White) },
+                      text = { Text("All hidden-element rules for " + ch + " will be deleted.", color = Soft) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              HideRules.clear(ch)
+                              reload()
+                              confirmHost = null
+                              toast(ctx, "Cleared. Reload the page.")
+                          }) { Text("Clear", color = Danger) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { confirmHost = null }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
               }
           }
 
