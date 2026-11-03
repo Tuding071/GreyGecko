@@ -2320,6 +2320,7 @@ jobs:
               var maxBg by mutableStateOf(6)
               var ctxMenu by mutableStateOf<CtxInfo?>(null)
               var home by mutableStateOf(true)
+              var previewTab by mutableStateOf<BrowserTab?>(null)
               val closingIds = mutableStateListOf<Int>()
               private val closeJobs = HashMap<Int, Runnable>()
               var view: GeckoView? = null
@@ -2532,6 +2533,8 @@ jobs:
 
               fun closeAll() {
                   closing = true
+                  previewTab?.session?.close()
+                  previewTab = null
                   main.removeCallbacks(saveRunnable)
                   main.removeCallbacks(idleTick)
                   for (t in tabs.toList()) {
@@ -2587,25 +2590,35 @@ jobs:
                   }, 200L)
               }
 
-              fun openPreview(url: String, openerId: Int): BrowserTab {
-                  var op = openerId
-                  val c = current
-                  if (c != null && c.preview) op = c.openerId
+              fun openPreview(url: String) {
+                  closePreview()
                   counter += 1
-                  val t = BrowserTab(counter, null, op)
+                  val t = BrowserTab(counter, null, 0)
                   t.preview = true
                   t.url = url
-                  tabs.add(t)
+                  previewTab = t
                   ensureLive(t, url)
-                  home = false
-                  select(t)
-                  return t
               }
 
-              fun keep(t: BrowserTab) {
+              fun closePreview() {
+                  val t = previewTab ?: return
+                  previewTab = null
+                  val s = t.session
+                  t.session = null
+                  if (s != null) main.postDelayed({ s.close() }, 300L)
+              }
+
+              fun previewToTab() {
+                  val t = previewTab ?: return
+                  previewTab = null
                   t.preview = false
-                  dedupe(t)
-                  persist()
+                  t.openerId = current?.id ?: 0
+                  main.postDelayed({
+                      tabs.add(t)
+                      home = false
+                      select(t)
+                      dedupe(t)
+                  }, 150L)
               }
 
               fun cycleMaxBg() {
@@ -3405,7 +3418,7 @@ jobs:
               val density = LocalDensity.current
               val pullTrigger = with(density) { 80.dp.toPx() }
               var pull by remember { mutableStateOf(0f) }
-              val curPreview = cur?.preview == true
+
 
               LaunchedEffect(cur?.id, tabs.home) {
                   if (HideTool.active && (tabs.home || cur?.id != HideTool.tabId)) HideTool.stop()
@@ -3422,6 +3435,7 @@ jobs:
                       editing = false
                       focusManager.clearFocus(true)
                       if (HideTool.active) HideTool.stop()
+                      tabs.closePreview()
                       val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
                       imm.hideSoftInputFromWindow(hostView.windowToken, 0)
                   }
@@ -3444,8 +3458,11 @@ jobs:
                   if (editing) {
                       editing = false
                       focusManager.clearFocus()
+                  } else if (tabs.previewTab != null) {
+                      val pt = tabs.previewTab
+                      if (pt != null && pt.canGoBack) pt.session?.goBack() else tabs.closePreview()
                   } else if (HideTool.active) {
-                  HideTool.stop()
+                      HideTool.stop()
                   } else if (panelOpen) {
                   panelOpen = false
                   } else if (tabs.home) {
@@ -3454,8 +3471,6 @@ jobs:
                       c.session?.goBack()
                   } else if (c != null && tabs.openerOf(c) != null) {
                   tabs.closeToOpener(c)
-                  } else if (c != null && c.preview) {
-                  tabs.close(c)
                   } else {
                       ctx.findActivity()?.moveTaskToBack(true)
                   }
@@ -3610,16 +3625,7 @@ jobs:
                                       text = { Text("Element rules", color = Color.White) },
                                       onClick = { menu = false; onElements() }
                                   )
-                                  if (cur?.preview == true) {
-                                      DropdownMenuItem(
-                                          text = { Text("Keep tab", color = Color.White) },
-                                          onClick = {
-                                              menu = false
-                                              tabs.current?.let { tabs.keep(it) }
-                                              toast(ctx, "Tab kept")
-                                          }
-                                      )
-                                  }
+
                                   DropdownMenuItem(
                                       text = { Text("Logcat", color = Color.White) },
                                       onClick = { menu = false; onLogs() }
@@ -3722,8 +3728,8 @@ jobs:
                                   }
                               }
                   }
-                  if (curPreview && !tabs.home) {
-                      PreviewBadge(Modifier.align(Alignment.TopCenter).padding(top = HeaderH + 8.dp))
+                  if (tabs.previewTab != null) {
+                      PreviewSheet(tabs, Modifier.align(Alignment.BottomCenter))
                   }
                   if (HideTool.active && !tabs.home) {
                       HideToolPanel()
@@ -3765,7 +3771,7 @@ jobs:
                               }
                               MenuRow("Preview") {
                                   tabs.ctxMenu = null
-                                  tabs.openPreview(cm.url, tabs.current?.id ?: 0)
+                                  tabs.openPreview(cm.url)
                               }
                               MenuRow("Copy link") {
                                   tabs.ctxMenu = null
@@ -5394,26 +5400,68 @@ jobs:
           }
 
           @Composable
-          fun PreviewBadge(modifier: Modifier = Modifier) {
-              val tr = rememberInfiniteTransition(label = "pv")
-              val a by tr.animateFloat(
-                  initialValue = 0.3f,
-                  targetValue = 1f,
-                  animationSpec = infiniteRepeatable(tween(650), RepeatMode.Reverse),
-                  label = "pvAlpha"
-              )
-              Box(
+          fun PreviewSheet(tabs: TabManager, modifier: Modifier = Modifier) {
+              val t = tabs.previewTab ?: return
+              val shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp)
+              Column(
                   modifier
-                      .alpha(a)
-                      .clip(RoundedCornerShape(10.dp))
-                      .background(Color.White)
-                      .padding(horizontal = 18.dp, vertical = 6.dp),
-                  contentAlignment = Alignment.Center
+                      .fillMaxWidth()
+                      .fillMaxHeight(0.85f)
+                      .clip(shape)
+                      .background(BG)
+                      .border(0.5.dp, Color(0xFF666666), shape)
+                      .pointerInput(Unit) { detectTapGestures { } }
               ) {
-                  Text("Preview", color = Color.Black, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                  Row(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(44.dp)
+                          .background(Color.White)
+                          .padding(horizontal = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      TextButton(onClick = { tabs.closePreview() }) {
+                          Text("×", color = Color.Black, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                      }
+                      Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                          Text("Preview", color = Color.Black, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                          Text(
+                              hostOf(t.url),
+                              color = Color(0xFF555555),
+                              fontSize = 10.sp,
+                              maxLines = 1,
+                              overflow = TextOverflow.Ellipsis
+                          )
+                      }
+                      TextButton(onClick = { tabs.previewToTab() }) {
+                          Text("New tab", color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                      }
+                  }
+                  Box(Modifier.fillMaxWidth().height(2.dp).background(Color(0xFFDDDDDD))) {
+                      if (t.loading) {
+                          Box(
+                              Modifier
+                                  .fillMaxHeight()
+                                  .fillMaxWidth(t.progress / 100f)
+                                  .background(TmGreen)
+                          )
+                      }
+                  }
+                  AndroidView(
+                      factory = { c -> GeckoView(c) },
+                      update = { v ->
+                          val s = t.session
+                          if (s != null) {
+                              if (v.session !== s) v.setSession(s)
+                          } else if (v.session != null) {
+                              v.releaseSession()
+                          }
+                      },
+                      onRelease = { v -> v.releaseSession() },
+                      modifier = Modifier.fillMaxWidth().weight(1f)
+                  )
               }
           }
-
           @Composable
           fun ElementRulesScreen(onBack: () -> Unit) {
               val ctx = LocalContext.current
