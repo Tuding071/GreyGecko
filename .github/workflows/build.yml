@@ -1995,6 +1995,9 @@ jobs:
           import androidx.compose.runtime.getValue
           import androidx.compose.runtime.mutableStateOf
           import androidx.compose.runtime.setValue
+          import android.os.Handler
+          import android.os.Looper
+          import androidx.compose.runtime.mutableStateListOf
           import org.json.JSONArray
           import org.json.JSONObject
           import org.mozilla.geckoview.WebExtension
@@ -2002,6 +2005,34 @@ jobs:
           class HideRule(val host: String, val sel: String, val path: String)
 
           object HideRules {
+              var rev by mutableStateOf(0)
+              val closing = mutableStateListOf<String>()
+              private val jobs = HashMap<String, Runnable>()
+              private val main = Handler(Looper.getMainLooper())
+
+              fun keyOf(r: HideRule): String = r.host + "|" + r.path + "|" + r.sel
+
+              fun requestRemove(r: HideRule) {
+                  val k = keyOf(r)
+                  if (closing.contains(k)) return
+                  closing.add(k)
+                  val job = Runnable {
+                      jobs.remove(k)
+                      closing.remove(k)
+                      remove(r.host, r.sel, r.path)
+                      toast(Gecko.appCtx, "Rule removed. Reload the page.")
+                  }
+                  jobs[k] = job
+                  main.postDelayed(job, 2000L)
+              }
+
+              fun undoRemove(r: HideRule) {
+                  val k = keyOf(r)
+                  val job = jobs.remove(k)
+                  if (job != null) main.removeCallbacks(job)
+                  closing.remove(k)
+              }
+
               private fun sp() = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
 
               fun hostKey(host: String): String = host.lowercase().removePrefix("www.")
@@ -2072,6 +2103,7 @@ jobs:
                   arr.put(o)
                   all.put(k, arr)
                   sp().edit().putString("hide", all.toString()).apply()
+                  rev++
               }
 
               @Synchronized
@@ -2090,6 +2122,7 @@ jobs:
                   }
                   if (keep.length() == 0) all.remove(host) else all.put(host, keep)
                   sp().edit().putString("hide", all.toString()).apply()
+                  rev++
               }
 
               @Synchronized
@@ -2097,6 +2130,7 @@ jobs:
                   val all = readAll()
                   all.remove(hostKey(host))
                   sp().edit().putString("hide", all.toString()).apply()
+                  rev++
               }
           }
 
@@ -2317,10 +2351,9 @@ jobs:
           class TabManager(private val runtime: GeckoRuntime) {
               val tabs = mutableStateListOf<BrowserTab>()
               var current by mutableStateOf<BrowserTab?>(null)
-              var maxBg by mutableStateOf(6)
+              var maxBg by mutableStateOf(4)
               var ctxMenu by mutableStateOf<CtxInfo?>(null)
               var home by mutableStateOf(true)
-              var previewTab by mutableStateOf<BrowserTab?>(null)
               val closingIds = mutableStateListOf<Int>()
               private val closeJobs = HashMap<Int, Runnable>()
               var view: GeckoView? = null
@@ -2336,7 +2369,7 @@ jobs:
               }
 
               init {
-                  maxBg = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE).getInt("maxbg", 6)
+
                   main.postDelayed(idleTick, 60000L)
               }
 
@@ -2533,8 +2566,6 @@ jobs:
 
               fun closeAll() {
                   closing = true
-                  previewTab?.session?.close()
-                  previewTab = null
                   main.removeCallbacks(saveRunnable)
                   main.removeCallbacks(idleTick)
                   for (t in tabs.toList()) {
@@ -2590,35 +2621,29 @@ jobs:
                   }, 200L)
               }
 
-              fun openPreview(url: String) {
-                  closePreview()
+              fun openPreview(url: String, openerId: Int): BrowserTab {
+                  var op = openerId
+                  val c = current
+                  if (c != null && c.preview) op = c.openerId
                   counter += 1
-                  val t = BrowserTab(counter, null, 0)
+                  val t = BrowserTab(counter, null, op)
                   t.preview = true
                   t.url = url
-                  previewTab = t
+                  tabs.add(t)
                   ensureLive(t, url)
+                  home = false
+                  select(t)
+                  return t
               }
 
-              fun closePreview() {
-                  val t = previewTab ?: return
-                  previewTab = null
-                  val s = t.session
-                  t.session = null
-                  if (s != null) main.postDelayed({ s.close() }, 300L)
-              }
-
-              fun previewToTab() {
-                  val t = previewTab ?: return
-                  previewTab = null
+              fun keep(t: BrowserTab) {
                   t.preview = false
-                  t.openerId = current?.id ?: 0
-                  main.postDelayed({
-                      tabs.add(t)
-                      home = false
-                      select(t)
-                      dedupe(t)
-                  }, 150L)
+                  dedupe(t)
+                  persist()
+              }
+
+              fun closePreviewTab(t: BrowserTab) {
+                  if (openerOf(t) != null) closeToOpener(t) else close(t)
               }
 
               fun cycleMaxBg() {
@@ -3435,7 +3460,6 @@ jobs:
                       editing = false
                       focusManager.clearFocus(true)
                       if (HideTool.active) HideTool.stop()
-                      tabs.closePreview()
                       val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
                       imm.hideSoftInputFromWindow(hostView.windowToken, 0)
                   }
@@ -3458,9 +3482,6 @@ jobs:
                   if (editing) {
                       editing = false
                       focusManager.clearFocus()
-                  } else if (tabs.previewTab != null) {
-                      val pt = tabs.previewTab
-                      if (pt != null && pt.canGoBack) pt.session?.goBack() else tabs.closePreview()
                   } else if (HideTool.active) {
                       HideTool.stop()
                   } else if (panelOpen) {
@@ -3471,6 +3492,8 @@ jobs:
                       c.session?.goBack()
                   } else if (c != null && tabs.openerOf(c) != null) {
                   tabs.closeToOpener(c)
+                  } else if (c != null && c.preview) {
+                  tabs.close(c)
                   } else {
                       ctx.findActivity()?.moveTaskToBack(true)
                   }
@@ -3569,10 +3592,7 @@ jobs:
                                           Videos.setGrabber(grabberOn)
                                       }
                                   )
-                                  DropdownMenuItem(
-                                      text = { Text("Background tabs kept: " + tabs.maxBg, color = Color.White) },
-                                      onClick = { tabs.cycleMaxBg() }
-                                  )
+
                                   DropdownMenuItem(
                                       text = { Text(if (marked) "Remove bookmark" else "Add to bookmark", color = Color.White) },
                                       onClick = {
@@ -3728,8 +3748,9 @@ jobs:
                                   }
                               }
                   }
-                  if (tabs.previewTab != null) {
-                      PreviewSheet(tabs, Modifier.align(Alignment.BottomCenter))
+                  val previewCur = cur
+                  if (previewCur != null && previewCur.preview && !tabs.home) {
+                      PreviewHeader(tabs, previewCur, Modifier.align(Alignment.TopStart))
                   }
                   if (HideTool.active && !tabs.home) {
                       HideToolPanel()
@@ -3771,7 +3792,7 @@ jobs:
                               }
                               MenuRow("Preview") {
                                   tabs.ctxMenu = null
-                                  tabs.openPreview(cm.url)
+                                  tabs.openPreview(cm.url, tabs.current?.id ?: 0)
                               }
                               MenuRow("Copy link") {
                                   tabs.ctxMenu = null
@@ -5400,31 +5421,25 @@ jobs:
           }
 
           @Composable
-          fun PreviewSheet(tabs: TabManager, modifier: Modifier = Modifier) {
-              val t = tabs.previewTab ?: return
-              val shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp)
+          fun PreviewHeader(tabs: TabManager, t: BrowserTab, modifier: Modifier = Modifier) {
               Column(
                   modifier
                       .fillMaxWidth()
-                      .fillMaxHeight(0.85f)
-                      .clip(shape)
-                      .background(BG)
-                      .border(0.5.dp, Color(0xFF666666), shape)
+                      .background(Color.White)
                       .pointerInput(Unit) { detectTapGestures { } }
               ) {
                   Row(
                       Modifier
                           .fillMaxWidth()
-                          .height(44.dp)
-                          .background(Color.White)
+                          .height(HeaderH - 2.dp)
                           .padding(horizontal = 4.dp),
                       verticalAlignment = Alignment.CenterVertically
                   ) {
-                      TextButton(onClick = { tabs.closePreview() }) {
+                      TextButton(onClick = { tabs.closePreviewTab(t) }) {
                           Text("×", color = Color.Black, fontSize = 26.sp, fontWeight = FontWeight.Bold)
                       }
                       Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                          Text("Preview", color = Color.Black, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                          Text("Preview", color = Color.Black, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                           Text(
                               hostOf(t.url),
                               color = Color(0xFF555555),
@@ -5433,7 +5448,7 @@ jobs:
                               overflow = TextOverflow.Ellipsis
                           )
                       }
-                      TextButton(onClick = { tabs.previewToTab() }) {
+                      TextButton(onClick = { tabs.keep(t) }) {
                           Text("New tab", color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                       }
                   }
@@ -5447,27 +5462,15 @@ jobs:
                           )
                       }
                   }
-                  AndroidView(
-                      factory = { c -> GeckoView(c) },
-                      update = { v ->
-                          val s = t.session
-                          if (s != null) {
-                              if (v.session !== s) v.setSession(s)
-                          } else if (v.session != null) {
-                              v.releaseSession()
-                          }
-                      },
-                      onRelease = { v -> v.releaseSession() },
-                      modifier = Modifier.fillMaxWidth().weight(1f)
-                  )
               }
           }
           @Composable
           fun ElementRulesScreen(onBack: () -> Unit) {
               val ctx = LocalContext.current
-              var rules by remember { mutableStateOf(HideRules.all()) }
+              val rulesRev = HideRules.rev
+              val rules = remember(rulesRev) { HideRules.all() }
               var confirmHost by remember { mutableStateOf<String?>(null) }
-              fun reload() { rules = HideRules.all() }
+              fun reload() { HideRules.rev = HideRules.rev + 1 }
               val groups = rules.groupBy { it.host }
               Column(Modifier.fillMaxSize()) {
                   Header {
@@ -5507,9 +5510,12 @@ jobs:
                           }
                           for (r in list) {
                               key(r.host + "|" + r.path + "|" + r.sel) {
+                                  val isClosing = HideRules.closing.contains(HideRules.keyOf(r))
+                                  val rowBg by animateColorAsState(if (isClosing) Color(0xFF4A2A2A) else Color.Transparent, label = "ruleBg")
                                   Row(
                                       Modifier
                                           .fillMaxWidth()
+                                          .background(rowBg)
                                           .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 8.dp),
                                       verticalAlignment = Alignment.CenterVertically
                                   ) {
@@ -5531,19 +5537,8 @@ jobs:
                                           )
                                       }
                                       Spacer(Modifier.width(8.dp))
-                                      Box(
-                                          Modifier
-                                              .size(26.dp)
-                                              .clip(CircleShape)
-                                              .background(Field)
-                                              .clickable {
-                                                  HideRules.remove(r.host, r.sel, r.path)
-                                                  reload()
-                                                  toast(ctx, "Removed. Reload the page.")
-                                              },
-                                          contentAlignment = Alignment.Center
-                                      ) {
-                                          Text("×", color = Soft, fontSize = 16.sp)
+                                      UndoClose(isClosing) {
+                                          if (isClosing) HideRules.undoRemove(r) else HideRules.requestRemove(r)
                                       }
                                   }
                                   Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
