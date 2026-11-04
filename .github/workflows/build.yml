@@ -3653,6 +3653,25 @@ jobs:
                               }
                           }
                       }
+                      if (!tabs.home && marked) {
+                          Box(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .height(12.dp)
+                                  .background(Color.White)
+                                  .clipToBounds(),
+                                  contentAlignment = Alignment.Center
+                          ) {
+                              Text(
+                                  "Bookmarked",
+                                  color = Color.Black,
+                                  fontSize = 9.sp,
+                                  lineHeight = 12.sp,
+                                  fontWeight = FontWeight.Bold,
+                                  maxLines = 1
+                              )
+                          }
+                      }
                       Box(
                           Modifier
                               .weight(1f)
@@ -3727,25 +3746,6 @@ jobs:
                                       )
                                   }
                               }
-                              }
-                              if (!tabs.home && marked) {
-                                  Box(
-                                      Modifier
-                                          .fillMaxWidth()
-                                          .height(12.dp)
-                                          .background(Color.White)
-                                          .clipToBounds(),
-                                          contentAlignment = Alignment.Center
-                                  ) {
-                                      Text(
-                                          "Bookmarked",
-                                          color = Color.Black,
-                                          fontSize = 9.sp,
-                                          lineHeight = 12.sp,
-                                          fontWeight = FontWeight.Bold,
-                                          maxLines = 1
-                                      )
-                                  }
                               }
                   }
                   val previewCur = cur
