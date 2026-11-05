@@ -658,6 +658,7 @@ jobs:
             if (!sender.tab) { nlog("no sender.tab"); return Promise.resolve({}); }
             return native({ type: "get", url: msg.url, tabId: sender.tab.id }).then(function (res) {
               if (typeof res.grabber === "boolean") grabberOn = res.grabber;
+              if (typeof res.img === "boolean") blockImg = res.img;
               if (typeof res.adv === "number" && res.adv !== adVer) adLoad().catch(function () {});
               connectPort();
               var jobs = [];
@@ -773,6 +774,7 @@ jobs:
 
           // ---- Ad blocker (network level, EasyList / ABP syntax) ----
           var adOn = false;
+          var blockImg = false;
           var adVer = -1;
           var adIdx = null;
           var adLoading = null;
@@ -957,7 +959,8 @@ jobs:
           }
 
           function adBlockReq(d) {
-            if (!adOn || !adIdx) return;
+          if (blockImg && d.tabId >= 0 && (d.type === "image" || d.type === "imageset")) return { cancel: true };
+          if (!adOn || !adIdx) return;
             if (d.tabId < 0 || d.type === "main_frame") return;
             var u = d.url;
             var c = u.charAt(0);
@@ -1025,6 +1028,7 @@ jobs:
           var nport = null;
 
           function onPortMsg(m) {
+            if (m && m.type === "saver") { blockImg = !!m.img; return; }
             if (!m || m.type !== "pick") return;
             var tid = m.tabId;
             if (typeof tid !== "number" || tid < 0) return;
@@ -2197,6 +2201,33 @@ jobs:
                   previewing = false
               }
           }
+          object Saver {
+              private fun sp() = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+
+              fun images(): Boolean = sp().getBoolean("saveimg", false)
+
+              fun autoplay(): Boolean = sp().getBoolean("saveplay", false)
+
+              fun setImages(v: Boolean) {
+                  sp().edit().putBoolean("saveimg", v).apply()
+                  push()
+              }
+
+              fun setAutoplay(v: Boolean) {
+                  sp().edit().putBoolean("saveplay", v).apply()
+              }
+
+              fun push() {
+                  val p = HideTool.port ?: return
+                  try {
+                      val o = JSONObject()
+                      o.put("type", "saver")
+                      o.put("img", images())
+                      p.postMessage(o)
+                  } catch (e: Exception) {
+                  }
+              }
+          }
           EOF
 
           cat > app/src/main/java/com/grey/gecko/Browser.kt <<'EOF'
@@ -3099,6 +3130,7 @@ jobs:
                                   reply.put("scripts", arr)
                                   reply.put("grabber", Videos.enabled)
                                   reply.put("adv", Filters.ver)
+                                  reply.put("img", Saver.images())
                                   val hostName = try { android.net.Uri.parse(url).host ?: "" } catch (e: Exception) { "" }
                                   val pathName = try { android.net.Uri.parse(url).path ?: "/" } catch (e: Exception) { "/" }
                                   reply.put("hide", JSONArray(HideRules.forPage(hostName, pathName)))
@@ -3166,7 +3198,7 @@ jobs:
                   appCtx = ctx.applicationContext
                   val cfg = java.io.File(appCtx.filesDir, "gecko-config.yaml")
                   try {
-                      cfg.writeText("prefs:\n  ui.click_hold_context_menus.delay: 350\n")
+                      cfg.writeText("prefs:\n  ui.click_hold_context_menus.delay: 350\n" + (if (Saver.autoplay()) "  media.autoplay.default: 5\n" else ""))
                   } catch (e: Exception) {
                       Log.e("GreyScript", "config write failed", e)
                   }
@@ -3245,7 +3277,7 @@ jobs:
                   t.startsWith("http://") || t.startsWith("https://") ||
                       t.startsWith("about:") || t.startsWith("file:") -> t
                   t.contains(" ") || !t.contains(".") ->
-                      "https://duckduckgo.com/?q=" + java.net.URLEncoder.encode(t, "UTF-8")
+                      "https://www.google.com/search?q=" + java.net.URLEncoder.encode(t, "UTF-8")
                   else -> "https://" + t
               }
           }
@@ -3434,6 +3466,8 @@ jobs:
               var editing by remember { mutableStateOf(false) }
               var text by remember { mutableStateOf(TextFieldValue("")) }
               var grabberOn by remember { mutableStateOf(Videos.enabled) }
+              var blockImg by remember { mutableStateOf(Saver.images()) }
+              var blockPlay by remember { mutableStateOf(Saver.autoplay()) }
               var panelOpen by remember { mutableStateOf(false) }
               var lastSubmit by remember { mutableStateOf(0L) }
               val focusManager = LocalFocusManager.current
@@ -3594,7 +3628,45 @@ jobs:
                                   )
 
                                   DropdownMenuItem(
-                                      text = { Text(if (marked) "Remove bookmark" else "Add to bookmark", color = Color.White) },
+                                      text = { Text("Block images", color = Color.White) },
+                                      trailingIcon = {
+                                          Switch(
+                                              checked = blockImg,
+                                              onCheckedChange = { v ->
+                                                  blockImg = v
+                                                  Saver.setImages(v)
+                                                  toast(ctx, "Reload the page")
+                                              },
+                                              colors = switchColors()
+                                          )
+                                      },
+                                      onClick = {
+                                          blockImg = !blockImg
+                                          Saver.setImages(blockImg)
+                                          toast(ctx, "Reload the page")
+                                      }
+                                  )
+                                  DropdownMenuItem(
+                                      text = { Text("Block video autoplay", color = Color.White) },
+                                      trailingIcon = {
+                                          Switch(
+                                              checked = blockPlay,
+                                              onCheckedChange = { v ->
+                                                  blockPlay = v
+                                                  Saver.setAutoplay(v)
+                                                  toast(ctx, "Restart the app to apply")
+                                              },
+                                              colors = switchColors()
+                                          )
+                                      },
+                                      onClick = {
+                                          blockPlay = !blockPlay
+                                          Saver.setAutoplay(blockPlay)
+                                          toast(ctx, "Restart the app to apply")
+                                      }
+                                  )
+                                  DropdownMenuItem(
+                                  text = { Text(if (marked) "Remove bookmark" else "Add to bookmark", color = Color.White) },
                                       onClick = {
                                           menu = false
                                           val t = tabs.current
@@ -3671,6 +3743,7 @@ jobs:
                                   maxLines = 1
                               )
                           }
+                          Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF555555)))
                       }
                       Box(
                           Modifier
