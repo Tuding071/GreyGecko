@@ -1822,28 +1822,36 @@ jobs:
                   }
               }
 
+              private fun listen() {
+                  for (n in names) prefs(n).registerOnSharedPreferenceChangeListener(listener)
+              }
+
               @Synchronized
               fun start() {
                   if (active) return
                   try {
                       dir().mkdirs()
                       val f = mainFile()
-                      var fromMain = false
-                      var restored = false
                       if (f.exists() && f.length() > 0L) {
-                          restored = restore(f)
-                          fromMain = restored
-                          if (!restored) {
-                              f.renameTo(java.io.File(dir(), "greygecko.json.corrupt"))
-                              val bak = java.io.File(dir(), "greygecko.json.bak")
-                              if (bak.exists()) restored = restore(bak)
+                          if (!restore(f)) {
+                              Log.e(TAG, "greygecko.json unreadable, backup off this session")
+                              toast(Gecko.appCtx, "greygecko.json is unreadable. Backup is off. Fix or delete the file.")
+                              return
                           }
+                          restoreFilterFiles()
+                          active = true
+                          listen()
+                          Log.d(TAG, "backup restored from file")
+                      } else {
+                          // No file: the file is the only source of truth, so start empty.
+                          for (n in names) prefs(n).edit().clear().commit()
+                          appFilters().deleteRecursively()
+                          java.io.File(Gecko.appCtx.filesDir, "thumbs").deleteRecursively()
+                          active = true
+                          listen()
+                          writeNow()
+                          Log.d(TAG, "backup file missing, started empty")
                       }
-                      if (restored) restoreFilterFiles()
-                      active = true
-                      for (n in names) prefs(n).registerOnSharedPreferenceChangeListener(listener)
-                      if (!fromMain) writeNow()
-                      Log.d(TAG, "backup started, restored=" + restored)
                   } catch (e: Exception) {
                       Log.e(TAG, "backup start failed", e)
                   }
@@ -1925,12 +1933,16 @@ jobs:
                           val tmp = java.io.File(d, "greygecko.json.tmp")
                           tmp.writeText(root.toString(1))
                           JSONObject(tmp.readText())
-                          val bak = java.io.File(d, "greygecko.json.bak")
-                          if (f.exists()) {
-                              bak.delete()
-                              f.renameTo(bak)
+                          var ok = tmp.renameTo(f)
+                          if (!ok) {
+                              try {
+                                  tmp.copyTo(f, overwrite = true)
+                                  tmp.delete()
+                                  ok = true
+                              } catch (e: Exception) {
+                                  ok = false
+                              }
                           }
-                          val ok = tmp.renameTo(f)
                           if (ok) syncFilters(root)
                           ok
                       }
@@ -1949,7 +1961,7 @@ jobs:
                       if (arr != null) {
                           for (i in 0 until arr.length()) ids.add(arr.getJSONObject(i).optString("id"))
                       }
-                      if (ids.isEmpty() && !dst.exists()) return
+                      if (ids.isEmpty()) return
                       dst.mkdirs()
                       for (id in ids) {
                           val a = java.io.File(src, id + ".txt")
@@ -1957,10 +1969,6 @@ jobs:
                           if (a.exists() && (!b.exists() || b.length() != a.length() || b.lastModified() < a.lastModified())) {
                               a.copyTo(b, overwrite = true)
                           }
-                      }
-                      val files = dst.listFiles() ?: return
-                      for (f in files) {
-                          if (f.name.endsWith(".txt") && f.name.removeSuffix(".txt") !in ids) f.delete()
                       }
                   } catch (e: Exception) {
                       Log.e(TAG, "filter sync failed", e)
