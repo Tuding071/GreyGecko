@@ -395,6 +395,43 @@ jobs:
               else if (m.cmd === "reset") reset();
             });
           })();
+          (function () {
+            var seen = Object.create(null);
+            var scans = 0;
+            var timer = null;
+            var MEDIA = /\.(mp4|m4v|webm|mkv|mov|flv|m3u8|mpd|mp3|m4a)(\?|#|$)/i;
+            function abs(u) {
+              try { return new URL(u, location.href).href; } catch (e) { return ""; }
+            }
+            function collect() {
+              timer = null;
+              if (scans > 10) return;
+              scans++;
+              var out = [];
+              function add(u, strict) {
+                if (!u) return;
+                u = abs(u);
+                if (!u || !/^https?:/i.test(u) || seen[u]) return;
+                if (strict && !MEDIA.test(u)) return;
+                seen[u] = 1;
+                out.push(u);
+              }
+              var els = document.querySelectorAll("video, audio");
+              for (var i = 0; i < els.length; i++) {
+                add(els[i].currentSrc, false);
+                add(els[i].getAttribute("src"), false);
+                var ss = els[i].querySelectorAll("source[src]");
+                for (var j = 0; j < ss.length; j++) add(ss[j].getAttribute("src"), false);
+              }
+              var ms = document.querySelectorAll('meta[property="og:video"],meta[property="og:video:url"],meta[property="og:video:secure_url"],meta[name="twitter:player:stream"]');
+              for (var k = 0; k < ms.length; k++) add(ms[k].getAttribute("content"), true);
+              if (out.length) browser.runtime.sendMessage({ type: "dommedia", page: location.href, urls: out }).catch(function () {});
+            }
+            function later() { if (!timer) timer = setTimeout(collect, 1200); }
+            document.addEventListener("DOMContentLoaded", later);
+            window.addEventListener("load", later);
+            try { new MutationObserver(later).observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+          })();
           EOF
 
           cat > app/src/main/assets/ext/background.js <<'EOF'
@@ -689,12 +726,29 @@ jobs:
             if (msg.type === "xhr") { return doXhr(msg.details); }
             if (msg.type === "page") { return handlePage(msg, sender); }
             if (msg.type === "pickstate" || msg.type === "hidesave" || msg.type === "hidereset") { native(msg).catch(function () {}); return; }
+            if (msg.type === "dommedia") { domMedia(msg, sender); return; }
           });
 
           // ---- Video grabber (network sniffing) ----
           var VIDEO_EXT = /\.(mp4|m4v|webm|mkv|mov|flv|avi|3gp|ogv)(\?|#|$)/i;
+          var AUDIO_EXT = /\.(mp3|m4a|opus|ogg|oga|wav|flac|weba)(\?|#|$)/i;
           var SKIP_EXT = /\.(ts|m4s|aac|vtt|webvtt|key|jpg|jpeg|png|gif|webp|svg|css|js|json|woff2?|ico)(\?|#|$)/i;
           var SEG_NAME = /(seg|segment|chunk|frag|fragment|init)[-_.]?\d*\.mp4/i;
+
+          function domMedia(msg, sender) {
+            if (!sender.tab || !grabberOn) return;
+            var list = msg.urls || [];
+            for (var i = 0; i < list.length && i < 40; i++) {
+              var u = String(list[i]);
+              if (!/^https?:/i.test(u)) continue;
+              var k = "file";
+              if (/\.mpd(\?|#|$)/i.test(u)) k = "dash";
+              else if (/\.m3u8(\?|#|$)/i.test(u)) k = "hls";
+              else if (AUDIO_EXT.test(u)) k = "audio";
+              nlog("grabber dom " + k + " " + u);
+              native({ type: "video", tabId: sender.tab.id, url: u, ctype: "", size: -1, kind: k, headers: { Referer: String(msg.page || "") } }).catch(function () {});
+            }
+          }
 
           function refreshCfg() {
             var now = Date.now();
@@ -705,12 +759,15 @@ jobs:
             }).catch(function () {});
           }
 
-          function classify(url, ct) {
+          function classify(url, ct, type) {
             var c = String(ct || "").toLowerCase();
+            if (/\.mpd(\?|#|$)/i.test(url) || c.indexOf("dash+xml") >= 0) return "dash";
             if (/\.m3u8(\?|#|$)/i.test(url) || c.indexOf("mpegurl") >= 0) return "hls";
             if (SKIP_EXT.test(url)) return "";
             if (c.indexOf("mp2t") >= 0 || c.indexOf("segment") >= 0) return "";
+            if (AUDIO_EXT.test(url) || c.indexOf("audio/") === 0) return "audio";
             if (VIDEO_EXT.test(url) || c.indexOf("video/") === 0) return "file";
+            if (type === "media") return "file";
             return "";
           }
 
@@ -746,11 +803,12 @@ jobs:
                 if (m) len = parseInt(m[1], 10);
               }
             }
-            var kind = classify(d.url, ct);
+            var kind = classify(d.url, ct, d.type);
             if (!kind) return;
-            if (kind === "file") {
+            if (kind === "file" || kind === "audio") {
               if (SEG_NAME.test(d.url)) return;
-              if (len >= 0 && len < 204800) return;
+              var minLen = kind === "audio" ? 102400 : 204800;
+              if (len >= 0 && len < minLen) { nlog("grabber small " + len + " " + d.url); return; }
             }
             nlog("grabber " + kind + " " + d.url);
             native({
@@ -759,6 +817,7 @@ jobs:
               url: d.url,
               ctype: ct,
               size: len,
+              kind: kind,
               headers: reqHdr[d.requestId] || {}
             }).then(function (r) {
               if (r && typeof r.grabber === "boolean") grabberOn = r.grabber;
@@ -1509,8 +1568,10 @@ jobs:
               val kind: String,
               val sub: String,
               val headers: Map<String, String>,
-              val rank: Long = 0L
-          )
+              val rank: Long = 0L,
+              val audio: String = "",
+              val rep: String = ""
+              )
 
           fun fmtSize(b: Long): String = when {
               b >= 1073741824L -> String.format("%.1f GB", b / 1073741824.0)
@@ -1578,6 +1639,17 @@ jobs:
               if (!text.trimStart().startsWith("#EXTM3U")) return out
               val lines = text.lines().map { it.trim() }
               if (lines.any { it.startsWith("#EXT-X-STREAM-INF") }) {
+                  val audioGroups = HashMap<String, String>()
+                  for (al in lines) {
+                      if (al.startsWith("#EXT-X-MEDIA:")) {
+                          val aa = hlsAttrs(al.substringAfter(':'))
+                          val au = aa["URI"]
+                          if (aa["TYPE"] == "AUDIO" && !au.isNullOrBlank()) {
+                              val g = aa["GROUP-ID"] ?: ""
+                              if (!audioGroups.containsKey(g) || aa["DEFAULT"] == "YES") audioGroups[g] = resolveUrl(url, au)
+                          }
+                      }
+                  }
                   var i = 0
                   while (i < lines.size) {
                       val ln = lines[i]
@@ -1595,10 +1667,12 @@ jobs:
                                   bw > 0 -> mbps(bw)
                                   else -> "Stream"
                               }
+                              val audioUrl = audioGroups[attrs["AUDIO"] ?: ""] ?: ""
                               val parts = mutableListOf("HLS")
                               if (res.isNotBlank()) parts.add(res)
                               if (bw > 0) parts.add(mbps(bw))
-                              out.add(VideoItem(u, label, "HLS", parts.joinToString(" · "), h, height * 100000L + bw / 1000))
+                              if (audioUrl.isNotEmpty()) parts.add("+audio")
+                              out.add(VideoItem(u, label, "HLS", parts.joinToString(" · "), h, height * 100000L + bw / 1000, audioUrl))
                               i = j
                           }
                       } else if (ln.startsWith("#EXT-X-MEDIA:")) {
@@ -1646,7 +1720,8 @@ jobs:
                       else -> "video"
                   }
               }
-              val kind = ext.uppercase()
+              val isAudio = ctype.startsWith("audio/", true) || ext in setOf("mp3", "m4a", "opus", "ogg", "oga", "wav", "flac", "weba")
+              val kind = if (isAudio) "AUDIO" else ext.uppercase()
               val parts = mutableListOf(kind)
               if (size > 0) parts.add(fmtSize(size))
               val host = hostOf(url)
@@ -1697,7 +1772,7 @@ jobs:
                   }
               }
 
-              fun onDetected(extId: Int, url: String, ctype: String, size: Long, hdr: Map<String, String>) {
+              fun onDetected(extId: Int, url: String, ctype: String, size: Long, hdr: Map<String, String>, kind: String = "") {
                   if (!enabled || extId < 0) return
                   val t = tabFor(extId)
                   val key = url.substringBefore('#')
@@ -1706,7 +1781,16 @@ jobs:
                   val h = HashMap<String, String>(hdr)
                   if (h["Referer"].isNullOrBlank() && t != null && t.url.isNotBlank()) h["Referer"] = t.url
                   if (h["User-Agent"].isNullOrBlank()) h["User-Agent"] = DEFAULT_UA
-                  if (isHls(url, ctype)) {
+                  if (kind == "dash" || isDash(url, ctype)) {
+                      Thread {
+                          try {
+                              val items = parseDashItems(url, fetchText(url, h), h)
+                              for (v in items) report(extId, v)
+                          } catch (e: Exception) {
+                              Log.d("GreyScript", "dash failed: " + url + " " + e)
+                          }
+                      }.start()
+                  } else if (isHls(url, ctype)) {
                       Thread {
                           try {
                               val items = parseHls(url, fetchText(url, h), h)
@@ -1811,6 +1895,8 @@ jobs:
 
           class HlsSeg(val url: String, val keyUrl: String?, val iv: ByteArray?, val seq: Long)
 
+          class SegPlan(val init: String?, val segs: List<HlsSeg>, val ext: String)
+
           class DlItem(val id: String, var url: String, name0: String, var kind: String) {
               var name by mutableStateOf(name0)
               var path by mutableStateOf("")
@@ -1818,8 +1904,11 @@ jobs:
               var done by mutableStateOf(0L)
               var total by mutableStateOf(0L)
               var error by mutableStateOf("")
+              var note by mutableStateOf("")
               var time = System.currentTimeMillis()
               var headers: Map<String, String> = emptyMap()
+              var audioUrl: String = ""
+              var rep: String = ""
               @Volatile
               var cancel = false
               @Volatile
@@ -1829,10 +1918,13 @@ jobs:
           fun dlStatus(d: DlItem): String = when (d.state) {
               DL_QUEUED -> "Waiting…"
               DL_RUNNING ->
-                  if (d.kind == "hls") d.done.toString() + " / " + d.total + " segments"
+                  if (d.note.isNotBlank()) d.note
+                  else if (d.kind == "hls" || d.kind == "dash") d.done.toString() + " / " + d.total + " segments"
                   else if (d.total > 0L) (d.done * 100L / d.total).toString() + "% · " + fmtSize(d.done) + " / " + fmtSize(d.total)
                   else fmtSize(d.done)
-              DL_DONE -> if (d.kind == "hls") "Done" else "Done · " + fmtSize(d.done)
+              DL_DONE ->
+                  (if (d.kind == "hls" || d.kind == "dash") "Done" else "Done · " + fmtSize(d.done)) +
+                      (if (d.note.isNotBlank()) " · " + d.note else "")
               DL_FAILED -> "Failed: " + d.error
               else -> "Canceled"
           }
@@ -1915,6 +2007,8 @@ jobs:
                           d.done = o.optLong("done")
                           d.total = o.optLong("total")
                           d.time = o.optLong("time")
+                          d.audioUrl = o.optString("audio")
+                          d.rep = o.optString("rep")
                           var st = o.optInt("state")
                           if (st == DL_QUEUED || st == DL_RUNNING) {
                               st = DL_FAILED
@@ -1952,6 +2046,8 @@ jobs:
                           o.put("total", d.total)
                           o.put("err", d.error)
                           o.put("time", d.time)
+                          o.put("audio", d.audioUrl)
+                          o.put("rep", d.rep)
                           o.put("ref", d.headers["Referer"] ?: "")
                           o.put("ua", d.headers["User-Agent"] ?: "")
                           arr.put(o)
@@ -1978,15 +2074,26 @@ jobs:
                   add(d)
               }
 
-              fun enqueueVideo(v: VideoItem, title: String) {
+              fun enqueueVideo(v: VideoItem, title: String, all: List<VideoItem>) {
                   val base = clean(if (title.isBlank()) hostOf(v.url) else title)
                   val d: DlItem
                   if (v.kind == "HLS") {
                       d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "hls")
+                      d.audioUrl = v.audio
+                  } else if (v.kind == "DASH") {
+                      d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "dash")
+                      d.rep = v.rep
+                      d.audioUrl = v.audio
+                  } else if (v.kind == "AUDIO") {
+                      val e = v.label.substringAfterLast('.', "m4a").lowercase()
+                      d = DlItem(Store.newId(), v.url, base + "." + (if (e.length <= 5) e else "m4a"), "file")
                   } else {
                       val e = v.kind.lowercase()
                       val ext = if (e in setOf("mp4", "m4v", "webm", "mkv", "mov", "flv", "avi", "3gp", "ogv")) e else "mp4"
                       d = DlItem(Store.newId(), v.url, base + "." + ext, "file")
+                      val host = hostOf(v.url)
+                      val au = all.firstOrNull { it.kind == "AUDIO" && hostOf(it.url) == host } ?: all.firstOrNull { it.kind == "AUDIO" }
+                      if (au != null) d.audioUrl = au.url
                   }
                   d.headers = HashMap(v.headers)
                   add(d)
@@ -2052,6 +2159,7 @@ jobs:
               fun retry(d: DlItem) {
                   if (d.state == DL_RUNNING || d.state == DL_QUEUED) return
                   d.error = ""
+                  d.note = ""
                   d.done = 0L
                   d.total = 0L
                   if (d.kind == "stream") d.kind = "file"
@@ -2088,6 +2196,7 @@ jobs:
                   }
                   d.state = DL_RUNNING
                   d.error = ""
+                  d.note = ""
                   running.add(d)
                   if (active.incrementAndGet() == 1) startService()
                   try {
@@ -2096,24 +2205,40 @@ jobs:
                       if (!dir.canWrite()) throw Exception("Folder is not writable")
                       when (d.kind) {
                           "hls" -> runHls(d, dir)
+                          "dash" -> runDash(d, dir)
                           "stream" -> runStream(d, dir)
                           else -> runFile(d, dir)
                       }
                       d.state = DL_DONE
-                      main.post { toast(Gecko.appCtx, "Downloaded " + d.name) }
+                      val done = d.name
+                      main.post { toast(Gecko.appCtx, "Downloaded " + done) }
                   } catch (e: Exception) {
                       if (d.cancel) {
                           d.state = DL_CANCELED
                       } else {
                           d.state = DL_FAILED
                           d.error = e.message ?: "Failed"
-                          main.post { toast(Gecko.appCtx, "Download failed: " + d.error) }
+                          val msg = d.error
+                          main.post { toast(Gecko.appCtx, "Download failed: " + msg) }
                       }
                       Log.e("GreyScript", "download failed " + d.url, e)
                   } finally {
                       running.remove(d)
                       if (active.decrementAndGet() == 0) stopService()
                       save()
+                  }
+              }
+
+              private fun tempDir(): File {
+                  val t = File(Gecko.appCtx.cacheDir, "dl")
+                  t.mkdirs()
+                  return t
+              }
+
+              private fun moveFile(src: File, dst: File) {
+                  if (!src.renameTo(dst)) {
+                      src.copyTo(dst, overwrite = true)
+                      src.delete()
                   }
               }
 
@@ -2256,6 +2381,48 @@ jobs:
                   } finally {
                       c.disconnect()
                   }
+                  afterFile(d, dir)
+              }
+
+              // A plain video file may have no sound (video-only). If a separate audio file was found, merge it in.
+              private fun afterFile(d: DlItem, dir: File) {
+                  if (d.audioUrl.isBlank() || d.path.isBlank()) return
+                  val f = File(d.path)
+                  if (!f.exists() || Mux.hasAudio(f)) return
+                  val tmp = tempDir()
+                  val a = File(tmp, d.id + "_a.m4a")
+                  val merged = File(tmp, d.id + "_m.mp4")
+                  try {
+                      d.note = "Downloading audio…"
+                      d.done = 0L
+                      d.total = 0L
+                      val c = openConn(d.audioUrl, d.headers)
+                      try {
+                          c.inputStream.use { ins -> java.io.FileOutputStream(a).use { out -> copyStream(d, ins, out) } }
+                      } finally {
+                          c.disconnect()
+                      }
+                      d.note = "Merging audio…"
+                      val base = f.name.substringBeforeLast('.')
+                      if (Mux.merge(f, a, merged)) {
+                          f.delete()
+                          val target = uniqueFile(dir, base + ".mp4")
+                          moveFile(merged, target)
+                          d.name = target.name
+                          d.path = target.path
+                          d.note = ""
+                      } else {
+                          val af = uniqueFile(dir, base + " (audio).m4a")
+                          moveFile(a, af)
+                          d.note = "No sound: could not merge. Audio saved as a separate file."
+                      }
+                  } catch (e: Exception) {
+                      if (d.cancel) throw e
+                      d.note = "No sound: audio failed (" + (e.message ?: "error") + ")"
+                  } finally {
+                      a.delete()
+                      merged.delete()
+                  }
               }
 
               private fun runStream(d: DlItem, dir: File) {
@@ -2271,6 +2438,7 @@ jobs:
                   }
               }
 
+              // ---------- HLS / DASH segments ----------
               private fun hexToBytes(s0: String): ByteArray {
                   var s = s0.trim()
                   if (s.startsWith("0x") || s.startsWith("0X")) s = s.substring(2)
@@ -2311,9 +2479,9 @@ jobs:
                   throw lastErr ?: Exception("Segment failed")
               }
 
-              private fun runHls(d: DlItem, dir: File) {
-                  var url = d.url
-                  var lns = fetchText(url, d.headers).let { t ->
+              private fun parseHlsPlan(url0: String, h: Map<String, String>): SegPlan {
+                  var url = url0
+                  var lns = fetchText(url, h).let { t ->
                       if (!t.trimStart().startsWith("#EXTM3U")) throw Exception("Not a playlist")
                       t.lines().map { it.trim() }
                   }
@@ -2336,7 +2504,7 @@ jobs:
                       }
                       if (bu.isEmpty()) throw Exception("No stream found")
                       url = bu
-                      lns = fetchText(url, d.headers).lines().map { it.trim() }
+                      lns = fetchText(url, h).lines().map { it.trim() }
                   }
                   if (lns.none { it.startsWith("#EXT-X-ENDLIST") }) throw Exception("Live streams are not supported")
                   var seq = 0L
@@ -2372,26 +2540,29 @@ jobs:
                       }
                   }
                   if (segs.isEmpty()) throw Exception("No segments")
-                  d.total = segs.size.toLong()
-                  d.done = 0L
-                  val initSeg = initUrl
-                  val ext = if (initSeg != null) "mp4" else "ts"
-                  val target = uniqueFile(dir, clean(d.name.ifBlank { "video" }) + "." + ext)
-                  d.name = target.name
-                  d.path = target.path
-                  val part = File(dir, target.name + ".part")
+                  val first = segs[0].url.substringBefore('?').lowercase()
+                  val ext = if (initUrl != null) "mp4"
+                  else if (first.endsWith(".aac")) "aac"
+                  else if (first.endsWith(".mp3")) "mp3"
+                  else if (first.endsWith(".mp4") || first.endsWith(".m4s") || first.endsWith(".m4a")) "mp4"
+                  else "ts"
+                  return SegPlan(initUrl, segs, ext)
+              }
+
+              private fun downloadPlan(d: DlItem, plan: SegPlan, out: File) {
                   val keys = HashMap<String, ByteArray>()
                   val exec = java.util.concurrent.Executors.newFixedThreadPool(4)
                   try {
-                      java.io.FileOutputStream(part).use { out ->
-                          if (initSeg != null) out.write(getBytes(initSeg, d.headers))
+                      java.io.FileOutputStream(out).use { os ->
+                          val initSeg = plan.init
+                          if (initSeg != null) os.write(getBytes(initSeg, d.headers))
                           var i = 0
-                          while (i < segs.size) {
+                          while (i < plan.segs.size) {
                               if (d.cancel) throw Exception("Canceled")
-                              val end = minOf(i + 8, segs.size)
+                              val end = minOf(i + 8, plan.segs.size)
                               val futs = ArrayList<java.util.concurrent.Future<ByteArray>>()
                               for (k in i until end) {
-                                  val s = segs[k]
+                                  val s = plan.segs[k]
                                   futs.add(exec.submit(java.util.concurrent.Callable { fetchSeg(s, d.headers, keys) }))
                               }
                               for (f in futs) {
@@ -2400,19 +2571,110 @@ jobs:
                                   } catch (e: java.util.concurrent.ExecutionException) {
                                       throw Exception(e.cause?.message ?: "Segment failed")
                                   }
-                                  out.write(bytes)
+                                  os.write(bytes)
                                   d.done = d.done + 1L
                               }
                               notifyProgress()
                               i = end
                           }
                       }
-                      if (!part.renameTo(target)) throw Exception("Could not save file")
-                  } catch (e: Exception) {
-                      part.delete()
-                      throw e
                   } finally {
                       exec.shutdownNow()
+                  }
+              }
+
+              private fun finishTracks(d: DlItem, dir: File, v: File, a: File?) {
+                  val base = clean(d.name.ifBlank { "video" })
+                  if (a == null) {
+                      val target = uniqueFile(dir, base + "." + v.extension)
+                      moveFile(v, target)
+                      d.name = target.name
+                      d.path = target.path
+                      return
+                  }
+                  d.note = "Merging audio…"
+                  val merged = File(v.parentFile, d.id + "_m.mp4")
+                  val ok = Mux.merge(v, a, merged)
+                  if (ok) {
+                      val target = uniqueFile(dir, base + ".mp4")
+                      moveFile(merged, target)
+                      v.delete()
+                      a.delete()
+                      d.name = target.name
+                      d.path = target.path
+                      d.note = ""
+                  } else {
+                      merged.delete()
+                      val tv = uniqueFile(dir, base + "." + v.extension)
+                      val ta = uniqueFile(dir, base + " (audio)." + a.extension)
+                      moveFile(v, tv)
+                      moveFile(a, ta)
+                      d.name = tv.name
+                      d.path = tv.path
+                      d.note = "No sound: could not merge. Audio saved as a separate file."
+                  }
+              }
+
+              private fun runHls(d: DlItem, dir: File) {
+                  val vPlan = parseHlsPlan(d.url, d.headers)
+                  var aPlan: SegPlan? = null
+                  if (d.audioUrl.isNotBlank()) {
+                      aPlan = try {
+                          parseHlsPlan(d.audioUrl, d.headers)
+                      } catch (e: Exception) {
+                          d.note = "No sound: audio playlist failed"
+                          null
+                      }
+                  }
+                  d.total = (vPlan.segs.size + (aPlan?.segs?.size ?: 0)).toLong()
+                  d.done = 0L
+                  val tmp = tempDir()
+                  val vFile = File(tmp, d.id + "_v." + vPlan.ext)
+                  var aFile: File? = null
+                  try {
+                      downloadPlan(d, vPlan, vFile)
+                      if (aPlan != null) {
+                          aFile = File(tmp, d.id + "_a." + aPlan.ext)
+                          downloadPlan(d, aPlan, aFile)
+                      }
+                      finishTracks(d, dir, vFile, aFile)
+                  } finally {
+                      vFile.delete()
+                      aFile?.delete()
+                  }
+              }
+
+              private fun runDash(d: DlItem, dir: File) {
+                  val reps = parseMpd(d.url, fetchText(d.url, d.headers))
+                  val v = reps.firstOrNull { it.id == d.rep } ?: throw Exception("Stream not found in the manifest")
+                  val a = if (d.audioUrl.isNotBlank()) reps.firstOrNull { it.id == d.audioUrl && it.kind == "audio" } else null
+                  val vs = v.single
+                  if (vs != null) {
+                      // whole-file representation: use the normal file path (with audio merge if needed)
+                      d.url = vs
+                      d.audioUrl = a?.single ?: ""
+                      d.kind = "file"
+                      if (d.name.indexOf('.') < 0) d.name = d.name + "." + v.ext
+                      runFile(d, dir)
+                      return
+                  }
+                  val vPlan = v.plan ?: throw Exception("No segments")
+                  val aPlan = a?.plan
+                  d.total = (vPlan.segs.size + (aPlan?.segs?.size ?: 0)).toLong()
+                  d.done = 0L
+                  val tmp = tempDir()
+                  val vFile = File(tmp, d.id + "_v." + vPlan.ext)
+                  var aFile: File? = null
+                  try {
+                      downloadPlan(d, vPlan, vFile)
+                      if (aPlan != null) {
+                          aFile = File(tmp, d.id + "_a." + aPlan.ext)
+                          downloadPlan(d, aPlan, aFile)
+                      }
+                      finishTracks(d, dir, vFile, aFile)
+                  } finally {
+                      vFile.delete()
+                      aFile?.delete()
                   }
               }
 
@@ -2495,6 +2757,299 @@ jobs:
                       startForeground(DlNotif.ID, n)
                   }
                   return START_NOT_STICKY
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/Dash.kt <<'EOF'
+          package com.grey.gecko
+
+          import org.w3c.dom.Element
+          import org.xml.sax.InputSource
+          import java.io.StringReader
+          import javax.xml.parsers.DocumentBuilderFactory
+
+          class DashRep(
+              val id: String,
+              val kind: String,
+              val bw: Long,
+              val w: Int,
+              val h: Int,
+              val codecs: String,
+              val ext: String,
+              val single: String?,
+              val plan: SegPlan?
+          )
+
+          fun isDash(url: String, ctype: String): Boolean {
+              val p = url.substringBefore('#').substringBefore('?')
+              return p.endsWith(".mpd", true) || ctype.contains("dash+xml", true)
+          }
+
+          private fun childEls(e: Element, name: String): List<Element> {
+              val out = ArrayList<Element>()
+              val nl = e.childNodes
+              for (i in 0 until nl.length) {
+                  val n = nl.item(i)
+                  if (n is Element && (n.localName ?: n.nodeName).substringAfter(':') == name) out.add(n)
+              }
+              return out
+          }
+
+          private fun attr(e: Element, name: String): String = if (e.hasAttribute(name)) e.getAttribute(name) else ""
+
+          private fun baseOf(e: Element, parent: String): String {
+              val b = childEls(e, "BaseURL").firstOrNull()?.textContent?.trim() ?: ""
+              return if (b.isEmpty()) parent else resolveUrl(parent, b)
+          }
+
+          private fun isoSeconds(s: String): Double {
+              val m = Regex("^P(?:(\\d+)D)?T?(?:(\\d+)H)?(?:(\\d+)M)?(?:([\\d.]+)S)?$").find(s.trim()) ?: return 0.0
+              val d = m.groupValues[1].toDoubleOrNull() ?: 0.0
+              val h = m.groupValues[2].toDoubleOrNull() ?: 0.0
+              val mi = m.groupValues[3].toDoubleOrNull() ?: 0.0
+              val sec = m.groupValues[4].toDoubleOrNull() ?: 0.0
+              return d * 86400.0 + h * 3600.0 + mi * 60.0 + sec
+          }
+
+          private fun fillTemplate(t: String, id: String, bw: Long, number: Long, time: Long): String {
+              var out = Regex("\\\$Number(%0(\\d+)d)?\\\$").replace(t) { m ->
+                  number.toString().padStart(m.groupValues[2].toIntOrNull() ?: 0, '0')
+              }
+              out = Regex("\\\$Time(%0(\\d+)d)?\\\$").replace(out) { m ->
+                  time.toString().padStart(m.groupValues[2].toIntOrNull() ?: 0, '0')
+              }
+              return out.replace("\$RepresentationID\$", id).replace("\$Bandwidth\$", bw.toString()).replace("\$\$", "\$")
+          }
+
+          private fun extFor(kind: String, mime: String): String {
+              val m = mime.lowercase()
+              return if (kind == "audio") {
+                  if (m.contains("webm")) "weba" else "m4a"
+              } else {
+                  if (m.contains("webm")) "webm" else "mp4"
+              }
+          }
+
+          private fun planFromTemplate(tpl: Element, id: String, bw: Long, base: String, perDur: Double, ext: String): SegPlan? {
+              val timescale = attr(tpl, "timescale").toLongOrNull() ?: 1L
+              val start = attr(tpl, "startNumber").toLongOrNull() ?: 1L
+              val initT = attr(tpl, "initialization")
+              val media = attr(tpl, "media")
+              if (media.isEmpty()) return null
+              val initUrl = if (initT.isEmpty()) null else resolveUrl(base, fillTemplate(initT, id, bw, 0L, 0L))
+              val segs = ArrayList<HlsSeg>()
+              val tl = childEls(tpl, "SegmentTimeline").firstOrNull()
+              if (tl != null) {
+                  var time = 0L
+                  var num = start
+                  for (s in childEls(tl, "S")) {
+                      val t = attr(s, "t")
+                      if (t.isNotEmpty()) time = t.toLongOrNull() ?: time
+                      val dd = attr(s, "d").toLongOrNull() ?: continue
+                      if (dd <= 0L) continue
+                      val r = attr(s, "r").toIntOrNull() ?: 0
+                      val count = if (r >= 0) r + 1 else {
+                          val remaining = perDur * timescale - time
+                          if (remaining <= 0.0) 1 else Math.ceil(remaining / dd).toInt()
+                      }
+                      for (k in 0 until count) {
+                          segs.add(HlsSeg(resolveUrl(base, fillTemplate(media, id, bw, num, time)), null, null, 0L))
+                          time += dd
+                          num++
+                          if (segs.size > 20000) return null
+                      }
+                  }
+              } else {
+                  val dur = attr(tpl, "duration").toLongOrNull() ?: return null
+                  if (dur <= 0L || perDur <= 0.0) return null
+                  val n = Math.ceil(perDur * timescale / dur).toLong()
+                  if (n <= 0L || n > 20000L) return null
+                  for (i in 0 until n) {
+                      segs.add(HlsSeg(resolveUrl(base, fillTemplate(media, id, bw, start + i, i * dur)), null, null, 0L))
+                  }
+              }
+              if (segs.isEmpty()) return null
+              return SegPlan(initUrl, segs, ext)
+          }
+
+          private fun planFromList(sl: Element, base: String, ext: String): SegPlan? {
+              val segs = ArrayList<HlsSeg>()
+              for (su in childEls(sl, "SegmentURL")) {
+                  val m = attr(su, "media")
+                  if (m.isEmpty() || attr(su, "mediaRange").isNotEmpty()) return null
+                  segs.add(HlsSeg(resolveUrl(base, m), null, null, 0L))
+              }
+              if (segs.isEmpty()) return null
+              val ini = childEls(sl, "Initialization").firstOrNull()
+              val initSrc = if (ini == null) "" else attr(ini, "sourceURL")
+              val initUrl = if (initSrc.isEmpty()) null else resolveUrl(base, initSrc)
+              return SegPlan(initUrl, segs, ext)
+          }
+
+          fun parseMpd(mpdUrl: String, xml: String): List<DashRep> {
+              val out = ArrayList<DashRep>()
+              val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(InputSource(StringReader(xml)))
+              val root = doc.documentElement
+              val mpdBase = baseOf(root, mpdUrl)
+              val totalDur = isoSeconds(attr(root, "mediaPresentationDuration"))
+              val period = childEls(root, "Period").firstOrNull() ?: return out
+              val perBase = baseOf(period, mpdBase)
+              val pd = isoSeconds(attr(period, "duration"))
+              val perDur = if (pd > 0.0) pd else totalDur
+              for (aset in childEls(period, "AdaptationSet")) {
+                  if (childEls(aset, "ContentProtection").isNotEmpty()) continue
+                  val asBase = baseOf(aset, perBase)
+                  val asMime = attr(aset, "mimeType")
+                  val asType = attr(aset, "contentType")
+                  val asCodecs = attr(aset, "codecs")
+                  val asTpl = childEls(aset, "SegmentTemplate").firstOrNull()
+                  val asList = childEls(aset, "SegmentList").firstOrNull()
+                  for (rep in childEls(aset, "Representation")) {
+                      if (childEls(rep, "ContentProtection").isNotEmpty()) continue
+                      val mime = attr(rep, "mimeType").ifEmpty { asMime }
+                      val type = asType.ifEmpty { mime.substringBefore('/') }
+                      val kind = if (type.startsWith("video")) "video" else if (type.startsWith("audio")) "audio" else continue
+                      val id = attr(rep, "id")
+                      val bw = attr(rep, "bandwidth").toLongOrNull() ?: 0L
+                      val w = attr(rep, "width").toIntOrNull() ?: 0
+                      val h = attr(rep, "height").toIntOrNull() ?: 0
+                      val codecs = attr(rep, "codecs").ifEmpty { asCodecs }
+                      val repBase = baseOf(rep, asBase)
+                      val ext = extFor(kind, mime)
+                      val tpl = childEls(rep, "SegmentTemplate").firstOrNull() ?: asTpl
+                      val sl = childEls(rep, "SegmentList").firstOrNull() ?: asList
+                      if (tpl != null) {
+                          val plan = planFromTemplate(tpl, id, bw, repBase, perDur, ext) ?: continue
+                          out.add(DashRep(id, kind, bw, w, h, codecs, ext, null, plan))
+                      } else if (sl != null) {
+                          val plan = planFromList(sl, repBase, ext) ?: continue
+                          out.add(DashRep(id, kind, bw, w, h, codecs, ext, null, plan))
+                      } else if (childEls(rep, "BaseURL").isNotEmpty()) {
+                          out.add(DashRep(id, kind, bw, w, h, codecs, ext, repBase, null))
+                      }
+                  }
+              }
+              return out
+          }
+
+          fun parseDashItems(mpdUrl: String, xml: String, headers: Map<String, String>): List<VideoItem> {
+              val reps = parseMpd(mpdUrl, xml)
+              val out = mutableListOf<VideoItem>()
+              val audio = reps.filter { it.kind == "audio" }.maxByOrNull { it.bw }
+              for (r in reps.filter { it.kind == "video" }.sortedByDescending { it.bw }) {
+                  val label = if (r.h > 0) r.h.toString() + "p" else mbps(r.bw)
+                  val parts = mutableListOf("DASH")
+                  if (r.w > 0) parts.add(r.w.toString() + "x" + r.h)
+                  if (r.bw > 0L) parts.add(mbps(r.bw))
+                  if (audio != null) parts.add("+audio")
+                  out.add(VideoItem(mpdUrl, label, "DASH", parts.joinToString(" · "), headers, r.h * 100000L + r.bw / 1000L, audio?.id ?: "", r.id))
+              }
+              if (audio != null) {
+                  out.add(VideoItem(mpdUrl, "Audio · " + mbps(audio.bw), "DASH", "DASH audio only", headers, -1L, "", audio.id))
+              }
+              return out
+          }
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/Mux.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.media.MediaMuxer
+          import android.util.Log
+          import java.io.File
+          import java.nio.ByteBuffer
+
+          object Mux {
+              // true when the file has an audio track, or when it can't be inspected (then we don't try to merge)
+              fun hasAudio(f: File): Boolean {
+                  val ex = MediaExtractor()
+                  return try {
+                      ex.setDataSource(f.path)
+                      var found = false
+                      for (i in 0 until ex.trackCount) {
+                          val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                          if (m.startsWith("audio/")) found = true
+                      }
+                      found
+                  } catch (e: Exception) {
+                      true
+                  } finally {
+                      ex.release()
+                  }
+              }
+
+              private fun findTrack(ex: MediaExtractor, prefix: String): Int {
+                  for (i in 0 until ex.trackCount) {
+                      val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                      if (m.startsWith(prefix)) return i
+                  }
+                  return -1
+              }
+
+              // Copies the first video track of v and the first audio track of a into one MP4 (no re-encoding).
+              fun merge(v: File, a: File, out: File): Boolean {
+                  val ve = MediaExtractor()
+                  val ae = MediaExtractor()
+                  var mux: MediaMuxer? = null
+                  var started = false
+                  return try {
+                      ve.setDataSource(v.path)
+                      ae.setDataSource(a.path)
+                      val vt = findTrack(ve, "video/")
+                      val at = findTrack(ae, "audio/")
+                      if (vt < 0 || at < 0) {
+                          false
+                      } else {
+                          ve.selectTrack(vt)
+                          ae.selectTrack(at)
+                          val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                          mux = m
+                          val vi = m.addTrack(ve.getTrackFormat(vt))
+                          val ai = m.addTrack(ae.getTrackFormat(at))
+                          m.start()
+                          started = true
+                          val buf = ByteBuffer.allocate(4 * 1024 * 1024)
+                          val info = MediaCodec.BufferInfo()
+                          var vTime = ve.sampleTime
+                          var aTime = ae.sampleTime
+                          val base = if (vTime >= 0L && aTime >= 0L) minOf(vTime, aTime) else maxOf(vTime, aTime, 0L)
+                          while (vTime >= 0L || aTime >= 0L) {
+                              val useV = aTime < 0L || (vTime >= 0L && vTime <= aTime)
+                              val ex = if (useV) ve else ae
+                              buf.clear()
+                              val size = ex.readSampleData(buf, 0)
+                              if (size < 0) {
+                                  if (useV) vTime = -1L else aTime = -1L
+                                  continue
+                              }
+                              val t = (if (useV) vTime else aTime) - base
+                              val flags = if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                              info.set(0, size, if (t < 0L) 0L else t, flags)
+                              m.writeSampleData(if (useV) vi else ai, buf, info)
+                              ex.advance()
+                              if (useV) vTime = ex.sampleTime else aTime = ex.sampleTime
+                          }
+                          true
+                      }
+                  } catch (e: Exception) {
+                      Log.e("GreyScript", "merge failed", e)
+                      false
+                  } finally {
+                      try {
+                          if (started) mux?.stop()
+                      } catch (e: Exception) {
+                      }
+                      try {
+                          mux?.release()
+                      } catch (e: Exception) {
+                      }
+                      ve.release()
+                      ae.release()
+                  }
               }
           }
           EOF
@@ -3260,7 +3815,7 @@ jobs:
 
               fun addVideo(v: VideoItem) {
                   seen.add(v.url.substringBefore('#'))
-                  val i = videos.indexOfFirst { it.url == v.url }
+                  val i = videos.indexOfFirst { it.url == v.url && it.rep == v.rep }
                   if (i >= 0) {
                       if (v.rank > videos[i].rank) videos[i] = v
                       return
@@ -4170,8 +4725,9 @@ jobs:
                                           m.optString("url"),
                                           m.optString("ctype"),
                                           m.optLong("size", -1L),
-                                          hd
-                                      )
+                                          hd,
+                                          m.optString("kind")
+                                          )
                                   }
                               }
                               "setValue" -> Store.setValue(m.optString("sid"), m.optString("key"), m.optString("value"))
@@ -5103,7 +5659,7 @@ jobs:
                       Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
                       Column(Modifier.verticalScroll(rememberScrollState())) {
                           for (v in videos) {
-                              VideoRow(v, ctx, title)
+                              VideoRow(v, ctx, title, videos)
                           }
                       }
                   }
@@ -5111,7 +5667,7 @@ jobs:
           }
 
           @Composable
-          fun VideoRow(v: VideoItem, ctx: Context, title: String) {
+          fun VideoRow(v: VideoItem, ctx: Context, title: String, all: List<VideoItem>) {
               Row(
                   Modifier.fillMaxWidth().padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 2.dp),
                   verticalAlignment = Alignment.CenterVertically
@@ -5122,7 +5678,7 @@ jobs:
                   }
                   TextButton(
                       onClick = {
-                          Downloads.enqueueVideo(v, title)
+                          Downloads.enqueueVideo(v, title, all)
                           toast(ctx, "Added to downloads")
                       },
                       contentPadding = PaddingValues(horizontal = 8.dp)
