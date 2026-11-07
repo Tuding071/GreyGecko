@@ -1703,7 +1703,10 @@ jobs:
                   val parts = mutableListOf("HLS")
                   parts.add(if (ended) fmtDur(dur) else "live")
                   if (enc.isNotEmpty()) parts.add(if (enc == "SAMPLE-AES") "DRM, may not download" else "encrypted " + enc)
-                  out.add(VideoItem(url, "HLS stream", "HLS", parts.joinToString(" · "), h, 0L))
+                  val firstSeg = lines.firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: ""
+                  val fs = firstSeg.substringBefore('?').lowercase()
+                  val audioOnly = fs.endsWith(".aac") || fs.endsWith(".mp3") || fs.endsWith(".m4a") || fs.endsWith(".ac3")
+                  out.add(VideoItem(url, if (audioOnly) "Audio stream" else "HLS stream", "HLS", parts.joinToString(" · "), h, if (audioOnly) -1L else 0L))
               }
               return out
           }
@@ -1908,6 +1911,7 @@ jobs:
               var time = System.currentTimeMillis()
               var headers: Map<String, String> = emptyMap()
               var audioUrl: String = ""
+              var cands: List<String> = emptyList()
               var rep: String = ""
               @Volatile
               var cancel = false
@@ -2080,6 +2084,13 @@ jobs:
                   if (v.kind == "HLS") {
                       d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "hls")
                       d.audioUrl = v.audio
+                      if (d.audioUrl.isBlank() && !v.label.startsWith("Audio")) {
+                          val host = hostOf(v.url)
+                          val audios = all.filter { it.kind == "HLS" && it.url != v.url && it.label.startsWith("Audio") }
+                          val au = audios.firstOrNull { hostOf(it.url) == host } ?: audios.firstOrNull()
+                          if (au != null) d.audioUrl = au.url
+                          d.cands = all.filter { it.kind == "HLS" && it.url != v.url && it.url != d.audioUrl }.map { it.url }.distinct()
+                      }
                   } else if (v.kind == "DASH") {
                       d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "dash")
                       d.rep = v.rep
@@ -2549,7 +2560,7 @@ jobs:
                   return SegPlan(initUrl, segs, ext)
               }
 
-              private fun downloadPlan(d: DlItem, plan: SegPlan, out: File) {
+              private fun downloadPlan(d: DlItem, plan: SegPlan, out: File, count: Boolean = true) {
                   val keys = HashMap<String, ByteArray>()
                   val exec = java.util.concurrent.Executors.newFixedThreadPool(4)
                   try {
@@ -2572,7 +2583,7 @@ jobs:
                                       throw Exception(e.cause?.message ?: "Segment failed")
                                   }
                                   os.write(bytes)
-                                  d.done = d.done + 1L
+                                  if (count) d.done = d.done + 1L
                               }
                               notifyProgress()
                               i = end
@@ -2581,6 +2592,26 @@ jobs:
                   } finally {
                       exec.shutdownNow()
                   }
+              }
+
+              // The video part had no sound: look for an audio-only playlist among the other streams found on the page.
+              private fun findAudioPlan(d: DlItem): SegPlan? {
+                  for (u in d.cands.take(6)) {
+                      if (d.cancel) return null
+                      try {
+                          val p = parseHlsPlan(u, d.headers)
+                          if (p.ext == "aac" || p.ext == "mp3") return p
+                          val probe = File(tempDir(), d.id + "_probe." + p.ext)
+                          try {
+                              downloadPlan(d, SegPlan(p.init, p.segs.take(1), p.ext), probe, false)
+                              if (Mux.probe(probe) == "audio") return p
+                          } finally {
+                              probe.delete()
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }
+                  return null
               }
 
               private fun finishTracks(d: DlItem, dir: File, v: File, a: File?) {
@@ -2649,9 +2680,16 @@ jobs:
                   var aFile: File? = null
                   try {
                       downloadPlan(d, vPlan, vFile)
-                      if (aPlan != null) {
-                          aFile = File(tmp, d.id + "_a." + aPlan.ext)
-                          downloadPlan(d, aPlan, aFile)
+                      var ap = aPlan
+                      if (ap == null && d.cands.isNotEmpty() && !Mux.hasAudio(vFile)) {
+                          d.note = "Looking for audio…"
+                          ap = findAudioPlan(d)
+                          d.note = ""
+                          if (ap != null) d.total = d.total + ap.segs.size
+                      }
+                      if (ap != null) {
+                          aFile = File(tmp, d.id + "_a." + ap.ext)
+                          downloadPlan(d, ap, aFile)
                       }
                       finishTracks(d, dir, vFile, aFile)
                   } finally {
@@ -2683,9 +2721,16 @@ jobs:
                   var aFile: File? = null
                   try {
                       downloadPlan(d, vPlan, vFile)
-                      if (aPlan != null) {
-                          aFile = File(tmp, d.id + "_a." + aPlan.ext)
-                          downloadPlan(d, aPlan, aFile)
+                      var ap = aPlan
+                      if (ap == null && d.cands.isNotEmpty() && !Mux.hasAudio(vFile)) {
+                          d.note = "Looking for audio…"
+                          ap = findAudioPlan(d)
+                          d.note = ""
+                          if (ap != null) d.total = d.total + ap.segs.size
+                      }
+                      if (ap != null) {
+                          aFile = File(tmp, d.id + "_a." + ap.ext)
+                          downloadPlan(d, ap, aFile)
                       }
                       finishTracks(d, dir, vFile, aFile)
                   } finally {
@@ -2979,7 +3024,86 @@ jobs:
           import java.io.File
           import java.nio.ByteBuffer
 
+          // Keeps timestamps continuous. A jump or wrap in the source (common when HLS segments are joined)
+          // must not stretch the file (for example 16 minutes showing as 54 hours).
+          class Retimer(private val base: Long) {
+              private var first = true
+              private var lastIn = 0L
+              private var lastOut = 0L
+              private var delta = 33333L
+
+              fun map(tm: Long): Long {
+                  if (first) {
+                      first = false
+                      lastIn = tm
+                      lastOut = if (tm - base < 0L) 0L else tm - base
+                      return lastOut
+                  }
+                  val diff = tm - lastIn
+                  val out = if (diff < -1000000L || diff > 5000000L) lastOut + delta else lastOut + diff
+                  if (diff > 0L && diff <= 200000L) delta = diff
+                  lastIn = tm
+                  lastOut = if (out < 0L) 0L else out
+                  return lastOut
+              }
+          }
+
+          private class Pend(val ex: MediaExtractor, val rt: Retimer) {
+              val buf: ByteBuffer = ByteBuffer.allocate(4 * 1024 * 1024)
+              var size = 0
+              var time = 0L
+              var flags = 0
+              var ended = false
+
+              fun load() {
+                  buf.clear()
+                  val s = ex.readSampleData(buf, 0)
+                  if (s < 0) {
+                      ended = true
+                      return
+                  }
+                  size = s
+                  flags = if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                  time = rt.map(ex.sampleTime)
+                  ex.advance()
+              }
+          }
+
           object Mux {
+              // "video", "audio", "av" or "" when the file can't be read
+              fun probe(f: File): String {
+                  val ex = MediaExtractor()
+                  return try {
+                      ex.setDataSource(f.path)
+                      var v = false
+                      var a = false
+                      for (i in 0 until ex.trackCount) {
+                          val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                          if (m.startsWith("video/")) v = true
+                          if (m.startsWith("audio/")) a = true
+                      }
+                      if (v && a) "av" else if (v) "video" else if (a) "audio" else ""
+                  } catch (e: Exception) {
+                      ""
+                  } finally {
+                      ex.release()
+                  }
+              }
+
+              // true when the file has an audio track, or when it can't be inspected (then we don't try to merge)
+              fun hasAudio(f: File): Boolean {
+                  val p = probe(f)
+                  return p == "av" || p == "audio" || p == ""
+              }
+
+              private fun findTrack(ex: MediaExtractor, prefix: String): Int {
+                  for (i in 0 until ex.trackCount) {
+                      val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                      if (m.startsWith(prefix)) return i
+                  }
+                  return -1
+              }
+
               // Copies all video and audio tracks of src into a standard MP4 (no re-encoding).
               fun remux(src: File, out: File): Boolean {
                   val ex = MediaExtractor()
@@ -3005,6 +3129,7 @@ jobs:
                           started = true
                           val buf = ByteBuffer.allocate(4 * 1024 * 1024)
                           val info = MediaCodec.BufferInfo()
+                          val rts = HashMap<Int, Retimer>()
                           var base = -1L
                           while (true) {
                               val idx = ex.sampleTrackIndex
@@ -3016,8 +3141,9 @@ jobs:
                               if (base < 0L) base = tm
                               val track = map[idx]
                               if (track != null) {
+                                  val rt = rts.getOrPut(idx) { Retimer(base) }
                                   val flags = if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                                  info.set(0, size, if (tm - base < 0L) 0L else tm - base, flags)
+                                  info.set(0, size, rt.map(tm), flags)
                                   m.writeSampleData(track, buf, info)
                               }
                               ex.advance()
@@ -3039,31 +3165,8 @@ jobs:
                       ex.release()
                   }
               }
-              // true when the file has an audio track, or when it can't be inspected (then we don't try to merge)
-              fun hasAudio(f: File): Boolean {
-                  val ex = MediaExtractor()
-                  return try {
-                      ex.setDataSource(f.path)
-                      var found = false
-                      for (i in 0 until ex.trackCount) {
-                          val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
-                          if (m.startsWith("audio/")) found = true
-                      }
-                      found
-                  } catch (e: Exception) {
-                      true
-                  } finally {
-                      ex.release()
-                  }
-              }
 
-              private fun findTrack(ex: MediaExtractor, prefix: String): Int {
-                  for (i in 0 until ex.trackCount) {
-                      val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
-                      if (m.startsWith(prefix)) return i
-                  }
-                  return -1
-              }
+              private fun trackOf(ex: MediaExtractor, prefix: String): Int = findTrack(ex, prefix)
 
               // Copies the first video track of v and the first audio track of a into one MP4 (no re-encoding).
               fun merge(v: File, a: File, out: File): Boolean {
@@ -3074,39 +3177,33 @@ jobs:
                   return try {
                       ve.setDataSource(v.path)
                       ae.setDataSource(a.path)
-                      val vt = findTrack(ve, "video/")
-                      val at = findTrack(ae, "audio/")
+                      val vt = trackOf(ve, "video/")
+                      val at = trackOf(ae, "audio/")
                       if (vt < 0 || at < 0) {
                           false
                       } else {
                           ve.selectTrack(vt)
                           ae.selectTrack(at)
+                          val vt0 = ve.sampleTime
+                          val at0 = ae.sampleTime
+                          val base = if (vt0 >= 0L && at0 >= 0L) minOf(vt0, at0) else maxOf(vt0, at0, 0L)
                           val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
                           mux = m
                           val vi = m.addTrack(ve.getTrackFormat(vt))
                           val ai = m.addTrack(ae.getTrackFormat(at))
                           m.start()
                           started = true
-                          val buf = ByteBuffer.allocate(4 * 1024 * 1024)
+                          val vp = Pend(ve, Retimer(base))
+                          val ap = Pend(ae, Retimer(base))
+                          vp.load()
+                          ap.load()
                           val info = MediaCodec.BufferInfo()
-                          var vTime = ve.sampleTime
-                          var aTime = ae.sampleTime
-                          val base = if (vTime >= 0L && aTime >= 0L) minOf(vTime, aTime) else maxOf(vTime, aTime, 0L)
-                          while (vTime >= 0L || aTime >= 0L) {
-                              val useV = aTime < 0L || (vTime >= 0L && vTime <= aTime)
-                              val ex = if (useV) ve else ae
-                              buf.clear()
-                              val size = ex.readSampleData(buf, 0)
-                              if (size < 0) {
-                                  if (useV) vTime = -1L else aTime = -1L
-                                  continue
-                              }
-                              val t = (if (useV) vTime else aTime) - base
-                              val flags = if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                              info.set(0, size, if (t < 0L) 0L else t, flags)
-                              m.writeSampleData(if (useV) vi else ai, buf, info)
-                              ex.advance()
-                              if (useV) vTime = ex.sampleTime else aTime = ex.sampleTime
+                          while (!vp.ended || !ap.ended) {
+                              val useV = ap.ended || (!vp.ended && vp.time <= ap.time)
+                              val p = if (useV) vp else ap
+                              info.set(0, p.size, p.time, p.flags)
+                              m.writeSampleData(if (useV) vi else ai, p.buf, info)
+                              p.load()
                           }
                           true
                       }
