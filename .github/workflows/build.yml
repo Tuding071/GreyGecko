@@ -100,9 +100,6 @@ jobs:
                   targetSdk = 35
                   versionCode = 1
                   versionName = "1.0"
-                  ndk {
-                      abiFilters += listOf("arm64-v8a")
-                  }
               }
               signingConfigs {
                   create("test") {
@@ -127,11 +124,6 @@ jobs:
                   freeCompilerArgs += "-Xskip-metadata-version-check"
               }
               buildFeatures { compose = true }
-              packaging {
-                  jniLibs {
-                      useLegacyPackaging = true
-                  }
-              }
           }
 
           tasks.configureEach {
@@ -146,8 +138,6 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("androidx.activity:activity-compose:1.9.3")
               implementation("androidx.core:core-ktx:1.15.0")
-              implementation("io.github.junkfood02.youtubedl-android:library:0.16.0")
-              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.16.0")
           }
           EOF
 
@@ -168,7 +158,6 @@ jobs:
               </queries>
               <application
                   android:label="GreyGecko"
-                  android:extractNativeLibs="true"
                   android:theme="@android:style/Theme.Material.NoActionBar"
                   android:usesCleartextTraffic="true">
                   <activity
@@ -1683,7 +1672,7 @@ jobs:
                               if (res.isNotBlank()) parts.add(res)
                               if (bw > 0) parts.add(mbps(bw))
                               if (audioUrl.isNotEmpty()) parts.add("+audio")
-                              out.add(VideoItem(u, label, "HLS", parts.joinToString(" · "), h, height * 100000L + bw / 1000, audioUrl, url))
+                              out.add(VideoItem(u, label, "HLS", parts.joinToString(" · "), h, height * 100000L + bw / 1000, audioUrl))
                               i = j
                           }
                       } else if (ln.startsWith("#EXT-X-MEDIA:")) {
@@ -1921,8 +1910,6 @@ jobs:
               var audioUrl: String = ""
               var rep: String = ""
               @Volatile
-              var worker: Thread? = null
-              @Volatile
               var cancel = false
               @Volatile
               var stream: InputStream? = null
@@ -2090,14 +2077,7 @@ jobs:
               fun enqueueVideo(v: VideoItem, title: String, all: List<VideoItem>) {
                   val base = clean(if (title.isBlank()) hostOf(v.url) else title)
                   val d: DlItem
-                  if (v.kind == "YTDLP") {
-                      d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "ytdlp")
-                      d.rep = v.rep
-                  } else if ((v.kind == "HLS" || v.kind == "DASH") && Ytdlp.ready) {
-                      val src = if (v.kind == "HLS" && v.rep.isNotBlank()) v.rep else v.url
-                      d = DlItem(Store.newId(), src, base + " " + clean(v.label), "ytdlp")
-                      d.rep = selectorFor(v.label)
-                  } else if (v.kind == "HLS") {
+                  if (v.kind == "HLS") {
                       d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "hls")
                       d.audioUrl = v.audio
                   } else if (v.kind == "DASH") {
@@ -2117,12 +2097,6 @@ jobs:
                   }
                   d.headers = HashMap(v.headers)
                   add(d)
-              }
-
-              private fun selectorFor(label: String): String {
-                  if (label.startsWith("Audio")) return "ba/b"
-                  val h = label.removeSuffix("p").toIntOrNull() ?: return "bv*+ba/b"
-                  return "bv*[height<=" + h + "]+ba/b[height<=" + h + "]/b"
               }
 
               fun fromResponse(r: WebResponse) {
@@ -2194,7 +2168,6 @@ jobs:
 
               fun cancel(d: DlItem) {
               d.cancel = true
-              d.worker?.interrupt()
                   if (d.state == DL_QUEUED) {
                       pending.remove(d)
                       d.state = DL_CANCELED
@@ -2203,10 +2176,7 @@ jobs:
               }
 
               fun remove(d: DlItem) {
-                  if (d.state == DL_RUNNING || d.state == DL_QUEUED) {
-                      d.cancel = true
-                      d.worker?.interrupt()
-                  }
+                  if (d.state == DL_RUNNING || d.state == DL_QUEUED) d.cancel = true
                   pending.remove(d)
                   items.remove(d)
                   save()
@@ -2228,7 +2198,6 @@ jobs:
                   d.error = ""
                   d.note = ""
                   running.add(d)
-                  d.worker = Thread.currentThread()
                   if (active.incrementAndGet() == 1) startService()
                   try {
                       val dir = folder() ?: throw Exception("No download folder")
@@ -2236,7 +2205,6 @@ jobs:
                       if (!dir.canWrite()) throw Exception("Folder is not writable")
                       when (d.kind) {
                           "hls" -> runHls(d, dir)
-                          "ytdlp" -> runYtdlp(d, dir)
                           "dash" -> runDash(d, dir)
                           "stream" -> runStream(d, dir)
                           else -> runFile(d, dir)
@@ -2256,8 +2224,6 @@ jobs:
                       Log.e("GreyScript", "download failed " + d.url, e)
                   } finally {
                       running.remove(d)
-                      d.worker = null
-                      Thread.interrupted()
                       if (active.decrementAndGet() == 0) stopService()
                       save()
                   }
@@ -2620,7 +2586,23 @@ jobs:
               private fun finishTracks(d: DlItem, dir: File, v: File, a: File?) {
                   val base = clean(d.name.ifBlank { "video" })
                   if (a == null) {
-                      val target = uniqueFile(dir, base + "." + v.extension)
+                      val ext = v.extension
+                      if (ext == "ts" || ext == "mp4") {
+                          d.note = "Converting to mp4…"
+                          val conv = File(v.parentFile, d.id + "_c.mp4")
+                          if (Mux.remux(v, conv) && conv.length() > 1024L) {
+                              val target = uniqueFile(dir, base + ".mp4")
+                              moveFile(conv, target)
+                              v.delete()
+                              d.name = target.name
+                              d.path = target.path
+                              d.note = ""
+                              return
+                          }
+                          conv.delete()
+                          d.note = "Saved as ." + ext + " (could not convert to mp4)"
+                      }
+                      val target = uniqueFile(dir, base + "." + ext)
                       moveFile(v, target)
                       d.name = target.name
                       d.path = target.path
@@ -2628,7 +2610,7 @@ jobs:
                   }
                   d.note = "Merging audio…"
                   val merged = File(v.parentFile, d.id + "_m.mp4")
-                  val ok = Mux.merge(v, a, merged)
+                  val ok = Mux.merge(v, a, merged) && merged.length() > 1024L
                   if (ok) {
                       val target = uniqueFile(dir, base + ".mp4")
                       moveFile(merged, target)
@@ -2709,63 +2691,6 @@ jobs:
                   } finally {
                       vFile.delete()
                       aFile?.delete()
-                  }
-              }
-
-              // ---------- yt-dlp ----------
-              private fun runYtdlp(d: DlItem, dir: File) {
-                  if (!Ytdlp.ready) throw Exception("yt-dlp is not ready yet (" + Ytdlp.initError + ")")
-                  val tmp = tempDir()
-                  val base = d.id
-                  val stop = java.util.concurrent.atomic.AtomicBoolean(false)
-                  d.done = 0L
-                  d.total = 0L
-                  val poller = Thread {
-                      while (!stop.get()) {
-                          var sum = 0L
-                          val fs = tmp.listFiles()
-                          if (fs != null) {
-                              for (f in fs) {
-                                  if (f.name.startsWith(base + ".")) sum += f.length()
-                              }
-                          }
-                          d.done = sum
-                          notifyProgress()
-                          try {
-                              Thread.sleep(700L)
-                          } catch (e: InterruptedException) {
-                              break
-                          }
-                      }
-                  }
-                  poller.isDaemon = true
-                  poller.start()
-                  try {
-                      Ytdlp.download(d.url, if (d.rep.isBlank()) "bv*+ba/b" else d.rep, d.headers, File(tmp, base).path)
-                      stop.set(true)
-                      poller.interrupt()
-                      val frag = Regex("\\.f[0-9a-zA-Z_-]+\\.[a-z0-9]+$")
-                      val files = (tmp.listFiles() ?: arrayOf<File>())
-                          .filter {
-                              it.name.startsWith(base + ".") && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") &&
-                                  !it.name.endsWith(".temp") && !frag.containsMatchIn(it.name)
-                          }
-                          .sortedByDescending { it.length() }
-                      val out = files.firstOrNull() ?: throw Exception("No file was produced")
-                      val target = uniqueFile(dir, clean(d.name.ifBlank { "video" }) + "." + out.extension)
-                      moveFile(out, target)
-                      d.name = target.name
-                      d.path = target.path
-                      d.done = target.length()
-                  } finally {
-                      stop.set(true)
-                      poller.interrupt()
-                      val left = tmp.listFiles()
-                      if (left != null) {
-                          for (f in left) {
-                              if (f.name.startsWith(base + ".")) f.delete()
-                          }
-                      }
                   }
               }
 
@@ -3055,6 +2980,65 @@ jobs:
           import java.nio.ByteBuffer
 
           object Mux {
+              // Copies all video and audio tracks of src into a standard MP4 (no re-encoding).
+              fun remux(src: File, out: File): Boolean {
+                  val ex = MediaExtractor()
+                  var mux: MediaMuxer? = null
+                  var started = false
+                  return try {
+                      ex.setDataSource(src.path)
+                      val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                      mux = m
+                      val map = HashMap<Int, Int>()
+                      for (i in 0 until ex.trackCount) {
+                          val f = ex.getTrackFormat(i)
+                          val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
+                          if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+                              ex.selectTrack(i)
+                              map[i] = m.addTrack(f)
+                          }
+                      }
+                      if (map.isEmpty()) {
+                          false
+                      } else {
+                          m.start()
+                          started = true
+                          val buf = ByteBuffer.allocate(4 * 1024 * 1024)
+                          val info = MediaCodec.BufferInfo()
+                          var base = -1L
+                          while (true) {
+                              val idx = ex.sampleTrackIndex
+                              if (idx < 0) break
+                              buf.clear()
+                              val size = ex.readSampleData(buf, 0)
+                              if (size < 0) break
+                              val tm = ex.sampleTime
+                              if (base < 0L) base = tm
+                              val track = map[idx]
+                              if (track != null) {
+                                  val flags = if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                                  info.set(0, size, if (tm - base < 0L) 0L else tm - base, flags)
+                                  m.writeSampleData(track, buf, info)
+                              }
+                              ex.advance()
+                          }
+                          true
+                      }
+                  } catch (e: Exception) {
+                      Log.e("GreyScript", "remux failed", e)
+                      false
+                  } finally {
+                      try {
+                          if (started) mux?.stop()
+                      } catch (e: Exception) {
+                      }
+                      try {
+                          mux?.release()
+                      } catch (e: Exception) {
+                      }
+                      ex.release()
+                  }
+              }
               // true when the file has an audio track, or when it can't be inspected (then we don't try to merge)
               fun hasAudio(f: File): Boolean {
                   val ex = MediaExtractor()
@@ -3141,136 +3125,6 @@ jobs:
                       ve.release()
                       ae.release()
                   }
-              }
-          }
-          EOF
-
-          cat > app/src/main/java/com/grey/gecko/Ytdlp.kt <<'EOF'
-          package com.grey.gecko
-
-          import android.content.Context
-          import android.os.Handler
-          import android.os.Looper
-          import android.util.Log
-          import com.yausername.ffmpeg.FFmpeg
-          import com.yausername.youtubedl_android.YoutubeDL
-          import com.yausername.youtubedl_android.YoutubeDLRequest
-          import org.json.JSONObject
-
-          object Ytdlp {
-              @Volatile
-              var ready = false
-              @Volatile
-              var initError = ""
-              private val main = Handler(Looper.getMainLooper())
-
-              fun init(ctx: Context) {
-                  try {
-                      YoutubeDL.getInstance().init(ctx)
-                      FFmpeg.getInstance().init(ctx)
-                      ready = true
-                      Log.d("GreyScript", "yt-dlp ready")
-                  } catch (e: Throwable) {
-                      initError = e.message ?: e.toString()
-                      Log.e("GreyScript", "yt-dlp init failed", e)
-                  }
-              }
-
-              private fun addHeaders(r: YoutubeDLRequest, h: Map<String, String>) {
-                  r.addOption("--user-agent", h["User-Agent"] ?: DEFAULT_UA)
-                  for (k in listOf("Referer", "Origin", "Cookie")) {
-                      val v = h[k]
-                      if (!v.isNullOrBlank()) r.addOption("--add-header", k + ":" + v)
-                  }
-              }
-
-              fun info(url: String, h: Map<String, String>): JSONObject {
-                  val r = YoutubeDLRequest(url)
-                  r.addOption("--dump-single-json")
-                  r.addOption("--no-playlist")
-                  r.addOption("--no-warnings")
-                  addHeaders(r, h)
-                  val out = YoutubeDL.getInstance().execute(r).out
-                  val a = out.indexOf('{')
-                  val b = out.lastIndexOf('}')
-                  if (a < 0 || b <= a) throw Exception("No video found on this page")
-                  return JSONObject(out.substring(a, b + 1))
-              }
-
-              fun itemsFromInfo(pageUrl: String, js: JSONObject, h: Map<String, String>): List<VideoItem> {
-                  val out = ArrayList<VideoItem>()
-                  val title = js.optString("title")
-                  out.add(VideoItem(pageUrl, "Best (yt-dlp)", "YTDLP", "yt-dlp · best video + audio · " + title, h, 900000000L, "", "bv*+ba/b"))
-                  val fm = js.optJSONArray("formats")
-                  if (fm != null) {
-                      val list = ArrayList<JSONObject>()
-                      for (i in 0 until fm.length()) {
-                          val f = fm.optJSONObject(i)
-                          if (f != null) list.add(f)
-                      }
-                      list.sortByDescending { it.optInt("height", 0) * 1000L + it.optDouble("tbr", 0.0).toLong() }
-                      val seen = HashSet<String>()
-                      for (f in list) {
-                          val vc = f.optString("vcodec", "none")
-                          val ac = f.optString("acodec", "none")
-                          val height = f.optInt("height", 0)
-                          if (vc == "none" || height <= 0) continue
-                          val ext = f.optString("ext")
-                          if (!seen.add(height.toString() + ext)) continue
-                          val id = f.optString("format_id")
-                          val sel = if (ac == "none") id + "+ba/" + id else id
-                          val size = f.optLong("filesize", f.optLong("filesize_approx", 0L))
-                          val parts = mutableListOf("yt-dlp", ext)
-                          if (size > 0L) parts.add(fmtSize(size))
-                          if (ac == "none") parts.add("+audio")
-                          out.add(VideoItem(pageUrl, height.toString() + "p", "YTDLP", parts.joinToString(" · "), h, height * 100000L, "", sel))
-                      }
-                  }
-                  out.add(VideoItem(pageUrl, "Audio (best)", "YTDLP", "yt-dlp · audio only", h, -1L, "", "ba/b"))
-                  return out
-              }
-
-              fun grab(tab: BrowserTab) {
-                  if (!ready) {
-                      toast(Gecko.appCtx, "yt-dlp is still starting. Try again in a moment.")
-                      return
-                  }
-                  val url = tab.url
-                  if (url.isBlank() || url.startsWith("about:")) {
-                      toast(Gecko.appCtx, "Open a page first")
-                      return
-                  }
-                  toast(Gecko.appCtx, "Analyzing page…")
-                  val h = HashMap<String, String>()
-                  h["Referer"] = url
-                  h["User-Agent"] = DEFAULT_UA
-                  Thread {
-                      try {
-                          val js = info(url, h)
-                          val items = itemsFromInfo(url, js, h)
-                          main.post {
-                              for (v in items) tab.addVideo(v)
-                              toast(Gecko.appCtx, "Found " + items.size + " options in the video list")
-                          }
-                      } catch (e: Throwable) {
-                          val msg = (e.message ?: "failed").take(120)
-                          main.post { toast(Gecko.appCtx, "No video found: " + msg) }
-                      }
-                  }.start()
-              }
-
-              fun download(url: String, fmt: String, h: Map<String, String>, outBase: String) {
-                  val r = YoutubeDLRequest(url)
-                  r.addOption("-o", outBase + ".%(ext)s")
-                  r.addOption("-f", fmt)
-                  r.addOption("--merge-output-format", "mp4")
-                  r.addOption("--no-playlist")
-                  r.addOption("--no-mtime")
-                  r.addOption("--concurrent-fragments", "4")
-                  r.addOption("--retries", "5")
-                  r.addOption("--fragment-retries", "5")
-                  addHeaders(r, h)
-                  YoutubeDL.getInstance().execute(r)
               }
           }
           EOF
@@ -5026,7 +4880,6 @@ jobs:
                   val runtime = Gecko.runtime(this)
                   Videos.load(this)
                   Thread { Updater.autoCheck() }.start()
-                  Thread { Ytdlp.init(applicationContext) }.start()
                   tabs = TabManager(runtime)
                   Videos.tabs = tabs
                   tabs.restore()
@@ -5563,14 +5416,7 @@ jobs:
                                       text = { Text("Downloads", color = Color.White) },
                                       onClick = { menu = false; onDownloads() }
                                   )
-                                  DropdownMenuItem(
-                                      text = { Text("Grab page video", color = Color.White) },
-                                      onClick = {
-                                          menu = false
-                                          val t = tabs.current
-                                          if (t == null || tabs.home) toast(ctx, "Open a page first") else Ytdlp.grab(t)
-                                      }
-                                  )
+
 
                                   DropdownMenuItem(
                                       text = { Text("Logcat", color = Color.White) },
