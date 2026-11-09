@@ -49,7 +49,7 @@ jobs:
 
       - name: Generate project
         run: |
-          mkdir -p app/src/main/java/com/grey/gecko app/src/main/assets/ext
+          mkdir -p app/src/main/java/com/grey/gecko app/src/main/assets/ext app/src/main/res/xml
 
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
@@ -170,12 +170,28 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+              <provider
+                  android:name="androidx.core.content.FileProvider"
+                  android:authorities="com.grey.gecko.fileprovider"
+                  android:exported="false"
+                  android:grantUriPermissions="true">
+                  <meta-data
+                      android:name="android.support.FILE_PROVIDER_PATHS"
+                      android:resource="@xml/file_paths" />
+              </provider>
               <service
                   android:name=".DownloadService"
                   android:exported="false"
                   android:foregroundServiceType="dataSync" />
               </application>
           </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <root-path name="root" path="." />
+          </paths>
           EOF
 
           cat > app/src/main/assets/ext/manifest.json <<'EOF'
@@ -431,6 +447,29 @@ jobs:
             document.addEventListener("DOMContentLoaded", later);
             window.addEventListener("load", later);
             try { new MutationObserver(later).observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+          })();
+          (function () {
+            var muteAll = false;
+            function apply(el) {
+              if (muteAll) {
+                if (!el.hasAttribute("data-grey-m")) el.setAttribute("data-grey-m", el.muted ? "1" : "0");
+                el.muted = true;
+              } else if (el.hasAttribute("data-grey-m")) {
+                el.muted = el.getAttribute("data-grey-m") === "1";
+                el.removeAttribute("data-grey-m");
+              }
+            }
+            function all() {
+              var els = document.querySelectorAll("video, audio");
+              for (var i = 0; i < els.length; i++) apply(els[i]);
+            }
+            function setMute(v) { muteAll = v; all(); }
+            document.addEventListener("play", function (e) { if (muteAll && e.target && e.target.muted === false) e.target.muted = true; }, true);
+            document.addEventListener("volumechange", function (e) { if (muteAll && e.target && e.target.muted === false) e.target.muted = true; }, true);
+            try { new MutationObserver(function () { if (muteAll) all(); }).observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+            browser.runtime.onMessage.addListener(function (m) {
+              if (m && m.type === "pick" && m.cmd === "mute") setMute(!!m.on);
+            });
           })();
           EOF
 
@@ -704,6 +743,7 @@ jobs:
             return native({ type: "get", url: msg.url, tabId: sender.tab.id }).then(function (res) {
               if (typeof res.grabber === "boolean") grabberOn = res.grabber;
               if (typeof res.img === "boolean") blockImg = res.img;
+              if (res.mute === true) browser.tabs.sendMessage(sender.tab.id, { type: "pick", cmd: "mute", on: true }).catch(function () {});
               if (typeof res.adv === "number" && res.adv !== adVer) adLoad().catch(function () {});
               connectPort();
               var jobs = [];
@@ -1895,6 +1935,7 @@ jobs:
           const val DL_DONE = 2
           const val DL_FAILED = 3
           const val DL_CANCELED = 4
+          const val DL_PAUSED = 5
 
           class HlsSeg(val url: String, val keyUrl: String?, val iv: ByteArray?, val seq: Long)
 
@@ -1908,6 +1949,15 @@ jobs:
               var total by mutableStateOf(0L)
               var error by mutableStateOf("")
               var note by mutableStateOf("")
+              var speed by mutableStateOf(0L)
+              @Volatile
+              var paused = false
+              @Volatile
+              var started = false
+              @Volatile
+              var bytes = 0L
+              var spB = 0L
+              var spT = 0L
               var time = System.currentTimeMillis()
               var headers: Map<String, String> = emptyMap()
               var audioUrl: String = ""
@@ -1919,13 +1969,20 @@ jobs:
               var stream: InputStream? = null
           }
 
+          fun fmtSpeed(bytesPerSec: Long): String {
+              val bits = bytesPerSec * 8L
+              return if (bits >= 1000000L) String.format("%.1f Mbps", bits / 1000000.0) else (bits / 1000L).toString() + " Kbps"
+          }
+
+          fun dlProgressText(d: DlItem): String =
+              if (d.kind == "hls" || d.kind == "dash") d.done.toString() + " / " + d.total + " segments"
+              else if (d.total > 0L) (d.done * 100L / d.total).toString() + "% · " + fmtSize(d.done) + " / " + fmtSize(d.total)
+              else fmtSize(d.done)
+
           fun dlStatus(d: DlItem): String = when (d.state) {
               DL_QUEUED -> "Waiting…"
-              DL_RUNNING ->
-                  if (d.note.isNotBlank()) d.note
-                  else if (d.kind == "hls" || d.kind == "dash") d.done.toString() + " / " + d.total + " segments"
-                  else if (d.total > 0L) (d.done * 100L / d.total).toString() + "% · " + fmtSize(d.done) + " / " + fmtSize(d.total)
-                  else fmtSize(d.done)
+              DL_RUNNING -> if (d.note.isNotBlank()) d.note else dlProgressText(d) + (if (d.speed > 0L) " · " + fmtSpeed(d.speed) else "")
+              DL_PAUSED -> "Paused · " + dlProgressText(d)
               DL_DONE ->
                   (if (d.kind == "hls" || d.kind == "dash") "Done" else "Done · " + fmtSize(d.done)) +
                       (if (d.note.isNotBlank()) " · " + d.note else "")
@@ -1938,6 +1995,9 @@ jobs:
               var askFolder by mutableStateOf(false)
               var askNotif by mutableStateOf(false)
               var folderState by mutableStateOf("")
+              var limitKbps by mutableStateOf(0)
+              private val limLock = Any()
+              private var nextFree = 0L
               private var notifAsked = false
               private val pending = ArrayList<DlItem>()
               private val running = java.util.concurrent.CopyOnWriteArrayList<DlItem>()
@@ -2002,6 +2062,7 @@ jobs:
               fun load() {
                   items.clear()
                   folderState = sp().getString("dlpath", "") ?: ""
+                  limitKbps = sp().getInt("dllimit", 0)
                   try {
                       val arr = JSONArray(sp().getString("downloads", "[]") ?: "[]")
                       for (i in 0 until arr.length()) {
@@ -2014,7 +2075,7 @@ jobs:
                           d.audioUrl = o.optString("audio")
                           d.rep = o.optString("rep")
                           var st = o.optInt("state")
-                          if (st == DL_QUEUED || st == DL_RUNNING) {
+                          if (st == DL_QUEUED || st == DL_RUNNING || st == DL_PAUSED) {
                               st = DL_FAILED
                               d.error = "Interrupted"
                           } else {
@@ -2162,13 +2223,18 @@ jobs:
                       return
                   }
                   d.cancel = false
+                  d.paused = false
+                  d.started = false
+                  d.bytes = 0L
+                  d.speed = 0L
+                  d.spT = 0L
                   d.state = DL_QUEUED
                   save()
                   pool.execute { runItem(d) }
               }
 
               fun retry(d: DlItem) {
-                  if (d.state == DL_RUNNING || d.state == DL_QUEUED) return
+                  if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) return
                   d.error = ""
                   d.note = ""
                   d.done = 0L
@@ -2178,8 +2244,9 @@ jobs:
               }
 
               fun cancel(d: DlItem) {
-              d.cancel = true
-                  if (d.state == DL_QUEUED) {
+                  d.cancel = true
+                  d.paused = false
+                  if (d.state == DL_QUEUED || (d.state == DL_PAUSED && !d.started)) {
                       pending.remove(d)
                       d.state = DL_CANCELED
                       save()
@@ -2187,15 +2254,129 @@ jobs:
               }
 
               fun remove(d: DlItem) {
-                  if (d.state == DL_RUNNING || d.state == DL_QUEUED) d.cancel = true
+                  if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) {
+                      d.cancel = true
+                      d.paused = false
+                  }
                   pending.remove(d)
                   items.remove(d)
                   save()
               }
 
+              fun setLimit(k: Int) {
+                  limitKbps = k
+                  sp().edit().putInt("dllimit", k).apply()
+              }
+
+              fun pause(d: DlItem) {
+                  if (d.state == DL_RUNNING || d.state == DL_QUEUED) {
+                      d.paused = true
+                      d.speed = 0L
+                      d.state = DL_PAUSED
+                  }
+              }
+
+              fun resume(d: DlItem) {
+                  if (d.state == DL_PAUSED) {
+                      d.paused = false
+                      d.spT = 0L
+                      d.state = if (d.started) DL_RUNNING else DL_QUEUED
+                  }
+              }
+
+              fun pauseAll() {
+                  for (d in ArrayList(items)) pause(d)
+              }
+
+              fun resumeAll() {
+                  for (d in ArrayList(items)) resume(d)
+              }
+
+              fun stopAll() {
+                  for (d in ArrayList(items)) {
+                      if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) cancel(d)
+                  }
+              }
+
+              fun removeAll() {
+                  for (d in ArrayList(items)) {
+                      if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) {
+                          d.cancel = true
+                          d.paused = false
+                      }
+                      pending.remove(d)
+                  }
+                  items.clear()
+                  save()
+              }
+
+              fun deleteFile(d: DlItem) {
+                  val path = d.path
+                  remove(d)
+                  if (path.isNotBlank()) {
+                      try {
+                          File(path).delete()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
               fun clearFinished() {
                   items.removeAll { it.state == DL_DONE || it.state == DL_FAILED || it.state == DL_CANCELED }
                   save()
+              }
+
+              // ---------- speed, limiter, pause ----------
+              private fun awaitResume(d: DlItem) {
+                  while (d.paused && !d.cancel) Thread.sleep(250L)
+                  if (d.cancel) throw Exception("Canceled")
+              }
+
+              private fun tickSpeed(d: DlItem) {
+                  val now = System.currentTimeMillis()
+                  if (d.spT == 0L) {
+                      d.spT = now
+                      d.spB = d.bytes
+                      return
+                  }
+                  val dt = now - d.spT
+                  if (dt >= 1000L) {
+                      d.speed = (d.bytes - d.spB) * 1000L / dt
+                      d.spT = now
+                      d.spB = d.bytes
+                  }
+              }
+
+              // Shared limit for all downloads, in kilobits per second (0 = unlimited).
+              private fun throttle(n: Int) {
+                  val k = limitKbps
+                  if (k <= 0) return
+                  val bps = k * 125L
+                  var waitMs = 0L
+                  synchronized(limLock) {
+                      val now = System.nanoTime()
+                      if (nextFree < now) nextFree = now
+                      nextFree += n * 1000000000L / bps
+                      waitMs = (nextFree - now) / 1000000L
+                  }
+                  if (waitMs > 5L) {
+                      try {
+                          Thread.sleep(minOf(waitMs, 3000L))
+                      } catch (e: InterruptedException) {
+                      }
+                  }
+              }
+
+              private fun readLimited(ins: InputStream): ByteArray {
+                  val bos = java.io.ByteArrayOutputStream()
+                  val buf = ByteArray(16384)
+                  while (true) {
+                      val n = ins.read(buf)
+                      if (n < 0) break
+                      bos.write(buf, 0, n)
+                      throttle(n)
+                  }
+                  return bos.toByteArray()
               }
 
               // ---------- worker ----------
@@ -2205,6 +2386,14 @@ jobs:
                       save()
                       return
                   }
+                  try {
+                      awaitResume(d)
+                  } catch (e: Exception) {
+                      d.state = DL_CANCELED
+                      save()
+                      return
+                  }
+                  d.started = true
                   d.state = DL_RUNNING
                   d.error = ""
                   d.note = ""
@@ -2235,6 +2424,7 @@ jobs:
                       Log.e("GreyScript", "download failed " + d.url, e)
                   } finally {
                       running.remove(d)
+                      d.speed = 0L
                       if (active.decrementAndGet() == 0) stopService()
                       save()
                   }
@@ -2311,7 +2501,7 @@ jobs:
                   return if (ext.isEmpty()) name else name + "." + ext
               }
 
-              private fun openConn(url0: String, h: Map<String, String>): java.net.HttpURLConnection {
+              private fun openConn(url0: String, h: Map<String, String>, range: String? = null): java.net.HttpURLConnection {
                   var url = url0
                   var hops = 0
                   while (true) {
@@ -2320,6 +2510,7 @@ jobs:
                       c.readTimeout = 30000
                       c.instanceFollowRedirects = false
                       c.setRequestProperty("User-Agent", h["User-Agent"] ?: DEFAULT_UA)
+                      if (range != null) c.setRequestProperty("Range", range)
                       for (k in listOf("Referer", "Cookie", "Origin")) {
                           val v = h[k]
                           if (!v.isNullOrBlank()) c.setRequestProperty(k, v)
@@ -2344,21 +2535,29 @@ jobs:
               private fun getBytes(url: String, h: Map<String, String>): ByteArray {
                   val c = openConn(url, h)
                   try {
-                      return c.inputStream.use { it.readBytes() }
+                      return c.inputStream.use { readLimited(it) }
                   } finally {
                       c.disconnect()
                   }
               }
 
-              private fun copyStream(d: DlItem, ins: InputStream, out: java.io.OutputStream) {
-                  val buf = ByteArray(65536)
+              // Returns true at the end of the stream. Returns false only when resumable and the item was paused.
+              private fun copyStream(d: DlItem, ins: InputStream, out: java.io.OutputStream, resumable: Boolean = false): Boolean {
+                  val buf = ByteArray(16384)
                   var last = 0L
                   while (true) {
                       if (d.cancel) throw Exception("Canceled")
+                      if (d.paused) {
+                          if (resumable) return false
+                          awaitResume(d)
+                      }
                       val n = ins.read(buf)
-                      if (n < 0) break
+                      if (n < 0) return true
                       out.write(buf, 0, n)
                       d.done = d.done + n
+                      d.bytes = d.bytes + n
+                      throttle(n)
+                      tickSpeed(d)
                       val now = System.currentTimeMillis()
                       if (now - last > 400L) {
                           last = now
@@ -2382,15 +2581,43 @@ jobs:
               }
 
               private fun runFile(d: DlItem, dir: File) {
-                  val c = openConn(d.url, d.headers)
-                  try {
-                      val len = c.contentLengthLong
-                      d.total = if (len > 0L) len else 0L
-                      var name = d.name
-                      if (name.isBlank()) name = withExt(clean(nameFromHeaders(c.getHeaderField("Content-Disposition"), d.url, c.contentType)), c.contentType)
-                      c.inputStream.use { ins -> saveTo(d, dir, clean(name), ins) }
-                  } finally {
-                      c.disconnect()
+                  var target: File? = null
+                  var part: File? = null
+                  while (true) {
+                      val existing = if (part != null) part.length() else 0L
+                      val c = openConn(d.url, d.headers, if (existing > 0L) "bytes=" + existing + "-" else null)
+                      try {
+                          val resumed = existing > 0L && c.responseCode == 206
+                          if (target == null) {
+                              var name = d.name
+                              if (name.isBlank()) name = withExt(clean(nameFromHeaders(c.getHeaderField("Content-Disposition"), d.url, c.contentType)), c.contentType)
+                              target = uniqueFile(dir, clean(name))
+                              part = File(dir, target.name + ".part")
+                              d.name = target.name
+                              d.path = target.path
+                          }
+                          val p = part ?: throw Exception("No file")
+                          val startAt = if (resumed) existing else 0L
+                          val len = c.contentLengthLong
+                          d.total = if (len > 0L) startAt + len else 0L
+                          d.done = startAt
+                          try {
+                              val finished = java.io.FileOutputStream(p, resumed).use { out -> copyStream(d, c.inputStream, out, true) }
+                              if (finished) break
+                          } catch (e: Exception) {
+                              p.delete()
+                              throw e
+                          }
+                      } finally {
+                          c.disconnect()
+                      }
+                      awaitResume(d)
+                  }
+                  val t = target ?: throw Exception("No file")
+                  val p2 = part ?: throw Exception("No file")
+                  if (!p2.renameTo(t)) {
+                      p2.delete()
+                      throw Exception("Could not save file")
                   }
                   afterFile(d, dir)
               }
@@ -2569,7 +2796,8 @@ jobs:
                           if (initSeg != null) os.write(getBytes(initSeg, d.headers))
                           var i = 0
                           while (i < plan.segs.size) {
-                              if (d.cancel) throw Exception("Canceled")
+                          if (d.cancel) throw Exception("Canceled")
+                          if (d.paused) awaitResume(d)
                               val end = minOf(i + 8, plan.segs.size)
                               val futs = ArrayList<java.util.concurrent.Future<ByteArray>>()
                               for (k in i until end) {
@@ -2584,6 +2812,8 @@ jobs:
                                   }
                                   os.write(bytes)
                                   if (count) d.done = d.done + 1L
+                                  d.bytes = d.bytes + bytes.size
+                                  tickSpeed(d)
                               }
                               notifyProgress()
                               i = end
@@ -3930,6 +4160,25 @@ jobs:
                   sp().edit().putBoolean("saveplay", v).apply()
               }
 
+              fun mute(): Boolean = sp().getBoolean("savemute", false)
+
+              fun setMute(v: Boolean, tabs: TabManager) {
+                  sp().edit().putBoolean("savemute", v).apply()
+                  val p = HideTool.port ?: return
+                  for (t in ArrayList(tabs.tabs)) {
+                      if (t.extId < 0) continue
+                      try {
+                          val o = JSONObject()
+                          o.put("type", "pick")
+                          o.put("cmd", "mute")
+                          o.put("on", v)
+                          o.put("tabId", t.extId)
+                          p.postMessage(o)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
               fun push() {
                   val p = HideTool.port ?: return
                   try {
@@ -4691,6 +4940,7 @@ jobs:
           import android.content.ClipData
           import android.content.ClipboardManager
           import android.content.Context
+          import android.content.Intent
           import android.content.SharedPreferences
           import android.os.Bundle
           import android.util.Log
@@ -4850,6 +5100,7 @@ jobs:
                                   reply.put("grabber", Videos.enabled)
                                   reply.put("adv", Filters.ver)
                                   reply.put("img", Saver.images())
+                                  reply.put("mute", Saver.mute())
                                   val hostName = try { android.net.Uri.parse(url).host ?: "" } catch (e: Exception) { "" }
                                   val pathName = try { android.net.Uri.parse(url).path ?: "/" } catch (e: Exception) { "/" }
                                   reply.put("hide", JSONArray(HideRules.forPage(hostName, pathName)))
@@ -5260,6 +5511,7 @@ jobs:
               var grabberOn by remember { mutableStateOf(Videos.enabled) }
               var blockImg by remember { mutableStateOf(Saver.images()) }
               var blockPlay by remember { mutableStateOf(Saver.autoplay()) }
+              var blockAudio by remember { mutableStateOf(Saver.mute()) }
               var panelOpen by remember { mutableStateOf(false) }
               var lastSubmit by remember { mutableStateOf(0L) }
               val focusManager = LocalFocusManager.current
@@ -5455,6 +5707,23 @@ jobs:
                                           blockPlay = !blockPlay
                                           Saver.setAutoplay(blockPlay)
                                           toast(ctx, "Restart the app to apply")
+                                      }
+                                  )
+                                  DropdownMenuItem(
+                                      text = { Text("Block audio", color = Color.White) },
+                                      trailingIcon = {
+                                          Switch(
+                                              checked = blockAudio,
+                                              onCheckedChange = { v ->
+                                                  blockAudio = v
+                                                  Saver.setMute(v, tabs)
+                                              },
+                                              colors = switchColors()
+                                          )
+                                      },
+                                      onClick = {
+                                          blockAudio = !blockAudio
+                                          Saver.setMute(blockAudio, tabs)
                                       }
                                   )
                                   DropdownMenuItem(
@@ -7492,46 +7761,109 @@ jobs:
               }
           }
 
+          fun openDownload(ctx: Context, d: DlItem) {
+              val f = java.io.File(d.path)
+              if (!f.exists()) {
+                  toast(ctx, "File not found")
+                  return
+              }
+              try {
+                  val uri = androidx.core.content.FileProvider.getUriForFile(ctx, "com.grey.gecko.fileprovider", f)
+                  val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
+                  val i = Intent(Intent.ACTION_VIEW)
+                  i.setDataAndType(uri, mime)
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                  ctx.startActivity(i)
+              } catch (e: Exception) {
+                  toast(ctx, "No app can open this file")
+              }
+          }
+
           @Composable
-          fun DlRow(d: DlItem) {
-              Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
-                  Text(
-                      d.name.ifBlank { hostOf(d.url).ifBlank { d.url } },
-                      color = Color.White,
-                      fontSize = 13.sp,
-                      maxLines = 2,
-                      overflow = TextOverflow.Ellipsis
-                  )
-                  Text(dlStatus(d), color = if (d.state == DL_FAILED) Danger else Soft, fontSize = 11.sp)
-                  if (d.state == DL_RUNNING) {
-                      Spacer(Modifier.height(4.dp))
-                      if (d.total > 0L) {
-                          val p = (d.done.toFloat() / d.total.toFloat()).coerceIn(0f, 1f)
-                          LinearProgressIndicator(
-                              progress = { p },
-                              modifier = Modifier.fillMaxWidth().height(3.dp),
-                              color = TmGreen,
-                              trackColor = Field
+          fun DlRow(d: DlItem, onOpen: (DlItem) -> Unit, onDeleteFile: (DlItem) -> Unit) {
+              var menu by remember { mutableStateOf(false) }
+              val active = d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED
+              Column(Modifier.fillMaxWidth()) {
+                  Row(
+                      Modifier
+                          .fillMaxWidth()
+                          .clickable(enabled = d.state == DL_DONE) { onOpen(d) }
+                          .padding(start = 12.dp, top = 8.dp, bottom = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column(Modifier.weight(1f)) {
+                          Text(
+                              d.name.ifBlank { hostOf(d.url).ifBlank { d.url } },
+                              color = Color.White,
+                              fontSize = 13.sp,
+                              maxLines = 2,
+                              overflow = TextOverflow.Ellipsis
                           )
-                      } else {
-                          LinearProgressIndicator(
-                              modifier = Modifier.fillMaxWidth().height(3.dp),
-                              color = TmGreen,
-                              trackColor = Field
-                          )
-                      }
-                  }
-                  if (d.path.isNotBlank()) {
-                      Text(d.path, color = Color(0xFF777777), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                  }
-                  Row {
-                      if (d.state == DL_QUEUED || d.state == DL_RUNNING) {
-                          TextButton(onClick = { Downloads.cancel(d) }) { Text("Cancel", color = Danger, fontSize = 12.sp) }
-                      } else {
-                          if (d.state == DL_FAILED || d.state == DL_CANCELED) {
-                              TextButton(onClick = { Downloads.retry(d) }) { Text("Retry", color = Color.White, fontSize = 12.sp) }
+                          Text(dlStatus(d), color = if (d.state == DL_FAILED) Danger else Soft, fontSize = 11.sp)
+                          if (d.state == DL_RUNNING || d.state == DL_PAUSED) {
+                              Spacer(Modifier.height(4.dp))
+                              if (d.total > 0L) {
+                                  val pr = (d.done.toFloat() / d.total.toFloat()).coerceIn(0f, 1f)
+                                  LinearProgressIndicator(
+                                      progress = { pr },
+                                      modifier = Modifier.fillMaxWidth().height(3.dp),
+                                      color = if (d.state == DL_PAUSED) Soft else TmGreen,
+                                      trackColor = Field
+                                  )
+                              } else if (d.state == DL_RUNNING) {
+                                  LinearProgressIndicator(
+                                      modifier = Modifier.fillMaxWidth().height(3.dp),
+                                      color = TmGreen,
+                                      trackColor = Field
+                                  )
+                              }
                           }
-                          TextButton(onClick = { Downloads.remove(d) }) { Text("Remove", color = Soft, fontSize = 12.sp) }
+                          if (d.path.isNotBlank()) {
+                              Text(d.path, color = Color(0xFF777777), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          }
+                      }
+                      Box {
+                          TextButton(onClick = { menu = true }) { Text("⋮", color = Color.White, fontSize = 20.sp) }
+                          DropdownMenu(
+                              expanded = menu,
+                              onDismissRequest = { menu = false },
+                              modifier = Modifier.background(Bar)
+                          ) {
+                              if (d.state == DL_RUNNING || d.state == DL_QUEUED) {
+                                  DropdownMenuItem(
+                                      text = { Text("Pause", color = Color.White) },
+                                      onClick = { menu = false; Downloads.pause(d) }
+                                  )
+                              }
+                              if (d.state == DL_PAUSED) {
+                                  DropdownMenuItem(
+                                      text = { Text("Resume", color = Color.White) },
+                                      onClick = { menu = false; Downloads.resume(d) }
+                                  )
+                              }
+                              if (active) {
+                                  DropdownMenuItem(
+                                      text = { Text("Stop", color = Color.White) },
+                                      onClick = { menu = false; Downloads.cancel(d) }
+                                  )
+                              }
+                              if (d.state == DL_FAILED || d.state == DL_CANCELED) {
+                                  DropdownMenuItem(
+                                      text = { Text("Retry", color = Color.White) },
+                                      onClick = { menu = false; Downloads.retry(d) }
+                                  )
+                              }
+                              DropdownMenuItem(
+                                  text = { Text("Delete from list", color = Color.White) },
+                                  onClick = { menu = false; Downloads.remove(d) }
+                              )
+                              if (d.state == DL_DONE && d.path.isNotBlank()) {
+                                  DropdownMenuItem(
+                                      text = { Text("Delete file", color = Danger) },
+                                      onClick = { menu = false; onDeleteFile(d) }
+                                  )
+                              }
+                          }
                       }
                   }
                   Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
@@ -7539,8 +7871,40 @@ jobs:
           }
 
           @Composable
+          fun LimitField() {
+              var text by remember { mutableStateOf(if (Downloads.limitKbps > 0) Downloads.limitKbps.toString() else "") }
+              Box(
+                  Modifier
+                      .width(104.dp)
+                      .height(36.dp)
+                      .clip(RoundedCornerShape(8.dp))
+                      .background(Field)
+                      .padding(horizontal = 8.dp),
+                  contentAlignment = Alignment.CenterStart
+              ) {
+                  if (text.isEmpty()) Text("Limit Kbps", color = Soft, fontSize = 12.sp)
+                  BasicTextField(
+                      value = text,
+                      onValueChange = { v ->
+                          val t = v.filter { it.isDigit() }.take(7)
+                          text = t
+                          Downloads.setLimit(t.toIntOrNull() ?: 0)
+                      },
+                      singleLine = true,
+                      textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
+                      cursorBrush = SolidColor(Color.White),
+                      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                      modifier = Modifier.fillMaxWidth()
+                  )
+              }
+          }
+
+          @Composable
           fun DownloadsScreen(onBack: () -> Unit) {
               val ctx = LocalContext.current
+              var menu by remember { mutableStateOf(false) }
+              var confirmAll by remember { mutableStateOf(false) }
+              var fileTarget by remember { mutableStateOf<DlItem?>(null) }
               val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
                   if (uri != null) {
                       val e = Downloads.setFolder(uri)
@@ -7551,11 +7915,43 @@ jobs:
                   Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Downloads", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
-                      TextButton(onClick = { picker.launch(null) }) { Text("Folder", color = Color.White) }
-                      TextButton(onClick = { Downloads.clearFinished() }) { Text("Clear", color = Soft) }
+                      LimitField()
+                      Box {
+                          TextButton(onClick = { menu = true }) { Text("⋮", color = Color.White, fontSize = 24.sp) }
+                          DropdownMenu(
+                              expanded = menu,
+                              onDismissRequest = { menu = false },
+                              modifier = Modifier.background(Bar)
+                          ) {
+                              DropdownMenuItem(
+                                  text = { Text("Resume all", color = Color.White) },
+                                  onClick = { menu = false; Downloads.resumeAll() }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Pause all", color = Color.White) },
+                                  onClick = { menu = false; Downloads.pauseAll() }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Stop all", color = Color.White) },
+                                  onClick = { menu = false; Downloads.stopAll() }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Clear finished", color = Color.White) },
+                                  onClick = { menu = false; Downloads.clearFinished() }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Delete all from list", color = Danger) },
+                                  onClick = { menu = false; confirmAll = true }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Change folder", color = Color.White) },
+                                  onClick = { menu = false; picker.launch(null) }
+                              )
+                          }
+                      }
                   }
                   Text(
-                      if (Downloads.folderState.isBlank()) "No folder chosen yet. Tap Folder." else "Saving to: " + Downloads.folderState,
+                      if (Downloads.folderState.isBlank()) "No folder chosen yet. Use the menu to pick one." else "Saving to: " + Downloads.folderState,
                       color = Soft,
                       fontSize = 11.sp,
                       modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
@@ -7565,13 +7961,45 @@ jobs:
                   }
                   Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
                       for (d in Downloads.items) {
-                          key(d.id) { DlRow(d) }
+                          key(d.id) {
+                              DlRow(d, onOpen = { openDownload(ctx, it) }, onDeleteFile = { fileTarget = it })
+                          }
                       }
                   }
+              }
+              if (confirmAll) {
+                  AlertDialog(
+                      onDismissRequest = { confirmAll = false },
+                      containerColor = Bar,
+                      title = { Text("Delete all from list?", color = Color.White) },
+                      text = { Text("Running downloads are stopped. Downloaded files are kept.", color = Soft) },
+                      confirmButton = {
+                          TextButton(onClick = { Downloads.removeAll(); confirmAll = false }) { Text("Delete", color = Danger) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { confirmAll = false }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
+              }
+              val ft = fileTarget
+              if (ft != null) {
+                  AlertDialog(
+                      onDismissRequest = { fileTarget = null },
+                      containerColor = Bar,
+                      title = { Text("Delete file?", color = Color.White) },
+                      text = { Text(ft.name + " will be deleted from storage.", color = Soft) },
+                      confirmButton = {
+                          TextButton(onClick = { Downloads.deleteFile(ft); fileTarget = null }) { Text("Delete", color = Danger) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { fileTarget = null }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
               }
           }
 
           @Composable
+
           fun GuideScreen(onBack: () -> Unit) {
               val ctx = LocalContext.current
               var copied by remember { mutableStateOf(false) }
