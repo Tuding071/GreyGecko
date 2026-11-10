@@ -1978,6 +1978,12 @@ jobs:
               var cancel = false
               @Volatile
               var stream: InputStream? = null
+              var tries = 0
+              var nextFree = 0L
+              val limLock = Any()
+              fun addBytes(n: Int) {
+                  synchronized(limLock) { bytes += n }
+              }
           }
 
           fun fmtSpeed(bytesPerSec: Long): String {
@@ -2007,15 +2013,18 @@ jobs:
               var askNotif by mutableStateOf(false)
               var folderState by mutableStateOf("")
               var limitKbps by mutableStateOf(0)
-              private val limLock = Any()
-              private var nextFree = 0L
+              var concurrent by mutableStateOf(2)
+              var maxRetries by mutableStateOf(2)
+              private val qLock = Any()
+              private val waiting = ArrayList<DlItem>()
+              private var inFlight = 0
               private var notifAsked = false
               private val pending = ArrayList<DlItem>()
               private val running = java.util.concurrent.CopyOnWriteArrayList<DlItem>()
               private val main = Handler(Looper.getMainLooper())
               private val active = AtomicInteger(0)
               private var lastNotif = 0L
-              private val pool = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+              private val pool = java.util.concurrent.Executors.newCachedThreadPool { r ->
                   val t = Thread(r)
                   t.isDaemon = true
                   t
@@ -2074,6 +2083,8 @@ jobs:
                   items.clear()
                   folderState = sp().getString("dlpath", "") ?: ""
                   limitKbps = sp().getInt("dllimit", 0)
+                  concurrent = sp().getInt("dlconc", 2)
+                  maxRetries = sp().getInt("dlretry", 2)
                   try {
                       val arr = JSONArray(sp().getString("downloads", "[]") ?: "[]")
                       for (i in 0 until arr.length()) {
@@ -2239,9 +2250,12 @@ jobs:
                   d.bytes = 0L
                   d.speed = 0L
                   d.spT = 0L
+                  d.tries = 0
+                  d.nextFree = 0L
                   d.state = DL_QUEUED
+                  synchronized(qLock) { if (!waiting.contains(d)) waiting.add(d) }
                   save()
-                  pool.execute { runItem(d) }
+                  pump()
               }
 
               fun retry(d: DlItem) {
@@ -2259,6 +2273,7 @@ jobs:
                   d.paused = false
                   if (d.state == DL_QUEUED || (d.state == DL_PAUSED && !d.started)) {
                       pending.remove(d)
+                      synchronized(qLock) { waiting.remove(d) }
                       d.state = DL_CANCELED
                       save()
                   }
@@ -2270,6 +2285,7 @@ jobs:
                       d.paused = false
                   }
                   pending.remove(d)
+                  synchronized(qLock) { waiting.remove(d) }
                   items.remove(d)
                   save()
               }
@@ -2293,6 +2309,7 @@ jobs:
                       d.spT = 0L
                       d.state = if (d.started) DL_RUNNING else DL_QUEUED
                   }
+                  pump()
               }
 
               fun pauseAll() {
@@ -2317,6 +2334,7 @@ jobs:
                       }
                       pending.remove(d)
                   }
+                  synchronized(qLock) { waiting.clear() }
                   items.clear()
                   save()
               }
@@ -2344,54 +2362,140 @@ jobs:
               }
 
               private fun tickSpeed(d: DlItem) {
-                  val now = System.currentTimeMillis()
-                  if (d.spT == 0L) {
-                      d.spT = now
-                      d.spB = d.bytes
-                      return
-                  }
-                  val dt = now - d.spT
-                  if (dt >= 1000L) {
-                      d.speed = (d.bytes - d.spB) * 1000L / dt
-                      d.spT = now
-                      d.spB = d.bytes
+                  synchronized(d.limLock) {
+                      val now = System.currentTimeMillis()
+                      if (d.spT == 0L) {
+                          d.spT = now
+                          d.spB = d.bytes
+                          return
+                      }
+                      val dt = now - d.spT
+                      if (dt >= 1000L) {
+                          d.speed = (d.bytes - d.spB) * 1000L / dt
+                          d.spT = now
+                          d.spB = d.bytes
+                      }
                   }
               }
 
-              // Shared limit for all downloads, in kilobits per second (0 = unlimited).
-              private fun throttle(n: Int) {
+              // Read size shrinks with the limit so low limits are paced smoothly (about 8 reads per second).
+              private fun chunkSize(): Int {
+                  val k = limitKbps
+                  if (k <= 0) return 16384
+                  return (k * 125 / 8).coerceIn(256, 16384)
+              }
+
+              // Limit is in kilobits per second and applies to each download on its own.
+              private fun throttle(d: DlItem, n: Int) {
                   val k = limitKbps
                   if (k <= 0) return
                   val bps = k * 125L
                   var waitMs = 0L
-                  synchronized(limLock) {
+                  synchronized(d.limLock) {
                       val now = System.nanoTime()
-                      if (nextFree < now) nextFree = now
-                      nextFree += n * 1000000000L / bps
-                      waitMs = (nextFree - now) / 1000000L
+                      if (d.nextFree < now) d.nextFree = now
+                      d.nextFree += n * 1000000000L / bps
+                      waitMs = (d.nextFree - now) / 1000000L
                   }
-                  if (waitMs > 5L) {
+                  if (waitMs > 2L) {
                       try {
-                          Thread.sleep(minOf(waitMs, 3000L))
+                          Thread.sleep(minOf(waitMs, 5000L))
                       } catch (e: InterruptedException) {
                       }
                   }
               }
 
-              private fun readLimited(ins: InputStream): ByteArray {
+              private fun readLimited(ins: InputStream, d: DlItem?): ByteArray {
                   val bos = java.io.ByteArrayOutputStream()
                   val buf = ByteArray(16384)
                   while (true) {
-                      val n = ins.read(buf)
+                      if (d != null && d.cancel) throw Exception("Canceled")
+                      val n = ins.read(buf, 0, chunkSize())
                       if (n < 0) break
                       bos.write(buf, 0, n)
-                      throttle(n)
+                      if (d != null) {
+                          d.addBytes(n)
+                          throttle(d, n)
+                          tickSpeed(d)
+                      }
                   }
                   return bos.toByteArray()
               }
 
               // ---------- worker ----------
+              private fun pump() {
+                  val go = ArrayList<DlItem>()
+                  synchronized(qLock) {
+                      val cap = if (concurrent <= 0) Int.MAX_VALUE else concurrent
+                      while (inFlight < cap) {
+                          val n = waiting.firstOrNull { !it.paused && !it.cancel } ?: break
+                          waiting.remove(n)
+                          inFlight++
+                          go.add(n)
+                      }
+                  }
+                  for (n in go) pool.execute { runItem(n) }
+              }
+
+              fun setConcurrent(n: Int) {
+                  concurrent = n
+                  sp().edit().putInt("dlconc", n).apply()
+                  pump()
+              }
+
+              fun cycleRetries() {
+                  maxRetries = when (maxRetries) {
+                      0 -> 2
+                      2 -> 4
+                      4 -> 8
+                      else -> 0
+                  }
+                  sp().edit().putInt("dlretry", maxRetries).apply()
+              }
+
+              private fun shouldRetry(d: DlItem, e: Exception): Boolean {
+                  if (d.cancel || d.tries >= maxRetries) return false
+                  if (d.kind == "stream") return false
+                  val m = (e.message ?: "").lowercase()
+                  if (m == "canceled") return false
+                  if (m.contains("space") || m.contains("permission") || m.contains("denied") || m.contains("read-only")) return false
+                  if (e is java.io.IOException) return true
+                  if (Regex("http (408|425|429|5\\d\\d)").containsMatchIn(m)) return true
+                  for (k in listOf("timed out", "timeout", "unable to resolve", "connection", "reset", "unexpected end", "eof", "broken pipe", "segment failed", "ssl", "socket")) {
+                      if (m.contains(k)) return true
+                  }
+                  return false
+              }
+
+              private fun waitRetry(d: DlItem, ms: Long): Boolean {
+                  var left = ms
+                  while (left > 0L) {
+                      if (d.cancel) return false
+                      try {
+                          Thread.sleep(200L)
+                      } catch (e: InterruptedException) {
+                          return false
+                      }
+                      left -= 200L
+                  }
+                  try {
+                      awaitResume(d)
+                  } catch (e: Exception) {
+                      return false
+                  }
+                  return !d.cancel
+              }
+
               private fun runItem(d: DlItem) {
+                  try {
+                      runItemInner(d)
+                  } finally {
+                      synchronized(qLock) { inFlight-- }
+                      pump()
+                  }
+              }
+
+              private fun runItemInner(d: DlItem) {
                   if (d.cancel) {
                       d.state = DL_CANCELED
                       save()
@@ -2411,28 +2515,50 @@ jobs:
                   running.add(d)
                   if (active.incrementAndGet() == 1) startService()
                   try {
-                      val dir = folder() ?: throw Exception("No download folder")
-                      dir.mkdirs()
-                      if (!dir.canWrite()) throw Exception("Folder is not writable")
-                      when (d.kind) {
-                          "hls" -> runHls(d, dir)
-                          "dash" -> runDash(d, dir)
-                          "stream" -> runStream(d, dir)
-                          else -> runFile(d, dir)
+                      while (true) {
+                          try {
+                              val dir = folder() ?: throw Exception("No download folder")
+                              dir.mkdirs()
+                              if (!dir.canWrite()) throw Exception("Folder is not writable")
+                              when (d.kind) {
+                                  "hls" -> runHls(d, dir)
+                                  "dash" -> runDash(d, dir)
+                                  "stream" -> runStream(d, dir)
+                                  else -> runFile(d, dir)
+                              }
+                              d.state = DL_DONE
+                              val done = d.name
+                              main.post { toast(Gecko.appCtx, "Downloaded " + done) }
+                              break
+                          } catch (e: Exception) {
+                              if (d.cancel) {
+                                  d.state = DL_CANCELED
+                                  break
+                              }
+                              if (shouldRetry(d, e)) {
+                                  d.tries = d.tries + 1
+                                  d.speed = 0L
+                                  d.note = "Retrying " + d.tries + "/" + maxRetries + "…"
+                                  Log.e("GreyScript", "download retry " + d.tries + " " + d.url, e)
+                                  if (!waitRetry(d, minOf(2000L * d.tries, 10000L))) {
+                                      d.state = DL_CANCELED
+                                      break
+                                  }
+                                  d.note = ""
+                                  continue
+                              }
+                              d.state = DL_FAILED
+                              d.error = e.message ?: "Failed"
+                              val msg = d.error
+                              main.post { toast(Gecko.appCtx, "Download failed: " + msg) }
+                              Log.e("GreyScript", "download failed " + d.url, e)
+                              try {
+                                  if (d.path.isNotBlank() && d.kind != "hls" && d.kind != "dash") File(d.path + ".part").delete()
+                              } catch (x: Exception) {
+                              }
+                              break
+                          }
                       }
-                      d.state = DL_DONE
-                      val done = d.name
-                      main.post { toast(Gecko.appCtx, "Downloaded " + done) }
-                  } catch (e: Exception) {
-                      if (d.cancel) {
-                          d.state = DL_CANCELED
-                      } else {
-                          d.state = DL_FAILED
-                          d.error = e.message ?: "Failed"
-                          val msg = d.error
-                          main.post { toast(Gecko.appCtx, "Download failed: " + msg) }
-                      }
-                      Log.e("GreyScript", "download failed " + d.url, e)
                   } finally {
                       running.remove(d)
                       d.speed = 0L
@@ -2543,10 +2669,10 @@ jobs:
                   }
               }
 
-              private fun getBytes(url: String, h: Map<String, String>): ByteArray {
+              private fun getBytes(url: String, h: Map<String, String>, d: DlItem? = null): ByteArray {
                   val c = openConn(url, h)
                   try {
-                      return c.inputStream.use { readLimited(it) }
+                      return c.inputStream.use { readLimited(it, d) }
                   } finally {
                       c.disconnect()
                   }
@@ -2562,12 +2688,12 @@ jobs:
                           if (resumable) return false
                           awaitResume(d)
                       }
-                      val n = ins.read(buf)
+                      val n = ins.read(buf, 0, chunkSize())
                       if (n < 0) return true
                       out.write(buf, 0, n)
                       d.done = d.done + n
-                      d.bytes = d.bytes + n
-                      throttle(n)
+                      d.addBytes(n)
+                      throttle(d, n)
                       tickSpeed(d)
                       val now = System.currentTimeMillis()
                       if (now - last > 400L) {
@@ -2594,6 +2720,10 @@ jobs:
               private fun runFile(d: DlItem, dir: File) {
                   var target: File? = null
                   var part: File? = null
+                  if (d.tries > 0 && d.path.isNotBlank() && File(d.path + ".part").exists()) {
+                      target = File(d.path)
+                      part = File(d.path + ".part")
+                  }
                   while (true) {
                       val existing = if (part != null) part.length() else 0L
                       val c = openConn(d.url, d.headers, if (existing > 0L) "bytes=" + existing + "-" else null)
@@ -2616,7 +2746,7 @@ jobs:
                               val finished = java.io.FileOutputStream(p, resumed).use { out -> copyStream(d, c.inputStream, out, true) }
                               if (finished) break
                           } catch (e: Exception) {
-                              p.delete()
+                              if (!shouldRetry(d, e)) p.delete()
                               throw e
                           }
                       } finally {
@@ -2703,14 +2833,14 @@ jobs:
                   return b
               }
 
-              private fun fetchSeg(s: HlsSeg, h: Map<String, String>, keys: HashMap<String, ByteArray>): ByteArray {
+              private fun fetchSeg(s: HlsSeg, h: Map<String, String>, keys: HashMap<String, ByteArray>, d: DlItem): ByteArray {
                   var lastErr: Exception? = null
                   for (attempt in 0 until 3) {
                       try {
-                          var b = getBytes(s.url, h)
+                          var b = getBytes(s.url, h, d)
                           val ku = s.keyUrl
                           if (ku != null) {
-                              val key = synchronized(keys) { keys.getOrPut(ku) { getBytes(ku, h) } }
+                              val key = synchronized(keys) { keys.getOrPut(ku) { getBytes(ku, h, d) } }
                               val iv = s.iv ?: ivFromSeq(s.seq)
                               val cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding")
                               cipher.init(
@@ -2804,7 +2934,7 @@ jobs:
                   try {
                       java.io.FileOutputStream(out).use { os ->
                           val initSeg = plan.init
-                          if (initSeg != null) os.write(getBytes(initSeg, d.headers))
+                          if (initSeg != null) os.write(getBytes(initSeg, d.headers, d))
                           var i = 0
                           while (i < plan.segs.size) {
                           if (d.cancel) throw Exception("Canceled")
@@ -2813,7 +2943,7 @@ jobs:
                               val futs = ArrayList<java.util.concurrent.Future<ByteArray>>()
                               for (k in i until end) {
                                   val s = plan.segs[k]
-                                  futs.add(exec.submit(java.util.concurrent.Callable { fetchSeg(s, d.headers, keys) }))
+                                  futs.add(exec.submit(java.util.concurrent.Callable { fetchSeg(s, d.headers, keys, d) }))
                               }
                               for (f in futs) {
                                   val bytes = try {
@@ -2823,7 +2953,6 @@ jobs:
                                   }
                                   os.write(bytes)
                                   if (count) d.done = d.done + 1L
-                                  d.bytes = d.bytes + bytes.size
                                   tickSpeed(d)
                               }
                               notifyProgress()
@@ -4259,6 +4388,11 @@ jobs:
 
           class CtxInfo(val url: String, val isImage: Boolean)
 
+          class ChoiceReq(
+              val prompt: GeckoSession.PromptDelegate.ChoicePrompt,
+              val result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>
+          )
+
           fun shownUrl(t: BrowserTab?): String {
               val u = t?.url ?: ""
               return if (u == "about:blank") "" else u
@@ -4358,6 +4492,7 @@ jobs:
               var current by mutableStateOf<BrowserTab?>(null)
               var maxBg by mutableStateOf(4)
               var ctxMenu by mutableStateOf<CtxInfo?>(null)
+              var choice by mutableStateOf<ChoiceReq?>(null)
               var home by mutableStateOf(true)
               val closingIds = mutableStateListOf<Int>()
               private val closeJobs = HashMap<Int, Runnable>()
@@ -4798,6 +4933,23 @@ jobs:
                           t.savedState = sessionState
                       }
                   }
+                  s.promptDelegate = object : GeckoSession.PromptDelegate {
+                      override fun onChoicePrompt(
+                          session: GeckoSession,
+                          prompt: GeckoSession.PromptDelegate.ChoicePrompt
+                      ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                          val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          val old = choice
+                          if (old != null) {
+                              try {
+                                  old.result.complete(old.prompt.dismiss())
+                              } catch (e: Exception) {
+                              }
+                          }
+                          choice = ChoiceReq(prompt, res)
+                          return res
+                      }
+                  }
                   s.scrollDelegate = object : GeckoSession.ScrollDelegate {
                       override fun onScrollChanged(session: GeckoSession, scrollX: Int, scrollY: Int) {
                           t.scrollY = scrollY
@@ -5031,6 +5183,7 @@ jobs:
           import org.mozilla.geckoview.GeckoResult
           import org.mozilla.geckoview.GeckoRuntime
           import org.mozilla.geckoview.GeckoRuntimeSettings
+          import org.mozilla.geckoview.GeckoSession
           import org.mozilla.geckoview.GeckoView
           import org.mozilla.geckoview.WebExtension
 
@@ -5353,6 +5506,7 @@ jobs:
                   var editId by remember { mutableStateOf<String?>(null) }
                   var startEdit by remember { mutableStateOf(false) }
                   DownloadAsk()
+                  ChoiceDialog(tabs)
                   BackHandler(screen != "browser") {
                       screen = when (screen) {
                           "guide", "editor" -> "scripts"
@@ -5444,6 +5598,108 @@ jobs:
                       }
                   }
               }
+          }
+
+          class ChoiceRow(val c: GeckoSession.PromptDelegate.ChoicePrompt.Choice, val header: Boolean, val indent: Boolean)
+
+          fun flattenChoices(arr: Array<GeckoSession.PromptDelegate.ChoicePrompt.Choice>?): List<ChoiceRow> {
+              val out = ArrayList<ChoiceRow>()
+              if (arr == null) return out
+              for (c in arr) {
+                  val kids = c.items
+                  if (kids != null && kids.isNotEmpty()) {
+                      out.add(ChoiceRow(c, true, false))
+                      for (k in kids) out.add(ChoiceRow(k, false, true))
+                  } else {
+                      out.add(ChoiceRow(c, false, false))
+                  }
+              }
+              return out
+          }
+
+          @Composable
+          fun ChoiceDialog(tabs: TabManager) {
+              val req = tabs.choice ?: return
+              val p = req.prompt
+              val rows = remember(req) { flattenChoices(p.choices) }
+              val multi = p.type == GeckoSession.PromptDelegate.ChoicePrompt.Type.MULTIPLE
+              val picked = remember(req) {
+                  val l = mutableStateListOf<String>()
+                  for (r in rows) {
+                      if (!r.header && r.c.selected) l.add(r.c.id)
+                  }
+                  l
+              }
+              fun finish(resp: () -> GeckoSession.PromptDelegate.PromptResponse) {
+                  tabs.choice = null
+                  try {
+                      req.result.complete(resp())
+                  } catch (e: Exception) {
+                      Log.d("GreyScript", "choice complete failed: " + e)
+                  }
+              }
+              val heading = (p.title ?: "").ifBlank { (p.message ?: "").ifBlank { "Select" } }
+              AlertDialog(
+                  onDismissRequest = { finish { p.dismiss() } },
+                  containerColor = Bar,
+                  title = { Text(heading, color = Soft, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                  text = {
+                      Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
+                          for (r in rows) {
+                              if (r.header) {
+                                  Text(
+                                      r.c.label,
+                                      color = Soft,
+                                      fontSize = 12.sp,
+                                      fontWeight = FontWeight.SemiBold,
+                                      modifier = Modifier.padding(top = 10.dp, bottom = 4.dp)
+                                  )
+                              } else if (r.c.separator) {
+                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF555555)))
+                              } else {
+                                  val id = r.c.id
+                                  val on = if (multi) picked.contains(id) else r.c.selected
+                                  val dis = r.c.disabled
+                                  Row(
+                                      Modifier
+                                          .fillMaxWidth()
+                                          .clip(RoundedCornerShape(8.dp))
+                                          .background(if (on) Field else Color.Transparent)
+                                          .clickable(enabled = !dis) {
+                                              if (multi) {
+                                                  if (picked.contains(id)) picked.remove(id) else picked.add(id)
+                                              } else {
+                                                  finish { p.confirm(id) }
+                                              }
+                                          }
+                                          .padding(start = if (r.indent) 18.dp else 8.dp, end = 8.dp, top = 12.dp, bottom = 12.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      if (multi) {
+                                          Text(if (on) "☑" else "☐", color = if (dis) Color(0xFF777777) else Color.White, fontSize = 16.sp)
+                                          Spacer(Modifier.width(10.dp))
+                                      }
+                                      Text(
+                                          r.c.label.ifBlank { " " },
+                                          color = if (dis) Color(0xFF777777) else Color.White,
+                                          fontSize = 15.sp,
+                                          modifier = Modifier.weight(1f)
+                                      )
+                                      if (!multi && on) Text("✓", color = TmGreen, fontSize = 15.sp)
+                                  }
+                              }
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      if (multi) {
+                          TextButton(onClick = { finish { p.confirm(picked.toTypedArray()) } }) { Text("OK", color = Color.White) }
+                      }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = { finish { p.dismiss() } }) { Text("Cancel", color = Color.White) }
+                  }
+              )
           }
 
           @Composable
@@ -8075,30 +8331,97 @@ jobs:
 
           @Composable
           fun LimitField() {
-              var text by remember { mutableStateOf(if (Downloads.limitKbps > 0) Downloads.limitKbps.toString() else "") }
-              Box(
-                  Modifier
-                      .width(104.dp)
-                      .height(36.dp)
-                      .clip(RoundedCornerShape(8.dp))
-                      .background(Field)
-                      .padding(horizontal = 8.dp),
-                  contentAlignment = Alignment.CenterStart
-              ) {
-                  if (text.isEmpty()) Text("Limit Kbps", color = Soft, fontSize = 12.sp)
-                  BasicTextField(
-                      value = text,
-                      onValueChange = { v ->
-                          val t = v.filter { it.isDigit() }.take(7)
-                          text = t
-                          Downloads.setLimit(t.toIntOrNull() ?: 0)
-                      },
-                      singleLine = true,
-                      textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
-                      cursorBrush = SolidColor(Color.White),
-                      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                      modifier = Modifier.fillMaxWidth()
-                  )
+              val focus = LocalFocusManager.current
+              val view = LocalView.current
+              val ctx = LocalContext.current
+              fun saved(): String = if (Downloads.limitKbps > 0) Downloads.limitKbps.toString() else ""
+              var text by remember { mutableStateOf(saved()) }
+              var focused by remember { mutableStateOf(false) }
+              fun save() {
+                  val v = text.toIntOrNull() ?: 0
+                  Downloads.setLimit(v)
+                  text = saved()
+                  focus.clearFocus(true)
+                  val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                  imm.hideSoftInputFromWindow(view.windowToken, 0)
+                  toast(ctx, if (v > 0) "Limit: " + v + " Kbps per download" else "Limit removed")
+              }
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Box(
+                      Modifier
+                          .width(110.dp)
+                          .height(36.dp)
+                          .clip(RoundedCornerShape(8.dp))
+                          .background(Field)
+                          .padding(horizontal = 8.dp),
+                      contentAlignment = Alignment.CenterStart
+                  ) {
+                      if (text.isEmpty()) Text("Limit Kbps", color = Soft, fontSize = 12.sp)
+                      BasicTextField(
+                          value = text,
+                          onValueChange = { v -> text = v.filter { it.isDigit() }.take(7) },
+                          singleLine = true,
+                          textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
+                          cursorBrush = SolidColor(Color.White),
+                          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                          keyboardActions = KeyboardActions(onDone = { save() }),
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .onFocusChanged { st ->
+                                  if (focused && !st.isFocused) text = saved()
+                                  focused = st.isFocused
+                              }
+                      )
+                  }
+                  if (focused) {
+                      Spacer(Modifier.width(6.dp))
+                      Box(
+                          Modifier
+                              .height(36.dp)
+                              .clip(RoundedCornerShape(8.dp))
+                              .background(Color.White)
+                              .clickable { save() }
+                              .padding(horizontal = 12.dp),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text("Save", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ConcurrentPicker() {
+              var open by remember { mutableStateOf(false) }
+              val n = Downloads.concurrent
+              Box {
+                  Row(
+                      Modifier
+                          .height(36.dp)
+                          .clip(RoundedCornerShape(8.dp))
+                          .background(Field)
+                          .clickable { open = true }
+                          .padding(horizontal = 10.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text("At once: " + (if (n <= 0) "Unlimited" else n.toString()) + " ▾", color = Color.White, fontSize = 12.sp, maxLines = 1)
+                  }
+                  DropdownMenu(
+                      expanded = open,
+                      onDismissRequest = { open = false },
+                      modifier = Modifier.background(Bar)
+                  ) {
+                      for (k in 1..8) {
+                          DropdownMenuItem(
+                              text = { Text(k.toString(), color = if (k == n) TmGreen else Color.White) },
+                              onClick = { open = false; Downloads.setConcurrent(k) }
+                          )
+                      }
+                      DropdownMenuItem(
+                          text = { Text("Unlimited", color = if (n <= 0) TmGreen else Color.White) },
+                          onClick = { open = false; Downloads.setConcurrent(0) }
+                      )
+                  }
               }
           }
 
@@ -8118,7 +8441,6 @@ jobs:
                   Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Downloads", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
-                      LimitField()
                       Box {
                           TextButton(onClick = { menu = true }) { Text("⋮", color = Color.White, fontSize = 24.sp) }
                           DropdownMenu(
@@ -8147,12 +8469,25 @@ jobs:
                                   onClick = { menu = false; confirmAll = true }
                               )
                               DropdownMenuItem(
+                                  text = { Text(if (Downloads.maxRetries > 0) "Auto retry: " + Downloads.maxRetries + "x" else "Auto retry: Off", color = Color.White) },
+                                  onClick = { Downloads.cycleRetries() }
+                              )
+                              DropdownMenuItem(
                                   text = { Text("Change folder", color = Color.White) },
                                   onClick = { menu = false; picker.launch(null) }
                               )
                           }
                       }
                   }
+                  Row(
+                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 12.dp, vertical = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      LimitField()
+                      Spacer(Modifier.weight(1f))
+                      ConcurrentPicker()
+                  }
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
                   Text(
                       if (Downloads.folderState.isBlank()) "No folder chosen yet. Use the menu to pick one." else "Saving to: " + Downloads.folderState,
                       color = Soft,
