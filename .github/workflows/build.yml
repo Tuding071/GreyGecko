@@ -2437,7 +2437,7 @@ jobs:
                   for (n in go) pool.execute { runItem(n) }
               }
 
-              fun setConcurrent(n: Int) {
+              fun applyConcurrent(n: Int) {
                   concurrent = n
                   sp().edit().putInt("dlconc", n).apply()
                   pump()
@@ -8414,12 +8414,12 @@ jobs:
                       for (k in 1..8) {
                           DropdownMenuItem(
                               text = { Text(k.toString(), color = if (k == n) TmGreen else Color.White) },
-                              onClick = { open = false; Downloads.setConcurrent(k) }
+                              onClick = { open = false; Downloads.applyConcurrent(k) }
                           )
                       }
                       DropdownMenuItem(
                           text = { Text("Unlimited", color = if (n <= 0) TmGreen else Color.White) },
-                          onClick = { open = false; Downloads.setConcurrent(0) }
+                          onClick = { open = false; Downloads.applyConcurrent(0) }
                       )
                   }
               }
