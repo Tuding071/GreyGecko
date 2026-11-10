@@ -8130,7 +8130,7 @@ jobs:
                   (running || done) && d.note.isNotBlank() -> d.note
                   else -> null
               }
-              Row(Modifier.fillMaxSize()) {
+              Row(Modifier.fillMaxWidth().heightIn(min = 68.dp).height(IntrinsicSize.Min)) {
                   Box(
                       Modifier.width(w * 0.1f).fillMaxHeight().background(typeBg),
                       contentAlignment = Alignment.Center
@@ -8145,16 +8145,14 @@ jobs:
                       )
                   }
                   Column(
-                      Modifier.width(w * 0.8f).fillMaxHeight().padding(start = 14.dp, end = 8.dp),
+                      Modifier.width(w * 0.8f).fillMaxHeight().padding(start = 14.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
                       verticalArrangement = Arrangement.Center
                   ) {
                       Text(
                           d.name.ifBlank { hostOf(d.url).ifBlank { d.url } },
                           color = fg,
                           fontSize = 13.sp,
-                          fontWeight = FontWeight.SemiBold,
-                          maxLines = 1,
-                          overflow = TextOverflow.Ellipsis
+                          fontWeight = FontWeight.SemiBold
                       )
                       Spacer(Modifier.height(6.dp))
                       Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -8238,7 +8236,6 @@ jobs:
                   BoxWithConstraints(
                       Modifier
                           .fillMaxWidth()
-                          .height(68.dp)
                           .background(if (isDone) Color(0xCCFFFFFF) else Color.Transparent)
                           .pointerInput(isDone) {
                               detectTapGestures(
@@ -8250,12 +8247,14 @@ jobs:
                       val w = maxWidth
                       val showFill = (st == DL_RUNNING || st == DL_PAUSED) && frac > 0.001f
                       if (showFill) {
-                          Box(
-                              Modifier
-                                  .fillMaxHeight()
-                                  .width(w * frac)
-                                  .background(if (st == DL_PAUSED) Color(0xFFBBBBBB) else Color.White)
-                          )
+                          Box(Modifier.matchParentSize()) {
+                              Box(
+                                  Modifier
+                                      .fillMaxHeight()
+                                      .width(w * frac)
+                                      .background(if (st == DL_PAUSED) Color(0xFFBBBBBB) else Color.White)
+                              )
+                          }
                       }
                       DlCells(
                           d, w,
@@ -8264,14 +8263,16 @@ jobs:
                           true, doneSize, dateText
                       ) { onAction() }
                       if (showFill) {
-                          Box(Modifier.fillMaxHeight().width(w * frac).clipToBounds()) {
-                              Box(
-                                  Modifier
-                                      .wrapContentWidth(Alignment.Start, unbounded = true)
-                                      .width(w)
-                                      .fillMaxHeight()
-                              ) {
-                                  DlCells(d, w, Color.Black, Color.Transparent, false, doneSize, dateText) { }
+                          Box(Modifier.matchParentSize()) {
+                              Box(Modifier.fillMaxHeight().width(w * frac).clipToBounds()) {
+                                  Box(
+                                      Modifier
+                                          .wrapContentWidth(Alignment.Start, unbounded = true)
+                                          .width(w)
+                                          .fillMaxHeight()
+                                  ) {
+                                      DlCells(d, w, Color.Black, Color.Transparent, false, doneSize, dateText) { }
+                                  }
                               }
                           }
                       }
@@ -8330,61 +8331,52 @@ jobs:
           }
 
           @Composable
-          fun LimitField() {
-              val focus = LocalFocusManager.current
-              val view = LocalView.current
-              val ctx = LocalContext.current
-              fun saved(): String = if (Downloads.limitKbps > 0) Downloads.limitKbps.toString() else ""
-              var text by remember { mutableStateOf(saved()) }
-              var focused by remember { mutableStateOf(false) }
-              fun save() {
-                  val v = text.toIntOrNull() ?: 0
-                  Downloads.setLimit(v)
-                  text = saved()
-                  focus.clearFocus(true)
-                  val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
-                  imm.hideSoftInputFromWindow(view.windowToken, 0)
-                  toast(ctx, if (v > 0) "Limit: " + v + " Kbps per download" else "Limit removed")
+          fun HeaderPick(label: String, value: String, onClick: () -> Unit) {
+              Column(
+                  Modifier
+                      .clip(RoundedCornerShape(8.dp))
+                      .background(Field)
+                      .clickable { onClick() }
+                      .padding(horizontal = 7.dp, vertical = 4.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Text(label, color = Soft, fontSize = 9.sp, maxLines = 1)
+                  Text(value + " ▾", color = Color.White, fontSize = 11.sp, maxLines = 1)
               }
-              Row(verticalAlignment = Alignment.CenterVertically) {
-                  Box(
-                      Modifier
-                          .width(110.dp)
-                          .height(36.dp)
-                          .clip(RoundedCornerShape(8.dp))
-                          .background(Field)
-                          .padding(horizontal = 8.dp),
-                      contentAlignment = Alignment.CenterStart
+          }
+
+          fun limitLabel(k: Int): String = when {
+              k <= 0 -> "Off"
+              k >= 1000 && k % 1000 == 0 -> (k / 1000).toString() + " Mbps"
+              else -> k.toString() + " Kbps"
+          }
+
+          @Composable
+          fun LimitPicker() {
+              var open by remember { mutableStateOf(false) }
+              val ctx = LocalContext.current
+              val cur = Downloads.limitKbps
+              Box {
+                  HeaderPick("Speed limit", limitLabel(cur)) { open = true }
+                  DropdownMenu(
+                      expanded = open,
+                      onDismissRequest = { open = false },
+                      modifier = Modifier.background(Bar)
                   ) {
-                      if (text.isEmpty()) Text("Limit Kbps", color = Soft, fontSize = 12.sp)
-                      BasicTextField(
-                          value = text,
-                          onValueChange = { v -> text = v.filter { it.isDigit() }.take(7) },
-                          singleLine = true,
-                          textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
-                          cursorBrush = SolidColor(Color.White),
-                          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
-                          keyboardActions = KeyboardActions(onDone = { save() }),
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .onFocusChanged { st ->
-                                  if (focused && !st.isFocused) text = saved()
-                                  focused = st.isFocused
-                              }
+                      DropdownMenuItem(
+                          text = { Text("Speed limit, per download", color = Soft, fontSize = 12.sp) },
+                          onClick = { },
+                          enabled = false
                       )
-                  }
-                  if (focused) {
-                      Spacer(Modifier.width(6.dp))
-                      Box(
-                          Modifier
-                              .height(36.dp)
-                              .clip(RoundedCornerShape(8.dp))
-                              .background(Color.White)
-                              .clickable { save() }
-                              .padding(horizontal = 12.dp),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text("Save", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                      for (k in listOf(32, 64, 128, 512, 1000, 0)) {
+                          DropdownMenuItem(
+                              text = { Text(if (k == 0) "Off (unlimited)" else limitLabel(k), color = if (k == cur) TmGreen else Color.White) },
+                              onClick = {
+                                  open = false
+                                  Downloads.setLimit(k)
+                                  toast(ctx, if (k == 0) "Speed limit off" else "Speed limit: " + limitLabel(k) + " per download")
+                              }
+                          )
                       }
                   }
               }
@@ -8395,22 +8387,17 @@ jobs:
               var open by remember { mutableStateOf(false) }
               val n = Downloads.concurrent
               Box {
-                  Row(
-                      Modifier
-                          .height(36.dp)
-                          .clip(RoundedCornerShape(8.dp))
-                          .background(Field)
-                          .clickable { open = true }
-                          .padding(horizontal = 10.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Text("At once: " + (if (n <= 0) "Unlimited" else n.toString()) + " ▾", color = Color.White, fontSize = 12.sp, maxLines = 1)
-                  }
+                  HeaderPick("At once", if (n <= 0) "Unli" else n.toString()) { open = true }
                   DropdownMenu(
                       expanded = open,
                       onDismissRequest = { open = false },
                       modifier = Modifier.background(Bar)
                   ) {
+                      DropdownMenuItem(
+                          text = { Text("Downloads at the same time", color = Soft, fontSize = 12.sp) },
+                          onClick = { },
+                          enabled = false
+                      )
                       for (k in 1..8) {
                           DropdownMenuItem(
                               text = { Text(k.toString(), color = if (k == n) TmGreen else Color.White) },
@@ -8440,7 +8427,10 @@ jobs:
               Column(Modifier.fillMaxSize()) {
                   Header {
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
-                      Text("Downloads", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                      Text("Downloads", color = Color.White, fontSize = 17.sp, maxLines = 1, modifier = Modifier.weight(1f))
+                      LimitPicker()
+                      Spacer(Modifier.width(6.dp))
+                      ConcurrentPicker()
                       Box {
                           TextButton(onClick = { menu = true }) { Text("⋮", color = Color.White, fontSize = 24.sp) }
                           DropdownMenu(
@@ -8479,15 +8469,6 @@ jobs:
                           }
                       }
                   }
-                  Row(
-                      Modifier.fillMaxWidth().background(Bar).padding(horizontal = 12.dp, vertical = 8.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      LimitField()
-                      Spacer(Modifier.weight(1f))
-                      ConcurrentPicker()
-                  }
-                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
                   Text(
                       if (Downloads.folderState.isBlank()) "No folder chosen yet. Use the menu to pick one." else "Saving to: " + Downloads.folderState,
                       color = Soft,
