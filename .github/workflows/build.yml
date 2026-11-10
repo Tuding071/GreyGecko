@@ -395,9 +395,20 @@ jobs:
               e.preventDefault();
               e.stopPropagation();
               e.stopImmediatePropagation();
+              browser.runtime.sendMessage({ type: "log", msg: "pick click " + describe(t) }).catch(function () {});
               select(t);
             }
-            document.addEventListener("click", onClick, true);
+            window.addEventListener("click", onClick, true);
+            function swallow(e) {
+              if (!on) return;
+              var t = e.target;
+              if (!t || t.nodeType !== 1) return;
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+            }
+            ["pointerdown", "pointerup", "mousedown", "mouseup", "touchstart", "touchend"].forEach(function (n) {
+              window.addEventListener(n, swallow, true);
+            });
             window.addEventListener("scroll", place, true);
             window.addEventListener("resize", place);
             browser.runtime.onMessage.addListener(function (m) {
@@ -7779,63 +7790,255 @@ jobs:
               }
           }
 
+          fun dlExt(d: DlItem): String {
+              val n = d.name
+              val dot = n.lastIndexOf('.')
+              if (dot > 0 && n.length - dot <= 5) return n.substring(dot + 1).uppercase().take(4)
+              return when (d.kind) {
+                  "hls" -> "HLS"
+                  "dash" -> "DASH"
+                  else -> "FILE"
+              }
+          }
+
+          fun dlPct(d: DlItem): Float =
+              if (d.total > 0L) (d.done.toFloat() / d.total.toFloat()).coerceIn(0f, 1f) else 0f
+
+          fun dlSizeText(d: DlItem): String = when {
+              d.kind == "hls" || d.kind == "dash" -> if (d.bytes > 0L) fmtSize(d.bytes) else ""
+              d.total > 0L -> fmtSize(d.total)
+              d.done > 0L -> fmtSize(d.done)
+              else -> ""
+          }
+
+          fun dlPctText(d: DlItem): String {
+              val s = dlSizeText(d)
+              if (d.total <= 0L) return if (s.isEmpty()) "—" else s
+              val p = (dlPct(d) * 100f).toInt().toString() + "%"
+              return if (s.isEmpty()) p else p + " · " + s
+          }
+
+          fun fmtEta(sec0: Long): String {
+              val sec = maxOf(sec0, 1L)
+              return when {
+                  sec < 60L -> "~" + sec + " s left"
+                  sec < 3600L -> "~" + (sec / 60L) + " min left"
+                  else -> "~" + (sec / 3600L) + " h " + ((sec % 3600L) / 60L) + " min left"
+              }
+          }
+
+          fun dlEta(d: DlItem): String {
+              if (d.speed <= 0L || d.total <= 0L) return "—"
+              val left: Long = if (d.kind == "hls" || d.kind == "dash") {
+                  if (d.done <= 0L) return "—"
+                  (d.total - d.done) * (d.bytes / d.done)
+              } else {
+                  d.total - d.done
+              }
+              if (left <= 0L) return "—"
+              return fmtEta(left / d.speed)
+          }
+
+          @Composable
+          fun DlCells(
+              d: DlItem,
+              w: Dp,
+              fg: Color,
+              typeBg: Color,
+              live: Boolean,
+              doneSize: Long,
+              dateText: String,
+              onAction: () -> Unit
+          ) {
+              val dark = fg == Color.Black
+              val dim = if (dark) Color(0xFF2A2A2A) else Soft
+              val bad = if (dark) Color(0xFF8B1A1A) else Danger
+              val st = d.state
+              val running = st == DL_RUNNING
+              val paused = st == DL_PAUSED
+              val queued = st == DL_QUEUED
+              val done = st == DL_DONE
+              val failed = st == DL_FAILED
+              val c1 = if (done) (if (doneSize > 0L) fmtSize(doneSize) else fmtSize(d.done)) else if (queued) "—" else dlPctText(d)
+              val c2 = when (st) {
+                  DL_QUEUED -> "Queued"
+                  DL_RUNNING -> if (d.speed > 0L) fmtSpeed(d.speed) else "Starting…"
+                  DL_PAUSED -> "Paused"
+                  DL_DONE -> "Finished"
+                  DL_FAILED -> "Failed"
+                  else -> "Canceled"
+              }
+              val c3 = if (running) dlEta(d) else if (done) dateText else "—"
+              val msg: String? = when {
+                  failed -> if (d.error.isBlank()) "Failed" else "Failed: " + d.error
+                  (running || done) && d.note.isNotBlank() -> d.note
+                  else -> null
+              }
+              Row(Modifier.fillMaxSize()) {
+                  Box(
+                      Modifier.width(w * 0.1f).fillMaxHeight().background(typeBg),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text(
+                          dlExt(d),
+                          color = fg,
+                          fontSize = 10.sp,
+                          fontWeight = FontWeight.ExtraBold,
+                          maxLines = 1,
+                          softWrap = false
+                      )
+                  }
+                  Column(
+                      Modifier.width(w * 0.8f).fillMaxHeight().padding(start = 14.dp, end = 8.dp),
+                      verticalArrangement = Arrangement.Center
+                  ) {
+                      Text(
+                          d.name.ifBlank { hostOf(d.url).ifBlank { d.url } },
+                          color = fg,
+                          fontSize = 13.sp,
+                          fontWeight = FontWeight.SemiBold,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Spacer(Modifier.height(6.dp))
+                      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                          Text(c1, color = dim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                          if (msg != null) {
+                              Text(
+                                  msg,
+                                  color = if (failed) bad else dim,
+                                  fontSize = 11.sp,
+                                  maxLines = 1,
+                                  overflow = TextOverflow.Ellipsis,
+                                  modifier = Modifier.weight(2.2f).padding(start = 6.dp)
+                              )
+                          } else {
+                              Text(
+                                  c2,
+                                  color = dim,
+                                  fontSize = 11.sp,
+                                  maxLines = 1,
+                                  overflow = TextOverflow.Ellipsis,
+                                  textAlign = TextAlign.Center,
+                                  modifier = Modifier.weight(1.2f)
+                              )
+                              Text(
+                                  c3,
+                                  color = dim,
+                                  fontSize = 11.sp,
+                                  maxLines = 1,
+                                  overflow = TextOverflow.Ellipsis,
+                                  textAlign = TextAlign.End,
+                                  modifier = Modifier.weight(1f)
+                              )
+                          }
+                      }
+                  }
+                  Box(
+                      Modifier
+                          .width(w * 0.1f)
+                          .fillMaxHeight()
+                          .then(if (live) Modifier.clickable { onAction() } else Modifier),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      if (running || queued) {
+                          Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                              Box(Modifier.width(4.dp).height(14.dp).background(fg, RoundedCornerShape(1.dp)))
+                              Box(Modifier.width(4.dp).height(14.dp).background(fg, RoundedCornerShape(1.dp)))
+                          }
+                      } else if (paused) {
+                          Text("▶", color = fg, fontSize = 15.sp)
+                      } else {
+                          Text("⋮", color = fg, fontSize = 20.sp)
+                      }
+                  }
+              }
+          }
+
           @Composable
           fun DlRow(d: DlItem, onOpen: (DlItem) -> Unit, onDeleteFile: (DlItem) -> Unit) {
               var menu by remember { mutableStateOf(false) }
-              val active = d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED
+              val st = d.state
+              val active = st == DL_RUNNING || st == DL_QUEUED || st == DL_PAUSED
+              val isDone = st == DL_DONE
+              val target = if (st == DL_RUNNING || st == DL_PAUSED) dlPct(d) else 0f
+              val frac by animateFloatAsState(targetValue = target, animationSpec = tween(500), label = "dlFill")
+              val doneSize = remember(st, d.path) {
+                  if (st == DL_DONE && d.path.isNotBlank()) {
+                      try { java.io.File(d.path).length() } catch (e: Exception) { 0L }
+                  } else 0L
+              }
+              val dateText = remember(d.time) {
+                  java.text.SimpleDateFormat("MMM d", java.util.Locale.getDefault()).format(java.util.Date(d.time))
+              }
+              val onAction: () -> Unit = {
+                  when (st) {
+                      DL_RUNNING, DL_QUEUED -> Downloads.pause(d)
+                      DL_PAUSED -> Downloads.resume(d)
+                      else -> menu = true
+                  }
+              }
               Column(Modifier.fillMaxWidth()) {
-                  Row(
+                  BoxWithConstraints(
                       Modifier
                           .fillMaxWidth()
-                          .clickable(enabled = d.state == DL_DONE) { onOpen(d) }
-                          .padding(start = 12.dp, top = 8.dp, bottom = 8.dp),
-                      verticalAlignment = Alignment.CenterVertically
+                          .height(68.dp)
+                          .background(if (isDone) Color(0xCCFFFFFF) else Color.Transparent)
+                          .pointerInput(isDone) {
+                              detectTapGestures(
+                                  onTap = { if (isDone) onOpen(d) },
+                                  onLongPress = { menu = true }
+                              )
+                          }
                   ) {
-                      Column(Modifier.weight(1f)) {
-                          Text(
-                              d.name.ifBlank { hostOf(d.url).ifBlank { d.url } },
-                              color = Color.White,
-                              fontSize = 13.sp,
-                              maxLines = 2,
-                              overflow = TextOverflow.Ellipsis
+                      val w = maxWidth
+                      val showFill = (st == DL_RUNNING || st == DL_PAUSED) && frac > 0.001f
+                      if (showFill) {
+                          Box(
+                              Modifier
+                                  .fillMaxHeight()
+                                  .width(w * frac)
+                                  .background(if (st == DL_PAUSED) Color(0xFFBBBBBB) else Color.White)
                           )
-                          Text(dlStatus(d), color = if (d.state == DL_FAILED) Danger else Soft, fontSize = 11.sp)
-                          if (d.state == DL_RUNNING || d.state == DL_PAUSED) {
-                              Spacer(Modifier.height(4.dp))
-                              if (d.total > 0L) {
-                                  val pr = (d.done.toFloat() / d.total.toFloat()).coerceIn(0f, 1f)
-                                  LinearProgressIndicator(
-                                      progress = { pr },
-                                      modifier = Modifier.fillMaxWidth().height(3.dp),
-                                      color = if (d.state == DL_PAUSED) Soft else TmGreen,
-                                      trackColor = Field
-                                  )
-                              } else if (d.state == DL_RUNNING) {
-                                  LinearProgressIndicator(
-                                      modifier = Modifier.fillMaxWidth().height(3.dp),
-                                      color = TmGreen,
-                                      trackColor = Field
-                                  )
+                      }
+                      DlCells(
+                          d, w,
+                          if (isDone) Color.Black else Color.White,
+                          if (isDone) Color(0x0F000000) else Color(0x14FFFFFF),
+                          true, doneSize, dateText
+                      ) { onAction() }
+                      if (showFill) {
+                          Box(Modifier.fillMaxHeight().width(w * frac).clipToBounds()) {
+                              Box(
+                                  Modifier
+                                      .wrapContentWidth(Alignment.Start, unbounded = true)
+                                      .width(w)
+                                      .fillMaxHeight()
+                              ) {
+                                  DlCells(d, w, Color.Black, Color.Transparent, false, doneSize, dateText) { }
                               }
                           }
-                          if (d.path.isNotBlank()) {
-                              Text(d.path, color = Color(0xFF777777), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                          }
                       }
-                      Box {
-                          TextButton(onClick = { menu = true }) { Text("⋮", color = Color.White, fontSize = 20.sp) }
+                      if (st == DL_RUNNING && d.total <= 0L) {
+                          LinearProgressIndicator(
+                              modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().height(2.dp),
+                              color = Color.White,
+                              trackColor = Field
+                          )
+                      }
+                      Box(Modifier.align(Alignment.TopEnd).width(w * 0.1f).height(68.dp)) {
                           DropdownMenu(
                               expanded = menu,
                               onDismissRequest = { menu = false },
                               modifier = Modifier.background(Bar)
                           ) {
-                              if (d.state == DL_RUNNING || d.state == DL_QUEUED) {
+                              if (st == DL_RUNNING || st == DL_QUEUED) {
                                   DropdownMenuItem(
                                       text = { Text("Pause", color = Color.White) },
                                       onClick = { menu = false; Downloads.pause(d) }
                                   )
                               }
-                              if (d.state == DL_PAUSED) {
+                              if (st == DL_PAUSED) {
                                   DropdownMenuItem(
                                       text = { Text("Resume", color = Color.White) },
                                       onClick = { menu = false; Downloads.resume(d) }
@@ -7847,7 +8050,7 @@ jobs:
                                       onClick = { menu = false; Downloads.cancel(d) }
                                   )
                               }
-                              if (d.state == DL_FAILED || d.state == DL_CANCELED) {
+                              if (st == DL_FAILED || st == DL_CANCELED) {
                                   DropdownMenuItem(
                                       text = { Text("Retry", color = Color.White) },
                                       onClick = { menu = false; Downloads.retry(d) }
@@ -7857,7 +8060,7 @@ jobs:
                                   text = { Text("Delete from list", color = Color.White) },
                                   onClick = { menu = false; Downloads.remove(d) }
                               )
-                              if (d.state == DL_DONE && d.path.isNotBlank()) {
+                              if (st == DL_DONE && d.path.isNotBlank()) {
                                   DropdownMenuItem(
                                       text = { Text("Delete file", color = Danger) },
                                       onClick = { menu = false; onDeleteFile(d) }
@@ -7866,7 +8069,7 @@ jobs:
                           }
                       }
                   }
-                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0x1FFFFFFF)))
               }
           }
 
