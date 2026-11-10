@@ -4355,6 +4355,7 @@ jobs:
           import org.mozilla.geckoview.GeckoRuntime
           import org.mozilla.geckoview.GeckoSession
           import org.mozilla.geckoview.GeckoView
+          import org.mozilla.geckoview.WebRequestError
           import org.mozilla.geckoview.WebResponse
 
           class BrowserTab(val id: Int, initialSession: GeckoSession?, var openerId: Int) {
@@ -4369,6 +4370,7 @@ jobs:
               var lastRecover = 0L
               var scrollY = 0
               var preview by mutableStateOf(false)
+              var errorUrl: String? = null
               var lastUsed = System.currentTimeMillis()
               var savedState: GeckoSession.SessionState? = null
               val videos = mutableStateListOf<VideoItem>()
@@ -4392,6 +4394,60 @@ jobs:
               val prompt: GeckoSession.PromptDelegate.ChoicePrompt,
               val result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>
           )
+
+          class JsReq(
+              val kind: Int,
+              val message: String,
+              val def: String,
+              val result: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
+              val ok: (String) -> GeckoSession.PromptDelegate.PromptResponse,
+              val cancel: () -> GeckoSession.PromptDelegate.PromptResponse
+          )
+
+          fun isErrorUri(u: String): Boolean = u.startsWith("data:text/html")
+
+          fun htmlEsc(s: String): String =
+              s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+          fun errorInfo(code: Int): Pair<String, String> = when (code) {
+              WebRequestError.ERROR_UNKNOWN_HOST -> Pair("Server not found", "The address could not be found. Check the spelling and your connection.")
+              WebRequestError.ERROR_OFFLINE -> Pair("You are offline", "This device has no network connection.")
+              WebRequestError.ERROR_NET_TIMEOUT -> Pair("Connection timed out", "The server took too long to respond.")
+              WebRequestError.ERROR_CONNECTION_REFUSED -> Pair("Connection refused", "The server refused the connection.")
+              WebRequestError.ERROR_NET_RESET -> Pair("Connection reset", "The connection was reset while loading the page.")
+              WebRequestError.ERROR_NET_INTERRUPT -> Pair("Connection interrupted", "The connection was lost while loading the page.")
+              WebRequestError.ERROR_SECURITY_SSL -> Pair("Secure connection failed", "A secure connection could not be set up with this site.")
+              WebRequestError.ERROR_SECURITY_BAD_CERT -> Pair("Certificate problem", "This site's security certificate could not be trusted.")
+              WebRequestError.ERROR_BAD_HSTS_CERT -> Pair("Certificate problem", "This site's security certificate could not be trusted.")
+              WebRequestError.ERROR_HTTPS_ONLY -> Pair("Secure connection needed", "This site could not be reached over a secure connection.")
+              WebRequestError.ERROR_MALFORMED_URI -> Pair("Invalid address", "That address is not valid.")
+              WebRequestError.ERROR_UNKNOWN_PROTOCOL -> Pair("Cannot open this link", "No app here can open this kind of link.")
+              WebRequestError.ERROR_REDIRECT_LOOP -> Pair("Too many redirects", "The page keeps redirecting and never loads.")
+              WebRequestError.ERROR_PORT_BLOCKED -> Pair("Port blocked", "The address uses a port that is blocked.")
+              WebRequestError.ERROR_PROXY_CONNECTION_REFUSED -> Pair("Proxy refused", "The proxy server refused the connection.")
+              WebRequestError.ERROR_UNKNOWN_PROXY_HOST -> Pair("Proxy not found", "The proxy server could not be found.")
+              WebRequestError.ERROR_SAFEBROWSING_MALWARE_URI -> Pair("Blocked page", "This page was blocked because it is reported as unsafe.")
+              WebRequestError.ERROR_SAFEBROWSING_PHISHING_URI -> Pair("Blocked page", "This page was blocked because it is reported as unsafe.")
+              else -> Pair("Cannot open this page", "Something went wrong while loading the page.")
+          }
+
+          fun errorPageUri(url: String, code: Int): String {
+              val info = errorInfo(code)
+              val js = "\"" + url.replace("\\", "\\\\").replace("\"", "\\\"").replace("<", "\\u003c") + "\""
+              val html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+                  "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+                  "<title>" + htmlEsc(info.first) + "</title><style>" +
+                  "body{margin:0;background:#1E1E1E;color:#fff;font-family:sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center}" +
+                  ".b{max-width:420px;padding:28px}h1{font-size:22px;margin:0 0 12px}" +
+                  "p{color:#AAAAAA;font-size:15px;line-height:1.45;margin:0 0 10px}" +
+                  ".u{word-break:break-all;font-size:13px;color:#888888}" +
+                  "button{margin-top:18px;background:#4A4A4A;color:#fff;border:0;border-radius:10px;padding:13px 26px;font-size:15px}" +
+                  "</style></head><body><div class=\"b\"><h1>" + htmlEsc(info.first) + "</h1><p>" + htmlEsc(info.second) + "</p>" +
+                  "<p class=\"u\">" + htmlEsc(url) + "</p>" +
+                  "<button onclick=\"r()\">Try again</button></div>" +
+                  "<script>function r(){location.href=" + js + "}</script></body></html>"
+              return "data:text/html;charset=utf-8," + java.net.URLEncoder.encode(html, "UTF-8").replace("+", "%20")
+          }
 
           fun shownUrl(t: BrowserTab?): String {
               val u = t?.url ?: ""
@@ -4493,6 +4549,9 @@ jobs:
               var maxBg by mutableStateOf(4)
               var ctxMenu by mutableStateOf<CtxInfo?>(null)
               var choice by mutableStateOf<ChoiceReq?>(null)
+              var js by mutableStateOf<JsReq?>(null)
+              var fullscreen by mutableStateOf(false)
+              var fullscreenTab = 0
               var home by mutableStateOf(true)
               val closingIds = mutableStateListOf<Int>()
               private val closeJobs = HashMap<Int, Runnable>()
@@ -4653,7 +4712,34 @@ jobs:
                   }
               }
 
+              fun showJs(r: JsReq) {
+                  val old = js
+                  if (old != null) {
+                      try {
+                          old.result.complete(old.cancel())
+                      } catch (e: Exception) {
+                      }
+                  }
+                  js = r
+              }
+
+              fun exitFullscreen() {
+                  val ft = tabs.firstOrNull { it.id == fullscreenTab }
+                  try {
+                      ft?.session?.exitFullScreen()
+                  } catch (e: Exception) {
+                  }
+                  fullscreen = false
+                  fullscreenTab = 0
+              }
+
+              fun reloadTab(t: BrowserTab) {
+                  val eu = t.errorUrl
+                  if (eu != null) t.session?.loadUri(eu) else t.session?.reload()
+              }
+
               fun select(t: BrowserTab) {
+                  if (fullscreen && fullscreenTab != t.id) exitFullscreen()
                   val prev = current
                   Log.d("GreyScript", "select tab " + t.id + " " + t.url + " session=" + System.identityHashCode(t.session))
                   if (prev != null && prev !== t) prev.lastUsed = System.currentTimeMillis()
@@ -4737,6 +4823,10 @@ jobs:
               private fun recover(t: BrowserTab, dead: GeckoSession) {
                   if (t.session !== dead) return
                   Log.d("GreyScript", "session died for tab " + t.id + " " + t.url)
+                  if (fullscreenTab == t.id) {
+                      fullscreen = false
+                      fullscreenTab = 0
+                  }
                   t.session = null
                   t.loading = false
                   t.progress = 0
@@ -4879,10 +4969,28 @@ jobs:
                           perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
                           hasUserGesture: Boolean
                       ) {
-                          t.url = url ?: ""
+                          val nu = url ?: ""
+                          val eu = t.errorUrl
+                          if (eu != null && isErrorUri(nu)) {
+                              t.url = eu
+                          } else {
+                              t.errorUrl = null
+                              t.url = nu
+                          }
                           dedupe(t)
                           Favicons.request(groupKeyOf(t))
                           persist()
+                      }
+
+                      override fun onLoadError(
+                          session: GeckoSession,
+                          uri: String?,
+                          error: WebRequestError
+                      ): GeckoResult<String>? {
+                          val failed = uri ?: ""
+                          if (failed.isBlank() || isErrorUri(failed)) return null
+                          t.errorUrl = failed
+                          return GeckoResult.fromValue(errorPageUri(failed, error.code))
                       }
 
                       override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
@@ -4905,7 +5013,8 @@ jobs:
                           t.loading = true
                           t.progress = 8
                           t.title = ""
-                          t.url = url
+                          val eu0 = t.errorUrl
+                          if (eu0 != null && isErrorUri(url)) t.url = eu0 else t.url = url
                           t.thumb = null
                           t.videos.clear()
                           t.scrollY = 0
@@ -4921,7 +5030,7 @@ jobs:
                       override fun onPageStop(session: GeckoSession, success: Boolean) {
                           t.loading = false
                           t.progress = 0
-                          if (success) HistoryStore.add(t.url, t.title)
+                          if (success && t.errorUrl == null) HistoryStore.add(t.url, t.title)
                           main.postDelayed({ capture(t) }, 800)
                           persist()
                       }
@@ -4949,6 +5058,60 @@ jobs:
                           choice = ChoiceReq(prompt, res)
                           return res
                       }
+
+                      override fun onAlertPrompt(
+                          session: GeckoSession,
+                          prompt: GeckoSession.PromptDelegate.AlertPrompt
+                      ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                          val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          showJs(JsReq(0, prompt.message ?: "", "", res, { prompt.dismiss() }, { prompt.dismiss() }))
+                          return res
+                      }
+
+                      override fun onButtonPrompt(
+                          session: GeckoSession,
+                          prompt: GeckoSession.PromptDelegate.ButtonPrompt
+                      ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                          val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          showJs(
+                              JsReq(
+                                  1, prompt.message ?: "", "", res,
+                                  { prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE) },
+                                  { prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE) }
+                              )
+                          )
+                          return res
+                      }
+
+                      override fun onTextPrompt(
+                          session: GeckoSession,
+                          prompt: GeckoSession.PromptDelegate.TextPrompt
+                      ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                          val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          showJs(
+                              JsReq(
+                                  2, prompt.message ?: "", prompt.defaultValue ?: "", res,
+                                  { t2 -> prompt.confirm(t2) },
+                                  { prompt.dismiss() }
+                              )
+                          )
+                          return res
+                      }
+
+                      override fun onBeforeUnloadPrompt(
+                          session: GeckoSession,
+                          prompt: GeckoSession.PromptDelegate.BeforeUnloadPrompt
+                      ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                          val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          showJs(
+                              JsReq(
+                                  3, "", "", res,
+                                  { prompt.confirm(AllowOrDeny.ALLOW) },
+                                  { prompt.confirm(AllowOrDeny.DENY) }
+                              )
+                          )
+                          return res
+                      }
                   }
                   s.scrollDelegate = object : GeckoSession.ScrollDelegate {
                       override fun onScrollChanged(session: GeckoSession, scrollX: Int, scrollY: Int) {
@@ -4962,6 +5125,11 @@ jobs:
 
                       override fun onKill(session: GeckoSession) {
                           recover(t, session)
+                      }
+
+                      override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
+                          fullscreenTab = if (fullScreen) t.id else 0
+                          fullscreen = fullScreen
                       }
 
                       override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
@@ -5507,6 +5675,22 @@ jobs:
                   var startEdit by remember { mutableStateOf(false) }
                   DownloadAsk()
                   ChoiceDialog(tabs)
+                  JsDialog(tabs)
+                  val actCtx = LocalContext.current
+                  LaunchedEffect(tabs.fullscreen) {
+                      val act = actCtx.findActivity()
+                      if (act != null) {
+                          val c = androidx.core.view.WindowCompat.getInsetsController(act.window, act.window.decorView)
+                          if (tabs.fullscreen) {
+                              c.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                              c.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                              act.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                          } else {
+                              c.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                              act.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                          }
+                      }
+                  }
                   BackHandler(screen != "browser") {
                       screen = when (screen) {
                           "guide", "editor" -> "scripts"
@@ -5518,9 +5702,10 @@ jobs:
                       Modifier
                           .fillMaxSize()
                           .background(BG)
-                          .statusBarsPadding()
-                          .navigationBarsPadding()
-                          .imePadding()
+                          .then(
+                              if (tabs.fullscreen) Modifier
+                              else Modifier.statusBarsPadding().navigationBarsPadding().imePadding()
+                          )
                   ) {
                       Box(Modifier.fillMaxSize()) {
                           BrowserScreen(
@@ -5703,6 +5888,56 @@ jobs:
           }
 
           @Composable
+          fun JsDialog(tabs: TabManager) {
+              val req = tabs.js ?: return
+              var text by remember(req) { mutableStateOf(req.def) }
+              fun finish(r: () -> GeckoSession.PromptDelegate.PromptResponse) {
+                  tabs.js = null
+                  try {
+                      req.result.complete(r())
+                  } catch (e: Exception) {
+                      Log.d("GreyScript", "js dialog complete failed: " + e)
+                  }
+              }
+              val host = hostOf(tabs.current?.url ?: "")
+              val heading = if (host.isBlank()) "This page says" else host + " says"
+              val kind = req.kind
+              val okLabel = if (kind == 3) "Leave" else "OK"
+              val cancelLabel = if (kind == 3) "Stay" else "Cancel"
+              val msg = if (kind == 3) "Leave this page? Changes you made may not be saved." else req.message
+              AlertDialog(
+                  onDismissRequest = { finish { req.cancel() } },
+                  containerColor = Bar,
+                  title = { Text(heading, color = Soft, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                  text = {
+                      Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                          if (msg.isNotBlank()) {
+                              SelectionContainer { Text(msg, color = Color.White, fontSize = 15.sp) }
+                          }
+                          if (kind == 2) {
+                              Spacer(Modifier.height(10.dp))
+                              OutlinedTextField(
+                                  value = text,
+                                  onValueChange = { text = it },
+                                  singleLine = true,
+                                  colors = fieldColors(),
+                                  modifier = Modifier.fillMaxWidth()
+                              )
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = { finish { req.ok(text) } }) { Text(okLabel, color = Color.White) }
+                  },
+                  dismissButton = {
+                      if (kind != 0) {
+                          TextButton(onClick = { finish { req.cancel() } }) { Text(cancelLabel, color = Color.White) }
+                      }
+                  }
+              )
+          }
+
+          @Composable
           fun AccessGate(onAllow: () -> Unit, onSkip: () -> Unit) {
               MaterialTheme(
                   colorScheme = darkColorScheme(
@@ -5824,7 +6059,9 @@ jobs:
 
               BackHandler(active) {
                   val c = tabs.current
-                  if (editing) {
+                  if (tabs.fullscreen) {
+                      tabs.exitFullscreen()
+                  } else if (editing) {
                       editing = false
                       focusManager.clearFocus()
                   } else if (HideTool.active) {
@@ -5864,7 +6101,8 @@ jobs:
                       Row(
                           Modifier
                               .fillMaxWidth()
-                              .height(HeaderH)
+                              .height(if (tabs.fullscreen) 0.dp else HeaderH)
+                              .clipToBounds()
                               .background(Bar)
                               .padding(horizontal = 8.dp),
                           verticalAlignment = Alignment.CenterVertically
@@ -6058,7 +6296,7 @@ jobs:
                               }
                           }
                       }
-                      if (!tabs.home && marked) {
+                      if (!tabs.home && marked && !tabs.fullscreen) {
                           Box(
                               Modifier
                                   .fillMaxWidth()
@@ -6097,7 +6335,7 @@ jobs:
                                               val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
                                               if (!ch.pressed) {
                                                   if (armed && dy >= pullTrigger) {
-                                                      tabs.current?.session?.reload()
+                                                      tabs.current?.let { tabs.reloadTab(it) }
                                                   }
                                                   break
                                               }
@@ -6155,13 +6393,13 @@ jobs:
                               }
                   }
                   val previewCur = cur
-                  if (previewCur != null && previewCur.preview && !tabs.home) {
+                  if (previewCur != null && previewCur.preview && !tabs.home && !tabs.fullscreen) {
                       PreviewHeader(tabs, previewCur, Modifier.align(Alignment.TopStart))
                   }
-                  if (HideTool.active && !tabs.home) {
+                  if (HideTool.active && !tabs.home && !tabs.fullscreen) {
                       HideToolPanel()
                   }
-                  if (!tabs.home && grabberOn && vids != null && vids.isNotEmpty()) {
+                  if (!tabs.home && !tabs.fullscreen && grabberOn && vids != null && vids.isNotEmpty()) {
                       VideoPanel(
                           videos = vids,
                           title = cur?.title ?: "",
