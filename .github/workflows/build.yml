@@ -2165,7 +2165,7 @@ jobs:
                   val base = clean(if (title.isBlank()) hostOf(v.url) else title)
                   val d: DlItem
                   if (v.kind == "HLS") {
-                      d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "hls")
+                      d = DlItem(Store.newId(), v.url, base, "hls")
                       d.audioUrl = v.audio
                       if (d.audioUrl.isBlank() && !v.label.startsWith("Audio")) {
                           val host = hostOf(v.url)
@@ -2175,7 +2175,7 @@ jobs:
                           d.cands = all.filter { it.kind == "HLS" && it.url != v.url && it.url != d.audioUrl }.map { it.url }.distinct()
                       }
                   } else if (v.kind == "DASH") {
-                      d = DlItem(Store.newId(), v.url, base + " " + clean(v.label), "dash")
+                      d = DlItem(Store.newId(), v.url, base, "dash")
                       d.rep = v.rep
                       d.audioUrl = v.audio
                   } else if (v.kind == "AUDIO") {
@@ -2593,6 +2593,15 @@ jobs:
                   }
               }
 
+              private fun nameTaken(d: DlItem, dir: File, name: String): Boolean {
+                  val f = File(dir, name)
+                  if (f.exists()) return true
+                  for (o in ArrayList(items)) {
+                      if (o !== d && o.path == f.path && (o.state == DL_RUNNING || o.state == DL_QUEUED || o.state == DL_PAUSED)) return true
+                  }
+                  return false
+              }
+
               private fun uniqueFile(dir: File, name: String): File {
                   var f = File(dir, name)
                   if (!f.exists() && !File(dir, name + ".part").exists()) return f
@@ -2717,10 +2726,14 @@ jobs:
               }
 
               private fun saveTo(d: DlItem, dir: File, name: String, ins: InputStream) {
-                  val target = uniqueFile(dir, name)
-                  d.name = target.name
+                  if (nameTaken(d, dir, name)) {
+                      d.name = name
+                      throw Exception("Same filename")
+                  }
+                  val target = File(dir, name)
+                  d.name = name
                   d.path = target.path
-                  val part = File(dir, target.name + ".part")
+                  val part = File(dir, name + ".part")
                   try {
                       java.io.FileOutputStream(part).use { out -> copyStream(d, ins, out) }
                       if (!part.renameTo(target)) throw Exception("Could not save file")
@@ -2745,9 +2758,14 @@ jobs:
                           if (target == null) {
                               var name = d.name
                               if (name.isBlank()) name = withExt(clean(nameFromHeaders(c.getHeaderField("Content-Disposition"), d.url, c.contentType)), c.contentType)
-                              target = uniqueFile(dir, clean(name))
-                              part = File(dir, target.name + ".part")
-                              d.name = target.name
+                              val nm = clean(name)
+                              if (nameTaken(d, dir, nm)) {
+                                  d.name = nm
+                                  throw Exception("Same filename")
+                              }
+                              target = File(dir, nm)
+                              part = File(dir, nm + ".part")
+                              d.name = nm
                               d.path = target.path
                           }
                           val p = part ?: throw Exception("No file")
@@ -3056,6 +3074,8 @@ jobs:
                           null
                       }
                   }
+                  val hext = if (aPlan != null || vPlan.ext == "ts" || vPlan.ext == "mp4") "mp4" else vPlan.ext
+                  if (nameTaken(d, dir, clean(d.name.ifBlank { "video" }) + "." + hext)) throw Exception("Same filename")
                   d.total = (vPlan.segs.size + (aPlan?.segs?.size ?: 0)).toLong()
                   d.done = 0L
                   val tmp = tempDir()
@@ -3091,12 +3111,14 @@ jobs:
                       d.url = vs
                       d.audioUrl = a?.single ?: ""
                       d.kind = "file"
-                      if (d.name.indexOf('.') < 0) d.name = d.name + "." + v.ext
+                      if (!d.name.lowercase().endsWith("." + v.ext)) d.name = d.name + "." + v.ext
                       runFile(d, dir)
                       return
                   }
                   val vPlan = v.plan ?: throw Exception("No segments")
                   val aPlan = a?.plan
+                  val dext = if (aPlan != null || vPlan.ext == "mp4") "mp4" else vPlan.ext
+                  if (nameTaken(d, dir, clean(d.name.ifBlank { "video" }) + "." + dext)) throw Exception("Same filename")
                   d.total = (vPlan.segs.size + (aPlan?.segs?.size ?: 0)).toLong()
                   d.done = 0L
                   val tmp = tempDir()
@@ -3683,6 +3705,7 @@ jobs:
                               return
                           }
                           restoreFilterFiles()
+                          restoreThumbFiles()
                           active = true
                           listen()
                           Log.d(TAG, "backup restored from file")
@@ -3787,7 +3810,10 @@ jobs:
                                   ok = false
                               }
                           }
-                          if (ok) syncFilters(root)
+                          if (ok) {
+                              syncFilters(root)
+                              syncThumbs(root)
+                          }
                           ok
                       }
                   } catch (e: Exception) {
@@ -3816,6 +3842,49 @@ jobs:
                       }
                   } catch (e: Exception) {
                       Log.e(TAG, "filter sync failed", e)
+                  }
+              }
+
+              private fun thumbsApp(): java.io.File = java.io.File(Gecko.appCtx.filesDir, "thumbs")
+
+              private fun thumbsBk(): java.io.File = java.io.File(dir(), "thumbs")
+
+              private fun syncThumbs(root: JSONObject) {
+                  try {
+                      val list = root.optJSONObject("browser")?.optJSONObject("tabs")?.optJSONArray("list") ?: return
+                      val names = HashSet<String>()
+                      for (i in 0 until list.length()) names.add("t" + list.getJSONObject(i).optInt("id") + ".jpg")
+                      val src = thumbsApp()
+                      val dst = thumbsBk()
+                      dst.mkdirs()
+                      for (n in names) {
+                          val a = java.io.File(src, n)
+                          val b = java.io.File(dst, n)
+                          if (a.exists() && (!b.exists() || b.length() != a.length() || b.lastModified() < a.lastModified())) {
+                              a.copyTo(b, overwrite = true)
+                          }
+                      }
+                      val old = dst.listFiles() ?: return
+                      for (f in old) {
+                          if (f.name.endsWith(".jpg") && !names.contains(f.name)) f.delete()
+                      }
+                  } catch (e: Exception) {
+                      Log.e(TAG, "thumb sync failed", e)
+                  }
+              }
+
+              private fun restoreThumbFiles() {
+                  try {
+                      val files = thumbsBk().listFiles() ?: return
+                      val dst = thumbsApp()
+                      dst.mkdirs()
+                      for (f in files) {
+                          if (!f.name.endsWith(".jpg")) continue
+                          val t = java.io.File(dst, f.name)
+                          if (!t.exists() || t.length() != f.length()) f.copyTo(t, overwrite = true)
+                      }
+                  } catch (e: Exception) {
+                      Log.e(TAG, "thumb restore failed", e)
                   }
               }
 
@@ -4977,6 +5046,7 @@ jobs:
                                               java.io.FileOutputStream(f).use { out ->
                                                   sc.compress(Bitmap.CompressFormat.JPEG, 75, out)
                                               }
+                                              Backup.schedule()
                                           } catch (e: Exception) {
                                           }
                                       }.start()
@@ -6976,12 +7046,12 @@ jobs:
                       .background(cardBg)
                       .then(if (foreground) Modifier.border(2.dp, TmGreen, shape) else Modifier)
                       .clickable(enabled = !closing) { onClick() }
-                      .padding(10.dp),
+                      .padding(start = 10.dp, end = 10.dp, top = 4.dp, bottom = 4.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
                   Box(
                       Modifier
-                          .size(72.dp)
+                          .size(84.dp)
                           .clip(RoundedCornerShape(8.dp))
                           .background(Field),
                       contentAlignment = Alignment.Center
@@ -6998,26 +7068,15 @@ jobs:
                       }
                   }
                   Spacer(Modifier.width(12.dp))
-                  Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                  Column(Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
                       Text(
                           title,
                           color = Color.White,
                           fontSize = 13.sp,
                           fontWeight = FontWeight.SemiBold,
-                          maxLines = 2,
+                          maxLines = 3,
                           overflow = TextOverflow.Ellipsis
                       )
-                      Row(verticalAlignment = Alignment.CenterVertically) {
-                          FaviconBox(key, 14.dp, 3.dp, 8)
-                          Spacer(Modifier.width(6.dp))
-                          Text(
-                              if (key == "newtab") "New tab" else key,
-                              color = Soft,
-                              fontSize = 11.sp,
-                              maxLines = 1,
-                              overflow = TextOverflow.Ellipsis
-                          )
-                      }
                   }
                   Spacer(Modifier.width(8.dp))
                   UndoClose(closing) { onToggleClose() }
@@ -7135,14 +7194,20 @@ jobs:
                                   .padding(12.dp)
                           ) {
                               if (active != null) {
-                                  Text(
-                                      active.label.uppercase(),
-                                      color = Soft,
-                                      fontSize = 11.sp,
-                                      fontWeight = FontWeight.SemiBold,
-                                      letterSpacing = 0.5.sp,
-                                      modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp)
-                                  )
+                                  Row(
+                                      Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      FaviconBox(active.key, 18.dp, 4.dp, 10)
+                                      Spacer(Modifier.width(8.dp))
+                                      Text(
+                                          active.label.uppercase(),
+                                          color = Soft,
+                                          fontSize = 11.sp,
+                                          fontWeight = FontWeight.SemiBold,
+                                          letterSpacing = 0.5.sp
+                                      )
+                                  }
                                   for (t in active.tabs) {
                                       key(t.id) {
                                           TabCard(
