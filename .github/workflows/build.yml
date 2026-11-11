@@ -482,133 +482,6 @@ jobs:
               if (m && m.type === "pick" && m.cmd === "mute") setMute(!!m.on);
             });
           })();
-          (function () {
-            var T = Object.create(null);
-            var B = Object.create(null);
-            var has = false;
-            var styleEl = null;
-            var obs = null;
-            var queue = [];
-            var qtimer = null;
-            var gen = 0;
-
-            function key(u) {
-              var t = String(u).replace(/#.*$/, "").toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
-              if (t.indexOf("www.") === 0) t = t.slice(4);
-              return t.replace(/\/+$/, "");
-            }
-            function selfKey() { return key(location.href); }
-            function ensureStyle() {
-              if (styleEl) return;
-              styleEl = document.createElement("style");
-              styleEl.setAttribute("data-grey-marks", "1");
-              var base = "border-radius:2px!important;padding:0 .12em!important;-webkit-box-decoration-break:clone!important;box-decoration-break:clone!important;";
-              styleEl.textContent =
-                'a[data-gg-m="t"]{background:#fff!important;color:#000!important;-webkit-text-fill-color:#000!important;' + base + '}' +
-                'a[data-gg-m="t"] *{color:#000!important;-webkit-text-fill-color:#000!important;background:transparent!important}' +
-                'a[data-gg-m="b"]{background:#4A4A4A!important;color:#fff!important;-webkit-text-fill-color:#fff!important;' + base + '}' +
-                'a[data-gg-m="b"] *{color:#fff!important;-webkit-text-fill-color:#fff!important;background:transparent!important}' +
-                'a[data-gg-w]{width:fit-content!important;max-width:100%!important}';
-              document.documentElement.appendChild(styleEl);
-            }
-            function mark(a, sk) {
-              var h = a.href;
-              var m = "";
-              if (typeof h === "string" && /^https?:/i.test(h)) {
-                var k = key(h);
-                if (k) {
-                  if (T[k] && k !== sk) m = "t";
-                  else if (B[k]) m = "b";
-                }
-              }
-              if (m) {
-                var txt = a.textContent || "";
-                if (!/\S/.test(txt) || txt.length > 300 || a.querySelector("img,picture,svg,video,canvas,iframe")) m = "";
-              }
-              var wide = false;
-              if (m) {
-                var d = "";
-                try { d = getComputedStyle(a).display; } catch (e) {}
-                if (d === "flex" || d === "inline-flex" || d === "grid" || d === "inline-grid" || d === "table" || d === "none") m = "";
-                else if (d === "block" || d === "list-item") wide = true;
-              }
-              var cur = a.getAttribute("data-gg-m") || "";
-              if (m) {
-                ensureStyle();
-                if (cur !== m) a.setAttribute("data-gg-m", m);
-                if (wide) a.setAttribute("data-gg-w", "1"); else a.removeAttribute("data-gg-w");
-              } else if (cur) {
-                a.removeAttribute("data-gg-m");
-                a.removeAttribute("data-gg-w");
-              }
-            }
-            function scanAll() {
-              var my = ++gen;
-              var list = document.querySelectorAll("a[href]");
-              var sk = selfKey();
-              var i = 0;
-              (function step() {
-                if (my !== gen) return;
-                var end = Math.min(i + 400, list.length);
-                for (; i < end; i++) mark(list[i], sk);
-                if (i < list.length) setTimeout(step, 16);
-              })();
-            }
-            function flush() {
-              qtimer = null;
-              var q = queue;
-              queue = [];
-              var sk = selfKey();
-              var n = 0;
-              for (var i = 0; i < q.length && n < 600; i++) {
-                var el = q[i];
-                if (!el || !el.isConnected) continue;
-                if (el.tagName === "A" && el.hasAttribute("href")) { mark(el, sk); n++; }
-                if (el.querySelectorAll) {
-                  var l = el.querySelectorAll("a[href]");
-                  for (var j = 0; j < l.length && n < 600; j++) { mark(l[j], sk); n++; }
-                }
-              }
-            }
-            function onMut(recs) {
-              if (!has) return;
-              for (var i = 0; i < recs.length; i++) {
-                var r = recs[i];
-                if (r.type === "attributes") {
-                  queue.push(r.target);
-                } else {
-                  for (var j = 0; j < r.addedNodes.length; j++) {
-                    var nd = r.addedNodes[j];
-                    if (nd.nodeType === 1) queue.push(nd);
-                  }
-                }
-              }
-              if (queue.length > 3000) queue = queue.slice(-3000);
-              if (!qtimer) qtimer = setTimeout(flush, 250);
-            }
-            function setMarks(t, b) {
-              T = Object.create(null);
-              B = Object.create(null);
-              var i;
-              for (i = 0; i < (t || []).length; i++) T[t[i]] = 1;
-              for (i = 0; i < (b || []).length; i++) B[b[i]] = 1;
-              has = !!((t && t.length) || (b && b.length));
-              if (!obs) {
-                try {
-                  obs = new MutationObserver(onMut);
-                  obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["href"] });
-                } catch (e) {}
-              }
-              if (document.readyState === "loading") {
-                document.addEventListener("DOMContentLoaded", scanAll, { once: true });
-              } else {
-                scanAll();
-              }
-            }
-            browser.runtime.onMessage.addListener(function (m) {
-              if (m && m.type === "marks") setMarks(m.t, m.b);
-            });
-          })();
           EOF
 
           cat > app/src/main/assets/ext/background.js <<'EOF'
@@ -881,7 +754,6 @@ jobs:
             return native({ type: "get", url: msg.url, tabId: sender.tab.id }).then(function (res) {
               if (typeof res.grabber === "boolean") grabberOn = res.grabber;
               if (typeof res.img === "boolean") blockImg = res.img;
-              if (res.mt || res.mb) browser.tabs.sendMessage(sender.tab.id, { type: "marks", t: res.mt || [], b: res.mb || [] }).catch(function () {});
               if (res.mute === true) browser.tabs.sendMessage(sender.tab.id, { type: "pick", cmd: "mute", on: true }).catch(function () {});
               if (typeof res.adv === "number" && res.adv !== adVer) adLoad().catch(function () {});
               connectPort();
@@ -1273,17 +1145,8 @@ jobs:
           // ---- Port to the app (hide element tool commands) ----
           var nport = null;
 
-          function relayMarks(m) {
-            browser.tabs.query({}).then(function (list) {
-              for (var i = 0; i < list.length; i++) {
-                browser.tabs.sendMessage(list[i].id, { type: "marks", t: m.mt || [], b: m.mb || [] }).catch(function () {});
-              }
-            }).catch(function () {});
-          }
-
           function onPortMsg(m) {
             if (m && m.type === "saver") { blockImg = !!m.img; return; }
-            if (m && m.type === "marks") { relayMarks(m); return; }
             if (!m || m.type !== "pick") return;
             var tid = m.tabId;
             if (typeof tid !== "number" || tid < 0) return;
@@ -2478,12 +2341,25 @@ jobs:
 
               fun deleteFile(d: DlItem) {
                   val path = d.path
+                  val finished = d.state == DL_DONE
                   remove(d)
                   if (path.isNotBlank()) {
+                      if (finished) {
+                          try {
+                              File(path).delete()
+                          } catch (e: Exception) {
+                          }
+                      }
                       try {
-                          File(path).delete()
+                          File(path + ".part").delete()
                       } catch (e: Exception) {
                       }
+                      main.postDelayed({
+                          try {
+                              File(path + ".part").delete()
+                          } catch (e: Exception) {
+                          }
+                      }, 1500L)
                   }
               }
 
@@ -4715,9 +4591,26 @@ jobs:
                   return java.io.File(dir, "t" + id + ".jpg")
               }
 
+              fun moveGroupBy(key: String, delta: Int) {
+                  val groups = groupTabs(tabs.filter { !it.preview })
+                  val i = groups.indexOfFirst { it.key == key }
+                  val j = i + delta
+                  if (i < 0 || j < 0 || j >= groups.size) return
+                  val order = groups.toMutableList()
+                  val g = order.removeAt(i)
+                  order.add(j, g)
+                  val next = ArrayList<BrowserTab>()
+                  for (x in order) next.addAll(x.tabs)
+                  next.addAll(tabs.filter { it.preview })
+                  if (next.size != tabs.size) return
+                  for (k in next.indices) {
+                      if (tabs[k] !== next[k]) tabs[k] = next[k]
+                  }
+                  persist()
+              }
+
               fun persist() {
                   if (closing) return
-                  Marks.pushSoon()
                   main.removeCallbacks(saveRunnable)
                   main.postDelayed(saveRunnable, 700L)
               }
@@ -5357,79 +5250,6 @@ jobs:
               }
           }
 
-          object Marks {
-              private val main = Handler(Looper.getMainLooper())
-              private val job = Runnable { pushNow() }
-              private var bookKeys: List<String> = emptyList()
-              private var booksDirty = true
-              private var lastSig = ""
-
-              // Must stay identical to key() in content.js
-              fun key(u: String): String {
-                  var t = u.substringBefore('#').lowercase()
-                  t = t.replace(Regex("^[a-z][a-z0-9+.-]*://"), "")
-                  if (t.startsWith("www.")) t = t.substring(4)
-                  return t.trimEnd('/')
-              }
-
-              private fun tabKeys(): List<String> {
-                  val tm = Videos.tabs ?: return emptyList()
-                  val out = LinkedHashSet<String>()
-                  for (t in ArrayList(tm.tabs)) {
-                      if (t.preview) continue
-                      val u = t.url
-                      if (!u.startsWith("http")) continue
-                      val k = key(u)
-                      if (k.isNotEmpty()) out.add(k)
-                  }
-                  return out.toList()
-              }
-
-              @Synchronized
-              private fun books(): List<String> {
-                  if (booksDirty) {
-                      val out = LinkedHashSet<String>()
-                      for (e in BookmarkStore.load()) {
-                          if (!e.url.startsWith("http")) continue
-                          val k = key(e.url)
-                          if (k.isNotEmpty()) out.add(k)
-                      }
-                      bookKeys = out.toList()
-                      booksDirty = false
-                  }
-                  return bookKeys
-              }
-
-              fun invalidateBooks() {
-                  booksDirty = true
-                  pushSoon()
-              }
-
-              fun pushSoon() {
-                  main.removeCallbacks(job)
-                  main.postDelayed(job, 400L)
-              }
-
-              fun fill(o: JSONObject) {
-                  o.put("mt", JSONArray(tabKeys()))
-                  o.put("mb", JSONArray(books()))
-              }
-
-              private fun pushNow() {
-                  val p = HideTool.port ?: return
-                  try {
-                      val o = JSONObject()
-                      fill(o)
-                      val sig = o.toString()
-                      if (sig == lastSig) return
-                      lastSig = sig
-                      o.put("type", "marks")
-                      p.postMessage(o)
-                  } catch (e: Exception) {
-                  }
-              }
-          }
-
           object BookmarkStore {
               var rev by mutableStateOf(0)
               val closing = mutableStateListOf<String>()
@@ -5464,7 +5284,6 @@ jobs:
                   l.add(0, PageEntry(url, title, System.currentTimeMillis()))
                   writeEntries("bookmarks", l)
                   rev++
-                  Marks.invalidateBooks()
               }
 
               @Synchronized
@@ -5473,7 +5292,6 @@ jobs:
                   l.removeAll { it.url == url }
                   writeEntries("bookmarks", l)
                   rev++
-                  Marks.invalidateBooks()
               }
           }
           EOF
@@ -5509,6 +5327,7 @@ jobs:
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.detectDragGestures
+          import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.layout.*
@@ -5534,12 +5353,17 @@ jobs:
           import androidx.compose.ui.focus.onFocusChanged
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.hapticfeedback.HapticFeedbackType
           import androidx.compose.ui.input.pointer.PointerEventPass
           import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.layout.onSizeChanged
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
           import androidx.compose.ui.platform.LocalFocusManager
+          import androidx.compose.ui.platform.LocalHapticFeedback
+          import androidx.compose.ui.zIndex
           import androidx.compose.ui.platform.LocalView
           import androidx.compose.ui.text.TextRange
           import androidx.compose.ui.text.TextStyle
@@ -5646,7 +5470,6 @@ jobs:
                                   reply.put("adv", Filters.ver)
                                   reply.put("img", Saver.images())
                                   reply.put("mute", Saver.mute())
-                                  Marks.fill(reply)
                                   val hostName = try { android.net.Uri.parse(url).host ?: "" } catch (e: Exception) { "" }
                                   val pathName = try { android.net.Uri.parse(url).path ?: "/" } catch (e: Exception) { "/" }
                                   reply.put("hide", JSONArray(HideRules.forPage(hostName, pathName)))
@@ -7211,6 +7034,10 @@ jobs:
               val groups = groupTabs(tabs.tabs.filter { !it.preview })
               val curKey = groupKeyOf(tabs.current)
               var activeKey by remember { mutableStateOf(curKey) }
+              var dragKey by remember { mutableStateOf<String?>(null) }
+              var dragOffset by remember { mutableStateOf(0f) }
+              val heights = remember { mutableStateMapOf<String, Int>() }
+              val haptic = LocalHapticFeedback.current
               val active = groups.firstOrNull { it.key == activeKey }
                   ?: groups.firstOrNull { it.key == curKey }
                   ?: groups.firstOrNull()
@@ -7244,12 +7071,59 @@ jobs:
                                   .padding(vertical = 8.dp)
                           ) {
                               for (g in groups) {
-                                  GroupItem(
-                                      g,
-                                      active = g.key == active?.key,
-                                      foreground = g.tabs.any { it === tabs.current },
-                                      onClick = { activeKey = g.key }
-                                  )
+                                  key(g.key) {
+                                      val dragging = dragKey == g.key
+                                      Box(
+                                          Modifier
+                                              .onSizeChanged { heights[g.key] = it.height }
+                                              .zIndex(if (dragging) 1f else 0f)
+                                              .graphicsLayer { translationY = if (dragging) dragOffset else 0f }
+                                              .background(if (dragging) Color(0xFF454545) else Color.Transparent)
+                                              .pointerInput(g.key) {
+                                                  detectDragGesturesAfterLongPress(
+                                                      onDragStart = {
+                                                          dragKey = g.key
+                                                          dragOffset = 0f
+                                                          haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                      },
+                                                      onDrag = { change, amount ->
+                                                          change.consume()
+                                                          dragOffset += amount.y
+                                                          val cur = groupTabs(tabs.tabs.filter { !it.preview })
+                                                          val i = cur.indexOfFirst { it.key == g.key }
+                                                          if (dragOffset > 0f && i >= 0 && i < cur.size - 1) {
+                                                              val nh = (heights[cur[i + 1].key] ?: 160).toFloat()
+                                                              if (dragOffset > nh / 2f) {
+                                                                  tabs.moveGroupBy(g.key, 1)
+                                                                  dragOffset -= nh
+                                                              }
+                                                          } else if (dragOffset < 0f && i > 0) {
+                                                              val ph = (heights[cur[i - 1].key] ?: 160).toFloat()
+                                                              if (-dragOffset > ph / 2f) {
+                                                                  tabs.moveGroupBy(g.key, -1)
+                                                                  dragOffset += ph
+                                                              }
+                                                          }
+                                                      },
+                                                      onDragEnd = {
+                                                          dragKey = null
+                                                          dragOffset = 0f
+                                                      },
+                                                      onDragCancel = {
+                                                          dragKey = null
+                                                          dragOffset = 0f
+                                                      }
+                                                  )
+                                              }
+                                      ) {
+                                          GroupItem(
+                                              g,
+                                              active = g.key == active?.key,
+                                              foreground = g.tabs.any { it === tabs.current },
+                                              onClick = { activeKey = g.key }
+                                          )
+                                      }
+                                  }
                               }
                           }
                           Box(Modifier.width(0.5.dp).fillMaxHeight().background(Field))
@@ -8765,10 +8639,17 @@ jobs:
                                       onClick = { menu = false; Downloads.retry(d) }
                                   )
                               }
-                              DropdownMenuItem(
-                                  text = { Text("Delete from list", color = Color.White) },
-                                  onClick = { menu = false; Downloads.remove(d) }
-                              )
+                              if (st == DL_PAUSED || st == DL_CANCELED || st == DL_FAILED) {
+                                  DropdownMenuItem(
+                                      text = { Text("Delete file", color = Danger) },
+                                      onClick = { menu = false; onDeleteFile(d) }
+                                  )
+                              } else {
+                                  DropdownMenuItem(
+                                      text = { Text("Delete from list", color = Color.White) },
+                                      onClick = { menu = false; Downloads.remove(d) }
+                                  )
+                              }
                               if (st == DL_DONE && d.path.isNotBlank()) {
                                   DropdownMenuItem(
                                       text = { Text("Delete file", color = Danger) },
@@ -8958,7 +8839,7 @@ jobs:
                       onDismissRequest = { fileTarget = null },
                       containerColor = Bar,
                       title = { Text("Delete file?", color = Color.White) },
-                      text = { Text(ft.name + " will be deleted from storage.", color = Soft) },
+                      text = { Text(if (ft.state == DL_DONE) ft.name + " will be deleted from storage." else "The partial download of " + ft.name + " will be deleted.", color = Soft) },
                       confirmButton = {
                           TextButton(onClick = { Downloads.deleteFile(ft); fileTarget = null }) { Text("Delete", color = Danger) }
                       },
