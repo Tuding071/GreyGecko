@@ -49,7 +49,7 @@ jobs:
 
       - name: Generate project
         run: |
-          mkdir -p app/src/main/java/com/grey/gecko app/src/main/assets/ext app/src/main/res/xml
+          mkdir -p app/src/main/java/com/grey/gecko app/src/main/assets/ext app/src/main/res/xml app/src/main/res/drawable app/src/main/res/values app/src/main/res/values-v31 app/src/main/res/mipmap-anydpi-v26
 
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
@@ -158,7 +158,9 @@ jobs:
               </queries>
               <application
                   android:label="GreyGecko"
-                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:theme="@style/AppTheme"
                   android:usesCleartextTraffic="true">
                   <activity
                       android:name=".MainActivity"
@@ -192,6 +194,95 @@ jobs:
           <paths>
               <root-path name="root" path="." />
           </paths>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:pathData="M62.9,35.0 A21,21 0 1,0 75.0,54.0"
+                  android:fillColor="#00000000"
+                  android:strokeColor="#BDBDBD"
+                  android:strokeWidth="10"
+                  android:strokeLineCap="round" />
+              <path
+                  android:pathData="M75.0,49.0 L57.0,52.6 L57.0,55.4 L75.0,59.0 Z M58.3,54 a1.3,1.3 0 1,0 -2.6,0 a1.3,1.3 0 1,0 2.6,0"
+                  android:fillColor="#BDBDBD" />
+              <path
+                  android:pathData="M45.0,31.7 L47.9,25.1 L56.8,22.1 M66.0,74.8 L64.1,81.7 L55.7,86.0 M50.9,36.3 L54.5,40.0 L57.6,43.1 M65.1,68.2 L60.1,66.6 L56.0,65.3"
+                  android:fillColor="#00000000"
+                  android:strokeColor="#BDBDBD"
+                  android:strokeWidth="4.2"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round" />
+              <path
+                  android:pathData="M76.0,41.1 L75.2,42.3 L74.1,43.4 L72.7,44.1 L71.1,44.5 L69.4,44.6 L67.7,44.3 L66.0,43.7 L64.4,42.8 L63.1,41.6 L62.1,40.3 L61.4,38.8 L61.0,37.3 L61.1,35.7 L61.5,34.3 L62.3,33.1 L63.4,32.1 L64.8,31.3 L66.4,30.9 L68.1,30.9 L69.9,31.1 L71.6,31.7 L73.1,32.6 L74.4,33.8 L75.5,35.1 L76.2,36.6 L76.5,38.2 L76.5,39.7 Z"
+                  android:fillColor="#BDBDBD" />
+              <path
+                  android:pathData="M67.8,42.0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0 M70.9,35.5 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0"
+                  android:fillColor="#232323" />
+          </vector>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#232323</color>
+              <color name="bg_dark">#1E1E1E</color>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/themes.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@drawable/splash_bg</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values-v31/themes.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@drawable/splash_bg</item>
+                  <item name="android:windowSplashScreenBackground">@color/bg_dark</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/drawable/splash_bg.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:drawable="@color/bg_dark" />
+              <item
+                  android:width="140dp"
+                  android:height="140dp"
+                  android:gravity="center"
+                  android:drawable="@drawable/ic_launcher_foreground" />
+          </layer-list>
           EOF
 
           cat > app/src/main/assets/ext/manifest.json <<'EOF'
@@ -4750,6 +4841,21 @@ jobs:
                   }
               }
 
+              // Same site as the reference tab: right below it. Other site: end of that site's group, or the end of the list.
+              private fun insertIndexFor(url: String, ref: BrowserTab? = current): Int {
+                  val key = keyOfUrl(url)
+                  if (ref != null && !ref.preview) {
+                      val ci = tabs.indexOf(ref)
+                      if (ci >= 0 && groupKeyOf(ref) == key) return ci + 1
+                  }
+                  var last = -1
+                  for (i in tabs.indices) {
+                      val x = tabs[i]
+                      if (!x.preview && groupKeyOf(x) == key) last = i
+                  }
+                  return if (last >= 0) last + 1 else tabs.size
+              }
+
               fun newTab(url: String, makeCurrent: Boolean = true, openerId: Int = 0): BrowserTab {
                   var opener = openerId
                   if (url.isNotBlank() && !url.startsWith("about:")) {
@@ -4767,7 +4873,7 @@ jobs:
                   counter += 1
                   val t = BrowserTab(counter, null, opener)
                   t.url = url
-                  tabs.add(t)
+                  tabs.add(insertIndexFor(url).coerceIn(0, tabs.size), t)
                   ensureLive(t, url)
                   if (makeCurrent || current == null) select(t)
                   enforceLimit()
@@ -4969,6 +5075,12 @@ jobs:
               fun keep(t: BrowserTab) {
                   t.preview = false
                   dedupe(t)
+                  val ref = openerOf(t) ?: current
+                  val i = tabs.indexOf(t)
+                  if (i >= 0) {
+                      tabs.removeAt(i)
+                      tabs.add(insertIndexFor(t.url, if (ref === t) null else ref).coerceIn(0, tabs.size), t)
+                  }
                   persist()
               }
 
@@ -5036,18 +5148,20 @@ jobs:
                           { bmp ->
                               try {
                                   if (bmp != null && bmp.width > 0 && bmp.height > 0) {
-                                      val side = minOf(bmp.width, bmp.height)
-                                      val sq = Bitmap.createBitmap(bmp, 0, 0, side, side)
-                                      val sc = Bitmap.createScaledBitmap(sq, 240, 240, true)
-                                      t.thumb = sc.asImageBitmap()
-                                      val f = thumbFile(t.id)
                                       Thread {
                                           try {
+                                              val side = minOf(bmp.width, bmp.height)
+                                              val sq = Bitmap.createBitmap(bmp, 0, 0, side, side)
+                                              val sc = Bitmap.createScaledBitmap(sq, 240, 240, true)
+                                              val ib = sc.asImageBitmap()
+                                              main.post { t.thumb = ib }
+                                              val f = thumbFile(t.id)
                                               java.io.FileOutputStream(f).use { out ->
                                                   sc.compress(Bitmap.CompressFormat.JPEG, 75, out)
                                               }
                                               Backup.schedule()
                                           } catch (e: Exception) {
+                                              Log.d("GreyScript", "thumb failed: " + e)
                                           }
                                       }.start()
                                   }
@@ -5836,7 +5950,7 @@ jobs:
                                       .background(BG)
                                       .pointerInput(Unit) { detectTapGestures { } }
                               ) {
-                                  when (screen) {
+                                  key(screen) { ScreenDeferred { when (screen) {
                                       "tabs" -> TabManagerScreen(
                                           tabs,
                                           onBack = { screen = "browser" },
@@ -5884,7 +5998,7 @@ jobs:
                                       "downloads" -> DownloadsScreen { screen = "browser" }
                                       "logs" -> LogScreen { screen = "browser" }
                                       else -> {}
-                                  }
+                                  } } }
                               }
                           }
                       }
@@ -6042,6 +6156,42 @@ jobs:
                       }
                   }
               )
+          }
+
+@Composable
+          fun ScreenSkeleton() {
+              Column(Modifier.fillMaxSize().background(BG)) {
+                  Row(
+                      Modifier.fillMaxWidth().height(HeaderH).background(Bar).padding(horizontal = 16.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Box(Modifier.size(24.dp).clip(RoundedCornerShape(6.dp)).background(Field))
+                      Spacer(Modifier.width(16.dp))
+                      Box(Modifier.width(120.dp).height(16.dp).clip(RoundedCornerShape(6.dp)).background(Field))
+                  }
+                  Column(Modifier.padding(12.dp)) {
+                      for (i in 0 until 6) {
+                          Box(Modifier.fillMaxWidth().height(60.dp).clip(RoundedCornerShape(12.dp)).background(Bar))
+                          Spacer(Modifier.height(10.dp))
+                      }
+                  }
+              }
+          }
+
+          // Shows a cheap background-only skeleton for the first frame, then builds the real screen and fades in.
+          @Composable
+          fun ScreenDeferred(content: @Composable () -> Unit) {
+              var started by remember { mutableStateOf(false) }
+              var ready by remember { mutableStateOf(false) }
+              LaunchedEffect(Unit) {
+                  started = true
+                  withFrameNanos { }
+                  ready = true
+              }
+              val a by animateFloatAsState(targetValue = if (started) 1f else 0f, animationSpec = tween(140), label = "screenFade")
+              Box(Modifier.fillMaxSize().graphicsLayer { alpha = a }) {
+                  if (ready) content() else ScreenSkeleton()
+              }
           }
 
           @Composable
@@ -8876,11 +9026,9 @@ jobs:
                   if (Downloads.items.isEmpty()) {
                       EmptyNote("No downloads yet. Use Save in the video list, Download in the long-press menu, or open a downloadable file.")
                   }
-                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                      for (d in Downloads.items) {
-                          key(d.id) {
-                              DlRow(d, onOpen = { openDownload(ctx, it) }, onDeleteFile = { fileTarget = it })
-                          }
+                  LazyColumn(Modifier.weight(1f)) {
+                      items(Downloads.items, key = { it.id }) { d ->
+                          DlRow(d, onOpen = { openDownload(ctx, it) }, onDeleteFile = { fileTarget = it })
                       }
                   }
               }
