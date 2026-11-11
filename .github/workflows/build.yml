@@ -6157,8 +6157,8 @@ jobs:
                   }
               )
           }
-
-@Composable
+          
+          @Composable
           fun ScreenSkeleton() {
               Column(Modifier.fillMaxSize().background(BG)) {
                   Row(
