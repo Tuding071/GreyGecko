@@ -5543,6 +5543,7 @@ jobs:
           import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.layout.onSizeChanged
+          import androidx.compose.ui.res.painterResource
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalDensity
           import androidx.compose.ui.platform.LocalFocusManager
@@ -5943,6 +5944,7 @@ jobs:
                               onDownloads = { screen = "downloads" },
                               onLogs = { screen = "logs" }
                           )
+                          StartupWarmup(tabs)
                           if (screen != "browser") {
                               Box(
                                   Modifier
@@ -6158,6 +6160,49 @@ jobs:
               )
           }
           
+          // Shows the gecko loading screen, builds every main screen once underneath it (so the first real
+          // open is already warm), then reveals the app.
+          @Composable
+          fun StartupWarmup(tabs: TabManager) {
+              var stage by remember { mutableStateOf(0) }
+              LaunchedEffect(Unit) {
+                  withFrameNanos { }
+                  stage = 1
+                  repeat(3) { withFrameNanos { } }
+                  stage = 2
+              }
+              if (stage < 2) {
+                  Box(
+                      Modifier
+                          .fillMaxSize()
+                          .background(BG)
+                          .pointerInput(Unit) { detectTapGestures { } }
+                  ) {
+                      if (stage == 1) {
+                          Box(Modifier.fillMaxSize()) { TabManagerScreen(tabs, { }, { }, { _ -> }) }
+                          Box(Modifier.fillMaxSize()) { HistoryScreen({ }, { _ -> }) }
+                          Box(Modifier.fillMaxSize()) { BookmarksScreen(tabs, { }, { _ -> }) }
+                          Box(Modifier.fillMaxSize()) { DownloadsScreen({ }) }
+                          Box(Modifier.fillMaxSize()) { ScriptsScreen({ }, { _ -> }, { }) }
+                          Box(Modifier.fillMaxSize()) { FiltersScreen({ }, { }) }
+                          Box(Modifier.fillMaxSize()) { ElementRulesScreen({ }) }
+                          Box(Modifier.fillMaxSize()) { GuideScreen({ }) }
+                          Box(Modifier.fillMaxSize()) { FilterGuideScreen({ }) }
+                      }
+                      Box(
+                          Modifier.fillMaxSize().background(BG),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Image(
+                              painter = painterResource(R.drawable.ic_launcher_foreground),
+                              contentDescription = null,
+                              modifier = Modifier.size(140.dp)
+                          )
+                      }
+                  }
+              }
+          }
+
           @Composable
           fun ScreenSkeleton() {
               Column(Modifier.fillMaxSize().background(BG)) {
