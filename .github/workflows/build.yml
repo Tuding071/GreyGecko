@@ -579,6 +579,7 @@ jobs:
           var APP = "browser";
           var libCache = {};
           var grabberOn = true;
+          var grabOnly = false;
           var lastCfg = 0;
           var reqHdr = {};
 
@@ -844,6 +845,7 @@ jobs:
             if (!sender.tab) { nlog("no sender.tab"); return Promise.resolve({}); }
             return native({ type: "get", url: msg.url, tabId: sender.tab.id }).then(function (res) {
               if (typeof res.grabber === "boolean") grabberOn = res.grabber;
+              if (typeof res.go === "boolean") grabOnly = res.go;
               if (typeof res.img === "boolean") blockImg = res.img;
               if (res.mute === true) browser.tabs.sendMessage(sender.tab.id, { type: "pick", cmd: "mute", on: true }).catch(function () {});
               if (typeof res.adv === "number" && res.adv !== adVer) adLoad().catch(function () {});
@@ -876,6 +878,7 @@ jobs:
           var AUDIO_EXT = /\.(mp3|m4a|opus|ogg|oga|wav|flac|weba)(\?|#|$)/i;
           var SKIP_EXT = /\.(ts|m4s|aac|vtt|webvtt|key|jpg|jpeg|png|gif|webp|svg|css|js|json|woff2?|ico)(\?|#|$)/i;
           var SEG_NAME = /(seg|segment|chunk|frag|fragment|init)[-_.]?\d*\.mp4/i;
+          var SEG_EXT = /\.(ts|m4s|cmfv|cmfa)(\?|#|$)/i;
 
           function domMedia(msg, sender) {
             if (!sender.tab || !grabberOn) return;
@@ -898,6 +901,7 @@ jobs:
             lastCfg = now;
             native({ type: "cfg" }).then(function (r) {
               if (r && typeof r.grabber === "boolean") grabberOn = r.grabber;
+              if (r && typeof r.go === "boolean") grabOnly = r.go;
             }).catch(function () {});
           }
 
@@ -927,6 +931,35 @@ jobs:
             reqHdr[d.requestId] = h;
           }
 
+          function grabCut(d) {
+            if (!grabOnly || !grabberOn || d.tabId < 0) return;
+            if (d.type === "main_frame" || d.type === "sub_frame") return;
+            var u = d.url;
+            if (SEG_EXT.test(u) || SEG_NAME.test(u)) return { cancel: true };
+            if (d.type !== "media") return;
+            if (/\.(m3u8|mpd)(\?|#|$)/i.test(u)) return;
+            var h = {};
+            var list = d.requestHeaders || [];
+            for (var i = 0; i < list.length; i++) {
+              var n = String(list[i].name).toLowerCase();
+              if (n === "referer") h["Referer"] = list[i].value;
+              else if (n === "cookie") h["Cookie"] = list[i].value;
+              else if (n === "user-agent") h["User-Agent"] = list[i].value;
+              else if (n === "origin") h["Origin"] = list[i].value;
+            }
+            nlog("grabber cut " + u);
+            native({
+              type: "video",
+              tabId: d.tabId,
+              url: u,
+              ctype: "",
+              size: -1,
+              kind: AUDIO_EXT.test(u) ? "audio" : "file",
+              headers: h
+            }).catch(function () {});
+            return { cancel: true };
+          }
+
           function onHeaders(d) {
             if (d.tabId < 0) return;
             if (!grabberOn) { refreshCfg(); return; }
@@ -946,11 +979,20 @@ jobs:
               }
             }
             var kind = classify(d.url, ct, d.type);
+            var cut = false;
+            if (grabOnly && d.type !== "main_frame") {
+              var lc = String(ct).toLowerCase();
+              if (SEG_EXT.test(d.url) || SEG_NAME.test(d.url) || lc.indexOf("mp2t") >= 0 || lc.indexOf("segment") >= 0) return { cancel: true };
+              if (kind === "file" || kind === "audio") cut = true;
+            }
             if (!kind) return;
             if (kind === "file" || kind === "audio") {
-              if (SEG_NAME.test(d.url)) return;
+              if (SEG_NAME.test(d.url)) return cut ? { cancel: true } : undefined;
               var minLen = kind === "audio" ? 102400 : 204800;
-              if (len >= 0 && len < minLen) { nlog("grabber small " + len + " " + d.url); return; }
+              if (len >= 0 && len < minLen) {
+                nlog("grabber small " + len + " " + d.url);
+                return cut ? { cancel: true } : undefined;
+              }
             }
             nlog("grabber " + kind + " " + d.url);
             native({
@@ -964,6 +1006,7 @@ jobs:
             }).then(function (r) {
               if (r && typeof r.grabber === "boolean") grabberOn = r.grabber;
             }).catch(function () {});
+            return cut ? { cancel: true } : undefined;
           }
 
           function cleanup(d) {
@@ -973,7 +1016,8 @@ jobs:
           try {
             var WR = { urls: ["<all_urls>"], types: ["main_frame", "sub_frame", "media", "xmlhttprequest", "other", "object"] };
             browser.webRequest.onSendHeaders.addListener(onSend, WR, ["requestHeaders"]);
-            browser.webRequest.onHeadersReceived.addListener(onHeaders, WR, ["responseHeaders"]);
+            browser.webRequest.onBeforeSendHeaders.addListener(grabCut, WR, ["requestHeaders", "blocking"]);
+            browser.webRequest.onHeadersReceived.addListener(onHeaders, WR, ["responseHeaders", "blocking"]);
             browser.webRequest.onCompleted.addListener(cleanup, WR);
             browser.webRequest.onErrorOccurred.addListener(cleanup, WR);
             nlog("grabber listeners ready");
@@ -1237,7 +1281,7 @@ jobs:
           var nport = null;
 
           function onPortMsg(m) {
-            if (m && m.type === "saver") { blockImg = !!m.img; return; }
+            if (m && m.type === "saver") { blockImg = !!m.img; if (typeof m.go === "boolean") grabOnly = m.go; return; }
             if (!m || m.type !== "pick") return;
             var tid = m.tabId;
             if (typeof tid !== "number" || tid < 0) return;
@@ -1882,21 +1926,32 @@ jobs:
           object Videos {
               @Volatile
               var enabled = true
+              @Volatile
+              var grabOnly = false
               var tabs: TabManager? = null
               private val pending = HashMap<Int, MutableList<VideoItem>>()
               private val pendingSeen = HashMap<Int, HashSet<String>>()
               private val main = Handler(Looper.getMainLooper())
 
               fun load(ctx: Context) {
-                  enabled = ctx.applicationContext
-                      .getSharedPreferences("browser", Context.MODE_PRIVATE)
-                      .getBoolean("grabber", true)
+                  val sp = ctx.applicationContext.getSharedPreferences("browser", Context.MODE_PRIVATE)
+                  enabled = sp.getBoolean("grabber", true)
+                  grabOnly = sp.getBoolean("grabonly", false)
               }
 
               fun setGrabber(v: Boolean) {
                   enabled = v
                   Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
                       .edit().putBoolean("grabber", v).apply()
+                  Saver.push()
+              }
+
+              // Grab only: video and audio requests are cancelled, the links are still collected.
+              fun applyGrabOnly(v: Boolean) {
+                  grabOnly = v
+                  Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+                      .edit().putBoolean("grabonly", v).apply()
+                  Saver.push()
               }
 
               private fun tabFor(extId: Int): BrowserTab? = tabs?.tabs?.firstOrNull { it.extId == extId }
@@ -2106,6 +2161,8 @@ jobs:
               var limitKbps by mutableStateOf(0)
               var concurrent by mutableStateOf(2)
               var maxRetries by mutableStateOf(2)
+              var askBefore by mutableStateOf(true)
+              val askQueue = mutableStateListOf<DlItem>()
               private val qLock = Any()
               private val waiting = ArrayList<DlItem>()
               private var inFlight = 0
@@ -2176,6 +2233,7 @@ jobs:
                   limitKbps = sp().getInt("dllimit", 0)
                   concurrent = sp().getInt("dlconc", 2)
                   maxRetries = sp().getInt("dlretry", 2)
+                  askBefore = sp().getBoolean("dlask", true)
                   try {
                       val arr = JSONArray(sp().getString("downloads", "[]") ?: "[]")
                       for (i in 0 until arr.length()) {
@@ -2304,6 +2362,41 @@ jobs:
 
               private fun add(d: DlItem) {
                   main.post {
+                      if (askBefore) askQueue.add(d) else addNow(d)
+                  }
+              }
+
+              fun confirmAsk(d: DlItem, name: String) {
+                  askQueue.remove(d)
+                  var n = name.trim()
+                  if (d.kind == "hls" || d.kind == "dash") {
+                      for (e in listOf(".mp4", ".ts", ".mkv", ".m4a", ".aac", ".mp3", ".webm")) {
+                          if (n.lowercase().endsWith(e)) {
+                              n = n.substring(0, n.length - e.length)
+                              break
+                          }
+                      }
+                  }
+                  if (n.isNotBlank()) d.name = clean(n)
+                  addNow(d)
+              }
+
+              fun cancelAskItem(d: DlItem) {
+                  askQueue.remove(d)
+                  try {
+                      d.stream?.close()
+                  } catch (e: Exception) {
+                  }
+                  d.stream = null
+              }
+
+              fun applyAsk(v: Boolean) {
+                  askBefore = v
+                  sp().edit().putBoolean("dlask", v).apply()
+              }
+
+              private fun addNow(d: DlItem) {
+                  run {
                       items.add(0, d)
                       while (items.size > 100) {
                           val last = items[items.size - 1]
@@ -4498,6 +4591,7 @@ jobs:
                       val o = JSONObject()
                       o.put("type", "saver")
                       o.put("img", images())
+                      o.put("go", Videos.enabled && Videos.grabOnly)
                       p.postMessage(o)
                   } catch (e: Exception) {
                   }
@@ -5652,6 +5746,7 @@ jobs:
                                   }
                                   reply.put("scripts", arr)
                                   reply.put("grabber", Videos.enabled)
+                                  reply.put("go", Videos.enabled && Videos.grabOnly)
                                   reply.put("adv", Filters.ver)
                                   reply.put("img", Saver.images())
                                   reply.put("mute", Saver.mute())
@@ -5660,7 +5755,10 @@ jobs:
                                   reply.put("hide", JSONArray(HideRules.forPage(hostName, pathName)))
                                   Log.d("GreyScript", "scripts for " + url + ": " + arr.length())
                               }
-                              "cfg" -> reply.put("grabber", Videos.enabled)
+                              "cfg" -> {
+                                  reply.put("grabber", Videos.enabled)
+                                  reply.put("go", Videos.enabled && Videos.grabOnly)
+                              }
                               "adcfg" -> {
                                   reply.put("on", Filters.isOn())
                                   reply.put("cos", Filters.cosOn())
@@ -5896,6 +5994,7 @@ jobs:
                   var editId by remember { mutableStateOf<String?>(null) }
                   var startEdit by remember { mutableStateOf(false) }
                   DownloadAsk()
+                  DownloadConfirmDialog()
                   ChoiceDialog(tabs)
                   JsDialog(tabs)
                   val actCtx = LocalContext.current
@@ -6313,6 +6412,7 @@ jobs:
               var editing by remember { mutableStateOf(false) }
               var text by remember { mutableStateOf(TextFieldValue("")) }
               var grabberOn by remember { mutableStateOf(Videos.enabled) }
+              var grabOnly by remember { mutableStateOf(Videos.grabOnly) }
               var blockImg by remember { mutableStateOf(Saver.images()) }
               var blockPlay by remember { mutableStateOf(Saver.autoplay()) }
               var blockAudio by remember { mutableStateOf(Saver.mute()) }
@@ -6475,6 +6575,33 @@ jobs:
                                       onClick = {
                                           grabberOn = !grabberOn
                                           Videos.setGrabber(grabberOn)
+                                      }
+                                  )
+
+                                  DropdownMenuItem(
+                                      enabled = grabberOn,
+                                      text = {
+                                          Column {
+                                              Text("Grab only", color = if (grabberOn) Color.White else Color(0xFF777777))
+                                              Text("Blocks video, keeps the links", color = if (grabberOn) Soft else Color(0xFF666666), fontSize = 11.sp)
+                                          }
+                                      },
+                                      trailingIcon = {
+                                          Switch(
+                                              checked = grabOnly,
+                                              enabled = grabberOn,
+                                              onCheckedChange = { v ->
+                                                  grabOnly = v
+                                                  Videos.applyGrabOnly(v)
+                                                  toast(ctx, "Reload the page")
+                                              },
+                                              colors = switchColors()
+                                          )
+                                      },
+                                      onClick = {
+                                          grabOnly = !grabOnly
+                                          Videos.applyGrabOnly(grabOnly)
+                                          toast(ctx, "Reload the page")
                                       }
                                   )
 
@@ -6744,7 +6871,7 @@ jobs:
                               MenuRow("Download") {
                                   tabs.ctxMenu = null
                                   Downloads.enqueueUrl(cm.url, tabs.current?.url, null)
-                                  toast(ctx, "Added to downloads")
+                                  if (!Downloads.askBefore) toast(ctx, "Added to downloads")
                               }
                               MenuRow("Copy link") {
                                   tabs.ctxMenu = null
@@ -6871,80 +6998,71 @@ jobs:
           ) {
               val ctx = LocalContext.current
               val shape = RoundedCornerShape(topStart = 12.dp, bottomStart = 12.dp)
-              if (!open) {
-                  Column(
-                      modifier
-                          .clip(shape)
-                          .background(Bar)
-                          .border(0.5.dp, Color(0xFF555555), shape)
-                          .clickable { onToggle() }
-                          .padding(horizontal = 10.dp, vertical = 12.dp),
-                      horizontalAlignment = Alignment.CenterHorizontally
-                  ) {
-                      Text("↓", color = Color.White, fontSize = 18.sp)
-                      Text(videos.size.toString(), color = Color.White, fontSize = 12.sp)
-                  }
-              } else {
-                  Column(
-                      modifier
-                          .fillMaxWidth(0.82f)
-                          .heightIn(max = 380.dp)
-                          .clip(shape)
-                          .background(Bar)
-                          .border(0.5.dp, Color(0xFF555555), shape)
-                  ) {
-                      Row(
-                          Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
-                          verticalAlignment = Alignment.CenterVertically
-                      ) {
+              Column(
+                  modifier
+                      .clip(shape)
+                      .background(Bar)
+                      .border(0.5.dp, Color(0xFF555555), shape)
+                      .clickable { onToggle() }
+                      .padding(horizontal = 10.dp, vertical = 12.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Text("↓", color = Color.White, fontSize = 18.sp)
+                  Text(videos.size.toString(), color = Color.White, fontSize = 12.sp)
+              }
+              if (open) {
+                  AlertDialog(
+                      onDismissRequest = onToggle,
+                      containerColor = Bar,
+                      title = {
                           Text(
-                              "Videos (" + videos.size + ")",
+                              "Download · " + videos.size + (if (videos.size == 1) " link" else " links"),
                               color = Color.White,
-                              fontSize = 14.sp,
-                              modifier = Modifier.weight(1f)
+                              fontSize = 17.sp
                           )
-                          TextButton(onClick = onToggle) { Text("×", color = Soft, fontSize = 20.sp) }
-                      }
-                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
-                      Column(Modifier.verticalScroll(rememberScrollState())) {
-                          for (v in videos) {
-                              VideoRow(v, ctx, title, videos)
+                      },
+                      text = {
+                          Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                              for (v in videos) {
+                                  VideoRow(v, ctx, title, videos, onToggle)
+                              }
                           }
+                      },
+                      confirmButton = {},
+                      dismissButton = {
+                          TextButton(onClick = onToggle) { Text("Close", color = Color.White) }
                       }
-                  }
+                  )
               }
           }
 
           @Composable
-          fun VideoRow(v: VideoItem, ctx: Context, title: String, all: List<VideoItem>) {
-              Row(
-                  Modifier.fillMaxWidth().padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 2.dp),
-                  verticalAlignment = Alignment.CenterVertically
-              ) {
-                  Column(Modifier.weight(1f)) {
-                      Text(v.label, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                      Text(v.sub, color = Soft, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+          fun VideoRow(v: VideoItem, ctx: Context, title: String, all: List<VideoItem>, onClose: () -> Unit) {
+              Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                  Text(v.label, color = Color.White, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                  Text(v.sub, color = Soft, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                      TextButton(
+                          onClick = { toast(ctx, Handoff.send(ctx, v)) },
+                          contentPadding = PaddingValues(horizontal = 10.dp)
+                      ) { Text("Send", color = Soft, fontSize = 13.sp) }
+                      TextButton(
+                          onClick = {
+                              copyText(ctx, v.url)
+                              toast(ctx, "Link copied")
+                          },
+                          contentPadding = PaddingValues(horizontal = 10.dp)
+                      ) { Text("Copy", color = Soft, fontSize = 13.sp) }
+                      TextButton(
+                          onClick = {
+                              Downloads.enqueueVideo(v, title, all)
+                              if (Downloads.askBefore) onClose() else toast(ctx, "Added to downloads")
+                          },
+                          contentPadding = PaddingValues(horizontal = 10.dp)
+                      ) { Text("Save", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                   }
-                  TextButton(
-                      onClick = {
-                          Downloads.enqueueVideo(v, title, all)
-                          toast(ctx, "Added to downloads")
-                      },
-                      contentPadding = PaddingValues(horizontal = 8.dp)
-                  ) { Text("Save", color = Color.White, fontSize = 13.sp) }
-                  TextButton(
-                  onClick = { toast(ctx, Handoff.send(ctx, v)) },
-                      contentPadding = PaddingValues(horizontal = 8.dp)
-                  ) { Text("Send", color = Color.White, fontSize = 13.sp) }
-                  TextButton(
-                      onClick = {
-                          copyText(ctx, v.url)
-                          toast(ctx, "Link copied")
-                      },
-                      contentPadding = PaddingValues(horizontal = 8.dp)
-                  ) { Text("Copy", color = Soft, fontSize = 13.sp) }
+                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
               }
-              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
           }
 
           @Composable
@@ -8576,6 +8694,66 @@ jobs:
           }
 
           @Composable
+          fun DownloadConfirmDialog() {
+              val d = Downloads.askQueue.firstOrNull() ?: return
+              var name by remember(d) { mutableStateOf(d.name) }
+              val kindText = when (d.kind) {
+                  "hls" -> "HLS stream"
+                  "dash" -> "DASH stream"
+                  else -> "File"
+              }
+              val sizeText = if (d.total > 0L) " · " + fmtSize(d.total) else ""
+              val host = hostOf(d.url)
+              AlertDialog(
+                  onDismissRequest = { Downloads.cancelAskItem(d) },
+                  containerColor = Bar,
+                  title = { Text("Download", color = Color.White, fontSize = 18.sp) },
+                  text = {
+                      Column(Modifier.verticalScroll(rememberScrollState())) {
+                          Text("File name", color = Soft, fontSize = 11.sp)
+                          Spacer(Modifier.height(4.dp))
+                          OutlinedTextField(
+                              value = name,
+                              onValueChange = { name = it },
+                              colors = fieldColors(),
+                              placeholder = { Text("Name from the server", color = Color(0xFF999999)) },
+                              maxLines = 4,
+                              modifier = Modifier.fillMaxWidth()
+                          )
+                          Spacer(Modifier.height(10.dp))
+                          Text(kindText + sizeText, color = Color.White, fontSize = 13.sp)
+                          if (host.isNotBlank()) Text("From " + host, color = Soft, fontSize = 12.sp)
+                          Text(d.url, color = Color(0xFF777777), fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                          Spacer(Modifier.height(6.dp))
+                          Text(
+                              "Saving to: " + Downloads.folderState.ifBlank { "you will pick a folder next" },
+                              color = Soft,
+                              fontSize = 11.sp
+                          )
+                          if (Downloads.askQueue.size > 1) {
+                              Text((Downloads.askQueue.size - 1).toString() + " more waiting", color = Soft, fontSize = 11.sp)
+                          }
+                          Spacer(Modifier.height(8.dp))
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text("Ask before download", color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                              Switch(
+                                  checked = Downloads.askBefore,
+                                  onCheckedChange = { Downloads.applyAsk(it) },
+                                  colors = switchColors()
+                              )
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = { Downloads.confirmAsk(d, name) }) { Text("Download", color = Color.White) }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = { Downloads.cancelAskItem(d) }) { Text("Cancel", color = Color.White) }
+                  }
+              )
+          }
+
+          @Composable
           fun DownloadAsk() {
               val ctx = LocalContext.current
               val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -9050,6 +9228,17 @@ jobs:
                               DropdownMenuItem(
                                   text = { Text("Delete all from list", color = Danger) },
                                   onClick = { menu = false; confirmAll = true }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Ask before download", color = Color.White) },
+                                  trailingIcon = {
+                                      Switch(
+                                          checked = Downloads.askBefore,
+                                          onCheckedChange = { Downloads.applyAsk(it) },
+                                          colors = switchColors()
+                                      )
+                                  },
+                                  onClick = { Downloads.applyAsk(!Downloads.askBefore) }
                               )
                               DropdownMenuItem(
                                   text = { Text(if (Downloads.maxRetries > 0) "Auto retry: " + Downloads.maxRetries + "x" else "Auto retry: Off", color = Color.White) },
