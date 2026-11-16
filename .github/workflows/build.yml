@@ -2428,6 +2428,22 @@ jobs:
                       save()
                       return
                   }
+                  val fdir = folder()
+                  if (fdir != null && d.name.isNotBlank()) {
+                      val probe = if (d.kind == "hls" || d.kind == "dash") clean(d.name) + ".mp4" else clean(d.name)
+                      if (nameTaken(d, fdir, probe)) {
+                          d.name = clean(d.name)
+                          d.state = DL_FAILED
+                          d.error = "Same filename"
+                          try {
+                              d.stream?.close()
+                          } catch (e: Exception) {
+                          }
+                          d.stream = null
+                          save()
+                          return
+                      }
+                  }
                   d.cancel = false
                   d.paused = false
                   d.started = false
@@ -2441,6 +2457,12 @@ jobs:
                   save()
                   pump()
               }
+
+              fun previewPlan(url: String, h: Map<String, String>): SegPlan = parseHlsPlan(url, h)
+
+              fun bytesFor(url: String, h: Map<String, String>): ByteArray = getBytes(url, h, null)
+
+              fun segBytes(s: HlsSeg, h: Map<String, String>, keys: HashMap<String, ByteArray>): ByteArray = fetchSeg(s, h, keys, null)
 
               fun retry(d: DlItem) {
                   if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) return
@@ -3048,7 +3070,7 @@ jobs:
                   return b
               }
 
-              private fun fetchSeg(s: HlsSeg, h: Map<String, String>, keys: HashMap<String, ByteArray>, d: DlItem): ByteArray {
+              private fun fetchSeg(s: HlsSeg, h: Map<String, String>, keys: HashMap<String, ByteArray>, d: DlItem?): ByteArray {
                   var lastErr: Exception? = null
                   for (attempt in 0 until 3) {
                       try {
@@ -3813,6 +3835,121 @@ jobs:
                   }
               }
           }
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/Preview.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.graphics.Bitmap
+          import android.media.MediaMetadataRetriever
+          import android.util.Log
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import java.io.File
+
+          // Grabs up to 5 frames from a video link without downloading the whole file.
+          object Preview {
+              private const val N = 5
+
+              private fun scaled(b: Bitmap): ImageBitmap {
+                  val w = 480
+                  if (b.width <= w) return b.asImageBitmap()
+                  val h = (b.height * (w.toFloat() / b.width.toFloat())).toInt().coerceAtLeast(1)
+                  return Bitmap.createScaledBitmap(b, w, h, true).asImageBitmap()
+              }
+
+              private fun fromSource(r: MediaMetadataRetriever, onFrame: (ImageBitmap) -> Unit): Int {
+                  var got = 0
+                  val durMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                  for (i in 0 until N) {
+                      val t = if (durMs > 0L) durMs * 1000L * (2 * i + 1) / (2 * N) else i * 2000000L
+                      val b = try {
+                          r.getFrameAtTime(t, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                      } catch (e: Exception) {
+                          null
+                      }
+                      if (b != null) {
+                          onFrame(scaled(b))
+                          got++
+                      }
+                  }
+                  return got
+              }
+
+              private fun fromUrl(url: String, h: Map<String, String>, onFrame: (ImageBitmap) -> Unit): Int {
+                  val r = MediaMetadataRetriever()
+                  try {
+                      r.setDataSource(url, HashMap(h))
+                      return fromSource(r, onFrame)
+                  } finally {
+                      try {
+                          r.release()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun fromPlan(plan: SegPlan, h: Map<String, String>, tag: String, onFrame: (ImageBitmap) -> Unit): Int {
+                  val n = plan.segs.size
+                  if (n == 0) return 0
+                  val keys = HashMap<String, ByteArray>()
+                  val initBytes = plan.init?.let { Downloads.bytesFor(it, h) }
+                  val dir = File(Gecko.appCtx.cacheDir, "pv")
+                  dir.mkdirs()
+                  var got = 0
+                  for (i in 0 until N) {
+                      val idx = minOf(n - 1, n * (2 * i + 1) / (2 * N))
+                      val f = File(dir, tag + i + "." + plan.ext)
+                      try {
+                          val seg = Downloads.segBytes(plan.segs[idx], h, keys)
+                          f.outputStream().use { o ->
+                              if (initBytes != null) o.write(initBytes)
+                              o.write(seg)
+                          }
+                          val r = MediaMetadataRetriever()
+                          try {
+                              r.setDataSource(f.path)
+                              val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                              val b = r.getFrameAtTime(dur * 500L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                              if (b != null) {
+                                  onFrame(scaled(b))
+                                  got++
+                              }
+                          } finally {
+                              try {
+                                  r.release()
+                              } catch (e: Exception) {
+                              }
+                          }
+                      } catch (e: Exception) {
+                          Log.d("GreyScript", "preview segment failed: " + e)
+                      } finally {
+                          f.delete()
+                      }
+                  }
+                  return got
+              }
+
+              fun run(v: VideoItem, all: List<VideoItem>, onFrame: (ImageBitmap) -> Unit): Int {
+                  val h = HashMap<String, String>(v.headers)
+                  if (h["User-Agent"].isNullOrBlank()) h["User-Agent"] = DEFAULT_UA
+                  if (v.kind == "HLS") {
+                      val low = all.filter { it.kind == "HLS" && !it.label.startsWith("Audio") && it.rank > 0L }.minByOrNull { it.rank }
+                      val plan = Downloads.previewPlan(low?.url ?: v.url, h)
+                      return fromPlan(plan, h, "h", onFrame)
+                  }
+                  if (v.kind == "DASH") {
+                      val reps = parseMpd(v.url, fetchText(v.url, h))
+                      val vid = reps.filter { it.kind == "video" }.minByOrNull { it.bw } ?: throw Exception("No video in this manifest")
+                      val single = vid.single
+                      if (single != null) return fromUrl(single, h, onFrame)
+                      val plan = vid.plan ?: throw Exception("No segments")
+                      return fromPlan(plan, h, "d", onFrame)
+                  }
+                  return fromUrl(v.url, h, onFrame)
+              }
+          }
+
           EOF
 
           cat > app/src/main/java/com/grey/gecko/Backup.kt <<'EOF'
@@ -5590,7 +5727,14 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.activity.enableEdgeToEdge
+          import androidx.compose.animation.AnimatedContent
+          import androidx.compose.animation.ContentTransform
+          import androidx.compose.animation.EnterTransition
+          import androidx.compose.animation.ExitTransition
           import androidx.compose.animation.animateColorAsState
+          import androidx.compose.animation.fadeOut
+          import androidx.compose.animation.slideInHorizontally
+          import androidx.compose.animation.slideOutHorizontally
           import androidx.compose.animation.core.RepeatMode
           import androidx.compose.animation.core.animateFloat
           import androidx.compose.animation.core.animateFloatAsState
@@ -5631,6 +5775,7 @@ jobs:
           import androidx.compose.ui.focus.onFocusChanged
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.graphics.ImageBitmap
           import androidx.compose.ui.graphics.graphicsLayer
           import androidx.compose.ui.hapticfeedback.HapticFeedbackType
           import androidx.compose.ui.input.pointer.PointerEventPass
@@ -5993,6 +6138,8 @@ jobs:
                   var screen by remember { mutableStateOf("browser") }
                   var editId by remember { mutableStateOf<String?>(null) }
                   var startEdit by remember { mutableStateOf(false) }
+                  val navFade = remember { booleanArrayOf(false) }
+                  LaunchedEffect(screen) { navFade[0] = false }
                   DownloadAsk()
                   DownloadConfirmDialog()
                   ChoiceDialog(tabs)
@@ -6044,23 +6191,34 @@ jobs:
                               onLogs = { screen = "logs" }
                           )
                           StartupWarmup(tabs)
-                          if (screen != "browser") {
-                              Box(
-                                  Modifier
-                                      .fillMaxSize()
-                                      .background(BG)
-                                      .pointerInput(Unit) { detectTapGestures { } }
-                              ) {
-                                  key(screen) { ScreenDeferred { when (screen) {
+                          AnimatedContent(
+                              targetState = screen,
+                              modifier = Modifier.fillMaxSize(),
+                              transitionSpec = { screenTransition(initialState, targetState, navFade[0]) },
+                              label = "screens"
+                          ) { sc ->
+                              if (sc == "browser") {
+                                  Box(Modifier.fillMaxSize())
+                              } else {
+                                  Box(
+                                      Modifier
+                                          .fillMaxSize()
+                                          .background(BG)
+                                          .pointerInput(Unit) { detectTapGestures { } }
+                                  ) {
+                                      ScreenDeferred {
+                                          when (sc) {
                                       "tabs" -> TabManagerScreen(
                                           tabs,
                                           onBack = { screen = "browser" },
                                           onNewTab = {
+                                              navFade[0] = true
                                               tabs.home = true
                                               startEdit = true
                                               screen = "browser"
                                           },
                                           onSelect = { t ->
+                                          navFade[0] = true
                                           tabs.select(t)
                                           tabs.home = false
                                           screen = "browser"
@@ -6099,12 +6257,18 @@ jobs:
                                       "downloads" -> DownloadsScreen { screen = "browser" }
                                       "logs" -> LogScreen { screen = "browser" }
                                       else -> {}
-                                  } } }
+                                          }
+                                      }
+                                  }
                               }
                           }
                       }
                   }
               }
+          }
+
+          object ScriptsRev {
+              var n by mutableStateOf(0)
           }
 
           class ChoiceRow(val c: GeckoSession.PromptDelegate.ChoicePrompt.Choice, val header: Boolean, val indent: Boolean)
@@ -6302,6 +6466,37 @@ jobs:
               }
           }
 
+          fun screenDepth(s: String): Int = when (s) {
+              "browser" -> 0
+              "guide", "editor", "filterguide" -> 2
+              else -> 1
+          }
+
+          // Fast slide / fade motion between screens (about 0.16 to 0.19 seconds, plain transforms only).
+          fun screenTransition(from: String, to: String, fade: Boolean): ContentTransform {
+              if (to == "tabs" && from == "browser") {
+                  return ContentTransform(slideInHorizontally(tween(190)) { -it }, ExitTransition.None, 0f, null)
+              }
+              if (from == "tabs" && to == "browser") {
+                  val out: ExitTransition = if (fade) fadeOut(tween(140)) else slideOutHorizontally(tween(160)) { -it }
+                  return ContentTransform(EnterTransition.None, out, -1f, null)
+              }
+              if (screenDepth(to) > screenDepth(from)) {
+                  return ContentTransform(
+                      slideInHorizontally(tween(190)) { it },
+                      slideOutHorizontally(tween(190)) { -it / 4 },
+                      0f,
+                      null
+                  )
+              }
+              return ContentTransform(
+                  slideInHorizontally(tween(160)) { -it / 4 },
+                  slideOutHorizontally(tween(160)) { it },
+                  -1f,
+                  null
+              )
+          }
+
           @Composable
           fun ScreenSkeleton() {
               Column(Modifier.fillMaxSize().background(BG)) {
@@ -6325,15 +6520,12 @@ jobs:
           // Shows a cheap background-only skeleton for the first frame, then builds the real screen and fades in.
           @Composable
           fun ScreenDeferred(content: @Composable () -> Unit) {
-              var started by remember { mutableStateOf(false) }
               var ready by remember { mutableStateOf(false) }
               LaunchedEffect(Unit) {
-                  started = true
                   withFrameNanos { }
                   ready = true
               }
-              val a by animateFloatAsState(targetValue = if (started) 1f else 0f, animationSpec = tween(140), label = "screenFade")
-              Box(Modifier.fillMaxSize().graphicsLayer { alpha = a }) {
+              Box(Modifier.fillMaxSize()) {
                   if (ready) content() else ScreenSkeleton()
               }
           }
@@ -6998,6 +7190,7 @@ jobs:
           ) {
               val ctx = LocalContext.current
               val shape = RoundedCornerShape(topStart = 12.dp, bottomStart = 12.dp)
+              var previewItem by remember { mutableStateOf<VideoItem?>(null) }
               Column(
                   modifier
                       .clip(shape)
@@ -7024,7 +7217,7 @@ jobs:
                       text = {
                           Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
                               for (v in videos) {
-                                  VideoRow(v, ctx, title, videos, onToggle)
+                                  VideoRow(v, ctx, title, videos, onToggle) { previewItem = it }
                               }
                           }
                       },
@@ -7034,18 +7227,32 @@ jobs:
                       }
                   )
               }
+              val pv = previewItem
+              if (pv != null) {
+                  PreviewDialog(pv, videos) { previewItem = null }
+              }
           }
 
           @Composable
-          fun VideoRow(v: VideoItem, ctx: Context, title: String, all: List<VideoItem>, onClose: () -> Unit) {
+          fun VideoRow(
+              v: VideoItem,
+              ctx: Context,
+              title: String,
+              all: List<VideoItem>,
+              onClose: () -> Unit,
+              onPreview: (VideoItem) -> Unit
+          ) {
+              val isVideo = v.kind != "AUDIO" && !v.label.startsWith("Audio")
               Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
                   Text(v.label, color = Color.White, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                   Text(v.sub, color = Soft, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                   Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                      TextButton(
-                          onClick = { toast(ctx, Handoff.send(ctx, v)) },
-                          contentPadding = PaddingValues(horizontal = 10.dp)
-                      ) { Text("Send", color = Soft, fontSize = 13.sp) }
+                      if (isVideo) {
+                          TextButton(
+                              onClick = { onPreview(v) },
+                              contentPadding = PaddingValues(horizontal = 10.dp)
+                          ) { Text("Preview", color = Soft, fontSize = 13.sp) }
+                      }
                       TextButton(
                           onClick = {
                               copyText(ctx, v.url)
@@ -7063,6 +7270,85 @@ jobs:
                   }
                   Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF3A3A3A)))
               }
+          }
+
+          @Composable
+          fun PreviewDialog(v: VideoItem, all: List<VideoItem>, onClose: () -> Unit) {
+              val frames = remember(v) { mutableStateListOf<ImageBitmap>() }
+              var loading by remember(v) { mutableStateOf(true) }
+              var err by remember(v) { mutableStateOf("") }
+              var idx by remember(v) { mutableStateOf(0) }
+              LaunchedEffect(v) {
+                  val r = withContext(Dispatchers.IO) {
+                      try {
+                          Preview.run(v, all) { b -> frames.add(b) }
+                          ""
+                      } catch (e: Exception) {
+                          e.message ?: "Preview failed"
+                      }
+                  }
+                  loading = false
+                  if (frames.isEmpty()) err = if (r.isBlank()) "No frames could be read from this link" else r
+              }
+              LaunchedEffect(frames.size) {
+                  while (true) {
+                      delay(1100)
+                      if (frames.size > 1) idx = (idx + 1) % frames.size
+                  }
+              }
+              AlertDialog(
+                  onDismissRequest = onClose,
+                  containerColor = Bar,
+                  title = { Text("Preview", color = Color.White, fontSize = 17.sp) },
+                  text = {
+                      Column {
+                          Box(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .aspectRatio(16f / 9f)
+                                  .clip(RoundedCornerShape(10.dp))
+                                  .background(Field),
+                              contentAlignment = Alignment.Center
+                          ) {
+                              if (frames.isNotEmpty()) {
+                                  Image(
+                                      bitmap = frames[idx % frames.size],
+                                      contentDescription = null,
+                                      contentScale = ContentScale.Fit,
+                                      modifier = Modifier.fillMaxSize()
+                                  )
+                              } else if (loading) {
+                                  CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(28.dp))
+                              } else {
+                                  Text(err, color = Soft, fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(12.dp))
+                              }
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                              for (i in 0 until 5) {
+                                  val cur = frames.isNotEmpty() && i == idx % frames.size
+                                  Box(
+                                      Modifier
+                                          .padding(horizontal = 3.dp)
+                                          .size(7.dp)
+                                          .clip(CircleShape)
+                                          .background(if (cur) Color.White else if (i < frames.size) Color(0xFF777777) else Color(0xFF444444))
+                                  )
+                              }
+                          }
+                          Spacer(Modifier.height(6.dp))
+                          Text(
+                              if (loading) "Loading frames… " + frames.size + "/5" else frames.size.toString() + " frames",
+                              color = Soft,
+                              fontSize = 11.sp,
+                              modifier = Modifier.fillMaxWidth(),
+                              textAlign = TextAlign.Center
+                          )
+                      }
+                  },
+                  confirmButton = {},
+                  dismissButton = { TextButton(onClick = onClose) { Text("Close", color = Color.White) } }
+              )
           }
 
           @Composable
@@ -7771,7 +8057,7 @@ jobs:
           @Composable
           fun ScriptsScreen(onBack: () -> Unit, onEdit: (String?) -> Unit, onGuide: () -> Unit) {
               val scope = rememberCoroutineScope()
-              var scripts by remember { mutableStateOf(Store.load()) }
+              var scripts by remember(ScriptsRev.n) { mutableStateOf(Store.load()) }
               var status by remember { mutableStateOf("") }
               var busy by remember { mutableStateOf(false) }
               var showImport by remember { mutableStateOf(false) }
@@ -8016,6 +8302,7 @@ jobs:
                       target.remoteVersion = remoteVer
                   }
                   Store.save(list)
+                  ScriptsRev.n = ScriptsRev.n + 1
                   savedCode = code
                   savedEnabled = enabled
                   savedSrc = srcUrl
@@ -8182,6 +8469,7 @@ jobs:
                               showDelete = false
                               val sid = curId
                               if (sid != null) Store.remove(sid)
+                              ScriptsRev.n = ScriptsRev.n + 1
                               onBack()
                           }) { Text("Delete", color = Danger) }
                       },
@@ -8720,6 +9008,14 @@ jobs:
                               maxLines = 4,
                               modifier = Modifier.fillMaxWidth()
                           )
+                          val clash = remember(name, Downloads.folderState) {
+                              val nm = Downloads.clean(name.trim().ifBlank { d.name })
+                              val probe = if (d.kind == "hls" || d.kind == "dash") nm + ".mp4" else nm
+                              Downloads.folderState.isNotBlank() && name.isNotBlank() && java.io.File(Downloads.folderState, probe).exists()
+                          }
+                          if (clash) {
+                              Text("A file with this name already exists. This download will fail.", color = Danger, fontSize = 11.sp)
+                          }
                           Spacer(Modifier.height(10.dp))
                           Text(kindText + sizeText, color = Color.White, fontSize = 13.sp)
                           if (host.isNotBlank()) Text("From " + host, color = Soft, fontSize = 12.sp)
@@ -8882,7 +9178,7 @@ jobs:
               val c1 = if (done) (if (doneSize > 0L) fmtSize(doneSize) else fmtSize(d.done)) else if (queued) "—" else dlPctText(d)
               val c2 = when (st) {
                   DL_QUEUED -> "Queued"
-                  DL_RUNNING -> if (d.speed > 0L) fmtSpeed(d.speed) else "Starting…"
+                  DL_RUNNING -> if (d.speed > 0L) fmtSpeed(d.speed) else if (d.done > 0L) "Downloading" else "Connecting…"
                   DL_PAUSED -> "Paused"
                   DL_DONE -> "Finished"
                   DL_FAILED -> "Failed"
@@ -8892,6 +9188,7 @@ jobs:
               val msg: String? = when {
                   failed -> if (d.error.isBlank()) "Failed" else "Failed: " + d.error
                   (running || done) && d.note.isNotBlank() -> d.note
+                  queued -> "Waiting to start"
                   else -> null
               }
               Row(Modifier.fillMaxWidth().heightIn(min = 68.dp).height(IntrinsicSize.Min)) {
