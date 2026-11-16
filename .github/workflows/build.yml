@@ -2801,6 +2801,7 @@ jobs:
 
               private fun nameTaken(d: DlItem, dir: File, name: String): Boolean {
                   val f = File(dir, name)
+                  Log.d("GreyScript", "name check " + f.path + " exists=" + f.exists())
                   if (f.exists()) return true
                   for (o in ArrayList(items)) {
                       if (o !== d && o.path == f.path && (o.state == DL_RUNNING || o.state == DL_QUEUED || o.state == DL_PAUSED)) return true
@@ -5727,14 +5728,7 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.activity.enableEdgeToEdge
-          import androidx.compose.animation.AnimatedContent
-          import androidx.compose.animation.ContentTransform
-          import androidx.compose.animation.EnterTransition
-          import androidx.compose.animation.ExitTransition
           import androidx.compose.animation.animateColorAsState
-          import androidx.compose.animation.fadeOut
-          import androidx.compose.animation.slideInHorizontally
-          import androidx.compose.animation.slideOutHorizontally
           import androidx.compose.animation.core.RepeatMode
           import androidx.compose.animation.core.animateFloat
           import androidx.compose.animation.core.animateFloatAsState
@@ -5762,6 +5756,8 @@ jobs:
           import androidx.compose.foundation.text.KeyboardActions
           import androidx.compose.foundation.text.KeyboardOptions
           import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.foundation.text.selection.LocalTextSelectionColors
+          import androidx.compose.foundation.text.selection.TextSelectionColors
           import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
@@ -6135,11 +6131,20 @@ jobs:
                       onSurface = Color.White
                   )
               ) {
+                  CompositionLocalProvider(
+                      LocalTextSelectionColors provides TextSelectionColors(handleColor = Color.White, backgroundColor = Color.Black)
+                  ) {
+                      AppBody(tabs)
+                  }
+              }
+          }
+
+          @Composable
+          fun AppBody(tabs: TabManager) {
+              run {
                   var screen by remember { mutableStateOf("browser") }
                   var editId by remember { mutableStateOf<String?>(null) }
                   var startEdit by remember { mutableStateOf(false) }
-                  val navFade = remember { booleanArrayOf(false) }
-                  LaunchedEffect(screen) { navFade[0] = false }
                   DownloadAsk()
                   DownloadConfirmDialog()
                   ChoiceDialog(tabs)
@@ -6191,34 +6196,23 @@ jobs:
                               onLogs = { screen = "logs" }
                           )
                           StartupWarmup(tabs)
-                          AnimatedContent(
-                              targetState = screen,
-                              modifier = Modifier.fillMaxSize(),
-                              transitionSpec = { screenTransition(initialState, targetState, navFade[0]) },
-                              label = "screens"
-                          ) { sc ->
-                              if (sc == "browser") {
-                                  Box(Modifier.fillMaxSize())
-                              } else {
-                                  Box(
-                                      Modifier
-                                          .fillMaxSize()
-                                          .background(BG)
-                                          .pointerInput(Unit) { detectTapGestures { } }
-                                  ) {
-                                      ScreenDeferred {
-                                          when (sc) {
+                          if (screen != "browser") {
+                              Box(
+                                  Modifier
+                                      .fillMaxSize()
+                                      .background(BG)
+                                      .pointerInput(Unit) { detectTapGestures { } }
+                              ) {
+                                  key(screen) { ScreenDeferred { when (screen) {
                                       "tabs" -> TabManagerScreen(
                                           tabs,
                                           onBack = { screen = "browser" },
                                           onNewTab = {
-                                              navFade[0] = true
                                               tabs.home = true
                                               startEdit = true
                                               screen = "browser"
                                           },
                                           onSelect = { t ->
-                                          navFade[0] = true
                                           tabs.select(t)
                                           tabs.home = false
                                           screen = "browser"
@@ -6257,18 +6251,12 @@ jobs:
                                       "downloads" -> DownloadsScreen { screen = "browser" }
                                       "logs" -> LogScreen { screen = "browser" }
                                       else -> {}
-                                          }
-                                      }
-                                  }
+                                  } } }
                               }
                           }
                       }
                   }
               }
-          }
-
-          object ScriptsRev {
-              var n by mutableStateOf(0)
           }
 
           class ChoiceRow(val c: GeckoSession.PromptDelegate.ChoicePrompt.Choice, val header: Boolean, val indent: Boolean)
@@ -6466,37 +6454,6 @@ jobs:
               }
           }
 
-          fun screenDepth(s: String): Int = when (s) {
-              "browser" -> 0
-              "guide", "editor", "filterguide" -> 2
-              else -> 1
-          }
-
-          // Fast slide / fade motion between screens (about 0.16 to 0.19 seconds, plain transforms only).
-          fun screenTransition(from: String, to: String, fade: Boolean): ContentTransform {
-              if (to == "tabs" && from == "browser") {
-                  return ContentTransform(slideInHorizontally(tween(190)) { -it }, ExitTransition.None, 0f, null)
-              }
-              if (from == "tabs" && to == "browser") {
-                  val out: ExitTransition = if (fade) fadeOut(tween(140)) else slideOutHorizontally(tween(160)) { -it }
-                  return ContentTransform(EnterTransition.None, out, -1f, null)
-              }
-              if (screenDepth(to) > screenDepth(from)) {
-                  return ContentTransform(
-                      slideInHorizontally(tween(190)) { it },
-                      slideOutHorizontally(tween(190)) { -it / 4 },
-                      0f,
-                      null
-                  )
-              }
-              return ContentTransform(
-                  slideInHorizontally(tween(160)) { -it / 4 },
-                  slideOutHorizontally(tween(160)) { it },
-                  -1f,
-                  null
-              )
-          }
-
           @Composable
           fun ScreenSkeleton() {
               Column(Modifier.fillMaxSize().background(BG)) {
@@ -6520,12 +6477,15 @@ jobs:
           // Shows a cheap background-only skeleton for the first frame, then builds the real screen and fades in.
           @Composable
           fun ScreenDeferred(content: @Composable () -> Unit) {
+              var started by remember { mutableStateOf(false) }
               var ready by remember { mutableStateOf(false) }
               LaunchedEffect(Unit) {
+                  started = true
                   withFrameNanos { }
                   ready = true
               }
-              Box(Modifier.fillMaxSize()) {
+              val a by animateFloatAsState(targetValue = if (started) 1f else 0f, animationSpec = tween(140), label = "screenFade")
+              Box(Modifier.fillMaxSize().graphicsLayer { alpha = a }) {
                   if (ready) content() else ScreenSkeleton()
               }
           }
@@ -8057,7 +8017,7 @@ jobs:
           @Composable
           fun ScriptsScreen(onBack: () -> Unit, onEdit: (String?) -> Unit, onGuide: () -> Unit) {
               val scope = rememberCoroutineScope()
-              var scripts by remember(ScriptsRev.n) { mutableStateOf(Store.load()) }
+              var scripts by remember { mutableStateOf(Store.load()) }
               var status by remember { mutableStateOf("") }
               var busy by remember { mutableStateOf(false) }
               var showImport by remember { mutableStateOf(false) }
@@ -8302,7 +8262,6 @@ jobs:
                       target.remoteVersion = remoteVer
                   }
                   Store.save(list)
-                  ScriptsRev.n = ScriptsRev.n + 1
                   savedCode = code
                   savedEnabled = enabled
                   savedSrc = srcUrl
@@ -8469,7 +8428,6 @@ jobs:
                               showDelete = false
                               val sid = curId
                               if (sid != null) Store.remove(sid)
-                              ScriptsRev.n = ScriptsRev.n + 1
                               onBack()
                           }) { Text("Delete", color = Danger) }
                       },
