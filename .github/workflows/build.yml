@@ -2093,6 +2093,7 @@ jobs:
           const val DL_FAILED = 3
           const val DL_CANCELED = 4
           const val DL_PAUSED = 5
+          const val DL_ERR_DIFF = "Same name, different type"
 
           class HlsSeg(val url: String, val keyUrl: String?, val iv: ByteArray?, val seq: Long)
 
@@ -2125,6 +2126,8 @@ jobs:
               @Volatile
               var stream: InputStream? = null
               var tries = 0
+              var pursue = false
+              val conns = java.util.concurrent.CopyOnWriteArrayList<java.net.HttpURLConnection>()
               var nextFree = 0L
               val limLock = Any()
               fun addBytes(n: Int) {
@@ -2162,6 +2165,7 @@ jobs:
               var concurrent by mutableStateOf(2)
               var maxRetries by mutableStateOf(2)
               var askBefore by mutableStateOf(true)
+              var busy by mutableStateOf(0)
               val askQueue = mutableStateListOf<DlItem>()
               private val qLock = Any()
               private val waiting = ArrayList<DlItem>()
@@ -2429,34 +2433,60 @@ jobs:
                       return
                   }
                   val fdir = folder()
+                  d.cancel = false
+                  d.paused = false
                   if (fdir != null && d.name.isNotBlank()) {
                       val probe = if (d.kind == "hls" || d.kind == "dash") clean(d.name) + ".mp4" else clean(d.name)
                       if (nameTaken(d, fdir, probe)) {
-                          d.name = clean(d.name)
-                          d.state = DL_FAILED
-                          d.error = "Same filename"
-                          try {
-                              d.stream?.close()
-                          } catch (e: Exception) {
+                          failItem(d, "Same filename")
+                          return
+                      }
+                      if (!d.pursue) {
+                          pool.execute {
+                              val clash = sameStemOtherType(fdir, probe)
+                              main.post {
+                                  if (!d.cancel) {
+                                      if (clash) failItem(d, DL_ERR_DIFF) else queueNow(d)
+                                  }
+                              }
                           }
-                          d.stream = null
-                          save()
                           return
                       }
                   }
-                  d.cancel = false
-                  d.paused = false
-                  d.started = false
-                  d.bytes = 0L
-                  d.speed = 0L
-                  d.spT = 0L
-                  d.tries = 0
-                  d.nextFree = 0L
-                  d.state = DL_QUEUED
-                  synchronized(qLock) { if (!waiting.contains(d)) waiting.add(d) }
-                  save()
-                  pump()
-              }
+                  queueNow(d)
+                  }
+
+                  private fun failItem(d: DlItem, msg: String) {
+                      d.name = clean(d.name)
+                      d.state = DL_FAILED
+                      d.error = msg
+                      try {
+                          d.stream?.close()
+                      } catch (e: Exception) {
+                      }
+                      d.stream = null
+                      save()
+                  }
+
+                  private fun queueNow(d: DlItem) {
+                      d.cancel = false
+                      d.paused = false
+                      d.started = false
+                      d.bytes = 0L
+                      d.speed = 0L
+                      d.spT = 0L
+                      d.tries = 0
+                      d.nextFree = 0L
+                      d.state = DL_QUEUED
+                      synchronized(qLock) { if (!waiting.contains(d)) waiting.add(d) }
+                      save()
+                      pump()
+                  }
+
+                  fun pursue(d: DlItem) {
+                      d.pursue = true
+                      retry(d)
+                  }
 
               fun previewPlan(url: String, h: Map<String, String>): SegPlan = parseHlsPlan(url, h)
 
@@ -2474,9 +2504,20 @@ jobs:
                   begin(d)
               }
 
+              private fun killConns(d: DlItem) {
+                  for (c in d.conns) {
+                      try {
+                          c.disconnect()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
               fun cancel(d: DlItem) {
                   d.cancel = true
                   d.paused = false
+                  killConns(d)
+                  notifyProgress(true)
                   if (d.state == DL_QUEUED || (d.state == DL_PAUSED && !d.started)) {
                       pending.remove(d)
                       synchronized(qLock) { waiting.remove(d) }
@@ -2489,6 +2530,7 @@ jobs:
                   if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) {
                       d.cancel = true
                       d.paused = false
+                      killConns(d)
                   }
                   pending.remove(d)
                   synchronized(qLock) { waiting.remove(d) }
@@ -2506,6 +2548,7 @@ jobs:
                       d.paused = true
                       d.speed = 0L
                       d.state = DL_PAUSED
+                      notifyProgress(true)
                   }
               }
 
@@ -2515,6 +2558,7 @@ jobs:
                       d.spT = 0L
                       d.state = if (d.started) DL_RUNNING else DL_QUEUED
                   }
+                  notifyProgress(true)
                   pump()
               }
 
@@ -2537,6 +2581,7 @@ jobs:
                       if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) {
                           d.cancel = true
                           d.paused = false
+                          killConns(d)
                       }
                       pending.remove(d)
                   }
@@ -2652,6 +2697,7 @@ jobs:
                           inFlight++
                           go.add(n)
                       }
+                      busy = inFlight
                   }
                   for (n in go) pool.execute { runItem(n) }
               }
@@ -2708,8 +2754,18 @@ jobs:
               private fun runItem(d: DlItem) {
                   try {
                       runItemInner(d)
+                  } catch (t: Throwable) {
+                      Log.e("GreyScript", "download thread crashed", t)
+                      if (d.state == DL_RUNNING || d.state == DL_QUEUED) {
+                          d.state = DL_FAILED
+                          d.error = "Crashed: " + t.javaClass.simpleName
+                          save()
+                      }
                   } finally {
-                      synchronized(qLock) { inFlight-- }
+                      synchronized(qLock) {
+                          inFlight--
+                          busy = inFlight
+                      }
                       pump()
                   }
               }
@@ -2799,6 +2855,25 @@ jobs:
                   }
               }
 
+              private fun stemOf(n: String): String {
+                  val dot = n.lastIndexOf('.')
+                  return if (dot > 0 && n.length - dot <= 6) n.substring(0, dot) else n
+              }
+
+              // True when the folder already holds the same name with another type, for example name.txt next to name.mp4.
+              private fun sameStemOtherType(dir: File, finalName: String): Boolean {
+                  val names = (try { dir.list() } catch (e: Exception) { null }) ?: return false
+                  val low = finalName.lowercase()
+                  val stem = stemOf(low)
+                  for (n in names) {
+                      if (n.endsWith(".part")) continue
+                      val ln = n.lowercase()
+                      if (ln == low) continue
+                      if (ln == stem || stemOf(ln) == stem) return true
+                  }
+                  return false
+              }
+
               private fun nameTaken(d: DlItem, dir: File, name: String): Boolean {
                   val f = File(dir, name)
                   Log.d("GreyScript", "name check " + f.path + " exists=" + f.exists())
@@ -2867,11 +2942,12 @@ jobs:
                   return if (ext.isEmpty()) name else name + "." + ext
               }
 
-              private fun openConn(url0: String, h: Map<String, String>, range: String? = null): java.net.HttpURLConnection {
+              private fun openConn(url0: String, h: Map<String, String>, range: String? = null, d: DlItem? = null): java.net.HttpURLConnection {
                   var url = url0
                   var hops = 0
                   while (true) {
                       val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                      d?.conns?.add(c)
                       c.connectTimeout = 15000
                       c.readTimeout = 30000
                       c.instanceFollowRedirects = false
@@ -2899,11 +2975,12 @@ jobs:
               }
 
               private fun getBytes(url: String, h: Map<String, String>, d: DlItem? = null): ByteArray {
-                  val c = openConn(url, h)
+                  val c = openConn(url, h, null, d)
                   try {
                       return c.inputStream.use { readLimited(it, d) }
                   } finally {
                       c.disconnect()
+                      d?.conns?.remove(c)
                   }
               }
 
@@ -2937,6 +3014,10 @@ jobs:
                       d.name = name
                       throw Exception("Same filename")
                   }
+                  if (!d.pursue && sameStemOtherType(dir, name)) {
+                      d.name = name
+                      throw Exception(DL_ERR_DIFF)
+                  }
                   val target = File(dir, name)
                   d.name = name
                   d.path = target.path
@@ -2959,7 +3040,7 @@ jobs:
                   }
                   while (true) {
                       val existing = if (part != null) part.length() else 0L
-                      val c = openConn(d.url, d.headers, if (existing > 0L) "bytes=" + existing + "-" else null)
+                      val c = openConn(d.url, d.headers, if (existing > 0L) "bytes=" + existing + "-" else null, d)
                       try {
                           val resumed = existing > 0L && c.responseCode == 206
                           if (target == null) {
@@ -2969,6 +3050,10 @@ jobs:
                               if (nameTaken(d, dir, nm)) {
                                   d.name = nm
                                   throw Exception("Same filename")
+                              }
+                              if (!d.pursue && sameStemOtherType(dir, nm)) {
+                                  d.name = nm
+                                  throw Exception(DL_ERR_DIFF)
                               }
                               target = File(dir, nm)
                               part = File(dir, nm + ".part")
@@ -3013,7 +3098,7 @@ jobs:
                       d.note = "Downloading audio…"
                       d.done = 0L
                       d.total = 0L
-                      val c = openConn(d.audioUrl, d.headers)
+                      val c = openConn(d.audioUrl, d.headers, null, d)
                       try {
                           c.inputStream.use { ins -> java.io.FileOutputStream(a).use { out -> copyStream(d, ins, out) } }
                       } finally {
@@ -3283,6 +3368,7 @@ jobs:
                   }
                   val hext = if (aPlan != null || vPlan.ext == "ts" || vPlan.ext == "mp4") "mp4" else vPlan.ext
                   if (nameTaken(d, dir, clean(d.name.ifBlank { "video" }) + "." + hext)) throw Exception("Same filename")
+                  if (!d.pursue && sameStemOtherType(dir, clean(d.name.ifBlank { "video" }) + "." + hext)) throw Exception(DL_ERR_DIFF)
                   d.total = (vPlan.segs.size + (aPlan?.segs?.size ?: 0)).toLong()
                   d.done = 0L
                   val tmp = tempDir()
@@ -3326,6 +3412,7 @@ jobs:
                   val aPlan = a?.plan
                   val dext = if (aPlan != null || vPlan.ext == "mp4") "mp4" else vPlan.ext
                   if (nameTaken(d, dir, clean(d.name.ifBlank { "video" }) + "." + dext)) throw Exception("Same filename")
+                  if (!d.pursue && sameStemOtherType(dir, clean(d.name.ifBlank { "video" }) + "." + dext)) throw Exception(DL_ERR_DIFF)
                   d.total = (vPlan.segs.size + (aPlan?.segs?.size ?: 0)).toLong()
                   d.done = 0L
                   val tmp = tempDir()
@@ -3352,15 +3439,21 @@ jobs:
               }
 
               // ---------- foreground service + notification ----------
-              private fun notifyProgress() {
+              private fun notifyProgress(force: Boolean = false) {
                   val now = System.currentTimeMillis()
-                  if (now - lastNotif < 1000L) return
+                  if (!force && now - lastNotif < 1000L) return
                   lastNotif = now
+                  if (active.get() <= 0) return
                   val list = ArrayList(running)
                   if (list.isEmpty()) return
-                  val first = list[0]
+                  val live = list.filter { !it.paused && !it.cancel }
+                  if (live.isEmpty()) {
+                      DlNotif.update(Gecko.appCtx, "Paused", -1)
+                      return
+                  }
+                  val first = live[0]
                   val pct = if (first.total > 0L) (first.done * 100L / first.total).toInt() else -1
-                  val text = if (list.size == 1) first.name else list.size.toString() + " downloads"
+                  val text = if (live.size == 1) first.name else live.size.toString() + " downloads"
                   DlNotif.update(Gecko.appCtx, text, pct)
               }
 
@@ -3377,6 +3470,7 @@ jobs:
                   try {
                       val c = Gecko.appCtx
                       c.stopService(Intent(c, DownloadService::class.java))
+                      (c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(DlNotif.ID)
                   } catch (e: Exception) {
                   }
               }
@@ -9326,7 +9420,12 @@ jobs:
                                       onClick = { menu = false; Downloads.cancel(d) }
                                   )
                               }
-                              if (st == DL_FAILED || st == DL_CANCELED) {
+                              if (st == DL_FAILED && d.error == DL_ERR_DIFF) {
+                                  DropdownMenuItem(
+                                      text = { Text("Pursue", color = Color.White) },
+                                      onClick = { menu = false; Downloads.pursue(d) }
+                                  )
+                              } else if (st == DL_FAILED || st == DL_CANCELED) {
                                   DropdownMenuItem(
                                       text = { Text("Retry", color = Color.White) },
                                       onClick = { menu = false; Downloads.retry(d) }
@@ -9413,7 +9512,7 @@ jobs:
               var open by remember { mutableStateOf(false) }
               val n = Downloads.concurrent
               Box {
-                  HeaderPick("At once", if (n <= 0) "Unli" else n.toString()) { open = true }
+                  HeaderPick("At once" + (if (Downloads.busy > 0) " · " + Downloads.busy + " busy" else ""), if (n <= 0) "Unli" else n.toString()) { open = true }
                   DropdownMenu(
                       expanded = open,
                       onDismissRequest = { open = false },
