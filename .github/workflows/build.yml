@@ -172,6 +172,13 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <activity
+                      android:name=".RestartActivity"
+                      android:exported="false"
+                      android:process=":restart"
+                      android:taskAffinity=""
+                      android:excludeFromRecents="true"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar" />
               <provider
                   android:name="androidx.core.content.FileProvider"
                   android:authorities="com.grey.gecko.fileprovider"
@@ -4082,7 +4089,7 @@ jobs:
 
               private fun dir(): java.io.File = java.io.File(Environment.getExternalStorageDirectory(), "GreyGecko")
 
-              private fun mainFile(): java.io.File = java.io.File(dir(), "greygecko.json")
+              private fun mainFile(): java.io.File = java.io.File(profDir(), "greygecko.json")
 
               private fun filtersDir(): java.io.File = java.io.File(dir(), "filters")
 
@@ -4113,6 +4120,7 @@ jobs:
                   if (active) return
                   try {
                       dir().mkdirs()
+                      resolveProfile()
                       val f = mainFile()
                       if (f.exists() && f.length() > 0L) {
                           if (!restore(f)) {
@@ -4121,6 +4129,7 @@ jobs:
                               return
                           }
                           restoreFilterFiles()
+                          thumbsApp().deleteRecursively()
                           restoreThumbFiles()
                           active = true
                           listen()
@@ -4204,7 +4213,7 @@ jobs:
               private fun writeNow(): Boolean {
                   if (!active) return false
                   return try {
-                      val d = dir()
+                      val d = profDir()
                       d.mkdirs()
                       val root = snapshot()
                       val f = mainFile()
@@ -4263,7 +4272,7 @@ jobs:
 
               private fun thumbsApp(): java.io.File = java.io.File(Gecko.appCtx.filesDir, "thumbs")
 
-              private fun thumbsBk(): java.io.File = java.io.File(dir(), "thumbs")
+              private fun thumbsBk(): java.io.File = java.io.File(profDir(), "thumbs")
 
               private fun syncThumbs(root: JSONObject) {
                   try {
@@ -4319,6 +4328,185 @@ jobs:
                   }
               }
 
+              @Volatile
+              private var cur = ""
+
+              fun current(): String = cur
+
+              fun isActive(): Boolean = active
+
+              private fun profilesDir(): java.io.File = java.io.File(dir(), "Profiles")
+
+              private fun activeFile(): java.io.File = java.io.File(dir(), "active.txt")
+
+              private fun profDir(): java.io.File = java.io.File(profilesDir(), cur)
+
+              private fun natural(a: String, b: String): Int {
+                  val rx = Regex("\\d+|\\D+")
+                  val x = rx.findAll(a.lowercase()).map { it.value }.toList()
+                  val y = rx.findAll(b.lowercase()).map { it.value }.toList()
+                  for (i in 0 until minOf(x.size, y.size)) {
+                      val p = x[i]
+                      val q = y[i]
+                      val c = if (p[0].isDigit() && q[0].isDigit()) {
+                          val pp = p.trimStart('0')
+                          val qq = q.trimStart('0')
+                          if (pp.length != qq.length) pp.length - qq.length else pp.compareTo(qq)
+                      } else p.compareTo(q)
+                      if (c != 0) return c
+                  }
+                  return x.size - y.size
+              }
+
+              fun list(): List<String> {
+                  val fs = profilesDir().listFiles() ?: return emptyList()
+                  return fs.filter { it.isDirectory }.map { it.name }.sortedWith { a, b -> natural(a, b) }
+              }
+
+              fun nextName(): String {
+                  val have = list().map { it.lowercase() }.toHashSet()
+                  var n = 1
+                  while (have.contains("profile" + n)) n++
+                  return "Profile" + n
+              }
+
+              fun clean(s: String): String {
+                  var t = s.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), " ").replace(Regex("\\s+"), " ").trim()
+                  t = t.trimStart('.').trim()
+                  if (t.length > 40) t = t.substring(0, 40).trim()
+                  return t
+              }
+
+              private fun writeActive(n: String): Boolean {
+                  return try {
+                      val tmp = java.io.File(dir(), "active.txt.tmp")
+                      tmp.writeText(n)
+                      if (!tmp.renameTo(activeFile())) {
+                          activeFile().writeText(n)
+                          tmp.delete()
+                      }
+                      true
+                  } catch (e: Exception) {
+                      Log.e(TAG, "active.txt write failed", e)
+                      false
+                  }
+              }
+
+              private fun moveFile(a: java.io.File, b: java.io.File) {
+                  try {
+                      if (!a.renameTo(b)) {
+                          a.copyTo(b, overwrite = true)
+                          a.delete()
+                      }
+                  } catch (e: Exception) {
+                      Log.e(TAG, "move failed " + a.name, e)
+                  }
+              }
+
+              private fun resolveProfile() {
+                  val pd = profilesDir()
+                  pd.mkdirs()
+                  val ab = activeFile()
+                  var name = if (ab.exists()) clean(ab.readText()) else ""
+                  if (name.isEmpty() || !java.io.File(pd, name).isDirectory) {
+                      val existing = list()
+                      if (existing.isNotEmpty()) {
+                          name = existing.first()
+                      } else {
+                          name = "Profile1"
+                          val t = java.io.File(pd, name)
+                          t.mkdirs()
+                          val old = java.io.File(dir(), "greygecko.json")
+                          if (old.exists() && old.length() > 0L) moveFile(old, java.io.File(t, "greygecko.json"))
+                          val ot = java.io.File(dir(), "thumbs")
+                          if (ot.isDirectory) ot.renameTo(java.io.File(t, "thumbs"))
+                      }
+                      writeActive(name)
+                  }
+                  cur = name
+              }
+
+              @Synchronized
+              fun create(raw: String?): String? {
+                  if (!active) return null
+                  val n = if (raw.isNullOrBlank()) nextName() else clean(raw)
+                  if (n.isEmpty() || list().any { it.equals(n, true) }) return null
+                  return if (java.io.File(profilesDir(), n).mkdirs()) n else null
+              }
+
+              @Synchronized
+              fun duplicate(src: String, raw: String?): String? {
+                  if (!active) return null
+                  val from = java.io.File(profilesDir(), src)
+                  if (!from.isDirectory) return null
+                  if (src == cur) {
+                      main.removeCallbacks(job)
+                      writeNow()
+                  }
+                  val n = if (raw.isNullOrBlank()) nextName() else clean(raw)
+                  if (n.isEmpty() || list().any { it.equals(n, true) }) return null
+                  val to = java.io.File(profilesDir(), n)
+                  return try {
+                      from.copyRecursively(to, false)
+                      n
+                  } catch (e: Exception) {
+                      Log.e(TAG, "duplicate failed", e)
+                      to.deleteRecursively()
+                      null
+                  }
+              }
+
+              @Synchronized
+              fun rename(old: String, raw: String): Boolean {
+                  if (!active) return false
+                  val n = clean(raw)
+                  if (n.isEmpty() || n == old) return false
+                  val a = java.io.File(profilesDir(), old)
+                  val b = java.io.File(profilesDir(), n)
+                  if (!a.isDirectory) return false
+                  if (!n.equals(old, true) && b.exists()) return false
+                  if (old == cur) {
+                      main.removeCallbacks(job)
+                      writeNow()
+                  }
+                  if (!a.renameTo(b)) return false
+                  if (old == cur) {
+                      if (!writeActive(n)) {
+                          b.renameTo(a)
+                          return false
+                      }
+                      cur = n
+                  }
+                  return true
+              }
+
+              @Synchronized
+              fun delete(name: String): Boolean {
+                  if (!active || name == cur) return false
+                  val f = java.io.File(profilesDir(), name)
+                  return f.isDirectory && f.deleteRecursively()
+              }
+
+              fun switchTo(c: Context, name: String): Boolean {
+                  if (!active || name == cur) return false
+                  if (!java.io.File(profilesDir(), name).isDirectory) return false
+                  flush()
+                  if (!writeActive(name)) return false
+                  return try {
+                      val launch = c.packageManager.getLaunchIntentForPackage(c.packageName) ?: return false
+                      val next = Intent.makeRestartActivityTask(launch.component)
+                      val i = Intent(c, RestartActivity::class.java)
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      i.putExtra("next", next)
+                      i.putExtra("pid", android.os.Process.myPid())
+                      c.startActivity(i)
+                      true
+                  } catch (e: Exception) {
+                      Log.e(TAG, "restart failed", e)
+                      writeActive(cur)
+                      false
+                  }
+              }
               fun schedule() {
                   if (!active) return
                   main.removeCallbacks(job)
@@ -4341,6 +4529,27 @@ jobs:
                       for (n in names) prefs(n).edit().clear().commit()
                   }
                   Log.d(TAG, "backup finished, cleared=" + ok)
+              }
+          }
+
+          class RestartActivity : android.app.Activity() {
+              @Suppress("DEPRECATION")
+              private fun nextIntent(): android.content.Intent? =
+                  if (android.os.Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("next", android.content.Intent::class.java)
+                  else intent.getParcelableExtra<android.content.Intent>("next")
+
+              override fun onCreate(savedInstanceState: android.os.Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  try {
+                      val pid = intent.getIntExtra("pid", -1)
+                      val next = nextIntent()
+                      if (pid > 0) android.os.Process.killProcess(pid)
+                      if (next != null) startActivity(next)
+                  } catch (e: Exception) {
+                      Log.e("GreyScript", "restart activity failed", e)
+                  }
+                  finish()
+                  Runtime.getRuntime().exit(0)
               }
           }
           EOF
@@ -6287,6 +6496,7 @@ jobs:
                               onFilters = { screen = "filters" },
                               onElements = { screen = "elements" },
                               onDownloads = { screen = "downloads" },
+                              onProfiles = { screen = "profiles" },
                               onLogs = { screen = "logs" }
                           )
                           StartupWarmup(tabs)
@@ -6343,6 +6553,7 @@ jobs:
                                       "filterguide" -> FilterGuideScreen { screen = "filters" }
                                       "elements" -> ElementRulesScreen { screen = "browser" }
                                       "downloads" -> DownloadsScreen { screen = "browser" }
+                                      "profiles" -> ProfilesScreen(tabs) { screen = "browser" }
                                       "logs" -> LogScreen { screen = "browser" }
                                       else -> {}
                                   } } }
@@ -6609,7 +6820,7 @@ jobs:
                       Text("GreyGecko backup", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                       Spacer(Modifier.height(12.dp))
                       Text(
-                          "GreyGecko keeps your bookmarks, history, tabs, scripts and settings in one file: GreyGecko/greygecko.json on your internal storage. For that it needs \"All files access\". Turn it on for GreyGecko, then come back to the app.",
+                          "GreyGecko keeps your bookmarks, history, tabs, scripts and settings in one file per profile: GreyGecko/Profiles/(profile name)/greygecko.json on your internal storage. For that it needs \"All files access\". Turn it on for GreyGecko, then come back to the app.",
                           color = Soft,
                           fontSize = 14.sp,
                           textAlign = TextAlign.Center
@@ -6649,6 +6860,7 @@ jobs:
               onFilters: () -> Unit,
               onElements: () -> Unit,
               onDownloads: () -> Unit,
+              onProfiles: () -> Unit,
               onLogs: () -> Unit
           ) {
               val cur = tabs.current
@@ -6961,6 +7173,10 @@ jobs:
                                   DropdownMenuItem(
                                       text = { Text("Downloads", color = Color.White) },
                                       onClick = { menu = false; onDownloads() }
+                                  )
+                                  DropdownMenuItem(
+                                      text = { Text("Profiles", color = Color.White) },
+                                      onClick = { menu = false; onProfiles() }
                                   )
 
 
@@ -9747,6 +9963,177 @@ jobs:
                           }
                       }
                   }
+              }
+          }
+
+          @Composable
+          fun ProfilesScreen(tabs: TabManager, onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              var rev by remember { mutableStateOf(0) }
+              val ready = Backup.isActive()
+              val names = remember(rev) { if (ready) Backup.list() else emptyList() }
+              val cur = Backup.current()
+              var switchTo by remember { mutableStateOf<String?>(null) }
+              var menuFor by remember { mutableStateOf<String?>(null) }
+              var renameFor by remember { mutableStateOf<String?>(null) }
+              var deleteFor by remember { mutableStateOf<String?>(null) }
+              var adding by remember { mutableStateOf(false) }
+              var input by remember { mutableStateOf("") }
+              Column(Modifier.fillMaxSize()) {
+                  Header {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Profiles", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                      TextButton(
+                          enabled = ready,
+                          onClick = { input = Backup.nextName(); adding = true }
+                      ) { Text("New", color = if (ready) Color.White else Soft, fontSize = 14.sp) }
+                  }
+                  if (!ready) {
+                      EmptyNote("Profiles need All files access. Allow it for GreyGecko and restart the app.")
+                  }
+                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                      for (n in names) {
+                          key(n) {
+                              val isCur = n == cur
+                              Row(
+                                  Modifier
+                                      .fillMaxWidth()
+                                      .clickable(enabled = !isCur) { switchTo = n }
+                                      .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Column(Modifier.weight(1f)) {
+                                      Text(n, color = Color.White, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                      Text(
+                                          if (isCur) "Current profile" else "Tap to switch",
+                                          color = if (isCur) TmGreen else Soft,
+                                          fontSize = 11.sp
+                                      )
+                                  }
+                                  Box {
+                                      TextButton(onClick = { menuFor = n }) { Text("⋮", color = Color.White, fontSize = 20.sp) }
+                                      DropdownMenu(
+                                          expanded = menuFor == n,
+                                          onDismissRequest = { menuFor = null },
+                                          modifier = Modifier.background(Bar)
+                                      ) {
+                                          DropdownMenuItem(
+                                              text = { Text("Rename", color = Color.White) },
+                                              onClick = { menuFor = null; input = n; renameFor = n }
+                                          )
+                                          DropdownMenuItem(
+                                              text = { Text("Duplicate", color = Color.White) },
+                                              onClick = {
+                                                  menuFor = null
+                                                  val r = Backup.duplicate(n, null)
+                                                  toast(ctx, if (r != null) "Created " + r else "Could not duplicate")
+                                                  rev++
+                                              }
+                                          )
+                                          if (!isCur) {
+                                              DropdownMenuItem(
+                                                  text = { Text("Delete", color = Danger) },
+                                                  onClick = { menuFor = null; deleteFor = n }
+                                              )
+                                          }
+                                      }
+                                  }
+                              }
+                              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                          }
+                      }
+                  }
+              }
+              val sw = switchTo
+              if (sw != null) {
+                  AlertDialog(
+                      onDismissRequest = { switchTo = null },
+                      containerColor = Bar,
+                      title = { Text("Switch profile?", color = Color.White) },
+                      text = {
+                          Text(
+                              "Switch to " + sw + ". The app will restart." +
+                                  (if (Downloads.hasActive()) " Running downloads will be stopped." else ""),
+                              color = Soft
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              switchTo = null
+                              tabs.saveNow()
+                              if (!Backup.switchTo(ctx, sw)) toast(ctx, "Could not switch profile")
+                          }) { Text("Switch", color = Color.White) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { switchTo = null }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
+              }
+              val del = deleteFor
+              if (del != null) {
+                  AlertDialog(
+                      onDismissRequest = { deleteFor = null },
+                      containerColor = Bar,
+                      title = { Text("Delete profile?", color = Color.White) },
+                      text = {
+                          Text(
+                              del + " will be deleted with its tabs, bookmarks, history, scripts and settings.",
+                              color = Soft
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              deleteFor = null
+                              if (!Backup.delete(del)) toast(ctx, "Could not delete")
+                              rev++
+                          }) { Text("Delete", color = Danger) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { deleteFor = null }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
+              }
+              if (adding || renameFor != null) {
+                  val isNew = adding
+                  AlertDialog(
+                      onDismissRequest = { adding = false; renameFor = null },
+                      containerColor = Bar,
+                      title = { Text(if (isNew) "New profile" else "Rename profile", color = Color.White) },
+                      text = {
+                          OutlinedTextField(
+                              value = input,
+                              onValueChange = { input = it },
+                              colors = fieldColors(),
+                              singleLine = true,
+                              modifier = Modifier.fillMaxWidth()
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              if (isNew) {
+                                  val r = Backup.create(input)
+                                  if (r == null) {
+                                      toast(ctx, "Name is empty or already used")
+                                  } else {
+                                      adding = false
+                                      toast(ctx, "Created " + r)
+                                      rev++
+                                  }
+                              } else {
+                                  val o = renameFor
+                                  if (o != null && Backup.rename(o, input)) {
+                                      renameFor = null
+                                      rev++
+                                  } else {
+                                      toast(ctx, "Name is empty or already used")
+                                  }
+                              }
+                          }) { Text(if (isNew) "Create" else "Rename", color = Color.White) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { adding = false; renameFor = null }) { Text("Cancel", color = Color.White) }
+                      }
+                  )
               }
           }
           EOF
