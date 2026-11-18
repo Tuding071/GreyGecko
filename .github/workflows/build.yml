@@ -4121,6 +4121,7 @@ jobs:
                   try {
                       dir().mkdirs()
                       resolveProfile()
+                      seedShared()
                       val f = mainFile()
                       if (f.exists() && f.length() > 0L) {
                           if (!restore(f)) {
@@ -4128,6 +4129,7 @@ jobs:
                               toast(Gecko.appCtx, "greygecko.json is unreadable. Backup is off. Fix or delete the file.")
                               return
                           }
+                          restoreShared()
                           restoreFilterFiles()
                           thumbsApp().deleteRecursively()
                           restoreThumbFiles()
@@ -4137,7 +4139,9 @@ jobs:
                       } else {
                           // No file: the file is the only source of truth, so start empty.
                           for (n in names) prefs(n).edit().clear().commit()
+                          restoreShared()
                           appFilters().deleteRecursively()
+                          restoreFilterFiles()
                           java.io.File(Gecko.appCtx.filesDir, "thumbs").deleteRecursively()
                           active = true
                           listen()
@@ -4179,6 +4183,43 @@ jobs:
                   }
               }
 
+              private val shared = listOf("filters", "adblock", "adcos", "hide")
+
+              @Volatile
+              private var sharedOk = true
+
+              private fun sharedFile(): java.io.File = java.io.File(dir(), "adfilters.json")
+
+              private fun toJson(v: Any?): Any? {
+                  return when (v) {
+                      is String -> {
+                          val t = v.trimStart()
+                          if (t.startsWith("[")) {
+                              try { JSONArray(v) } catch (e: Exception) { v }
+                          } else if (t.startsWith("{")) {
+                              try { JSONObject(v) } catch (e: Exception) { v }
+                          } else v
+                      }
+                      is Boolean -> v
+                      is Int -> v
+                      is Long -> v
+                      is Float -> v.toDouble()
+                      else -> null
+                  }
+              }
+
+              private fun putJson(e: SharedPreferences.Editor, k: String, v: Any?) {
+                  when (v) {
+                      is JSONObject -> e.putString(k, v.toString())
+                      is JSONArray -> e.putString(k, v.toString())
+                      is Boolean -> e.putBoolean(k, v)
+                      is Int -> e.putInt(k, v)
+                      is Long -> e.putLong(k, v)
+                      is Double -> e.putFloat(k, v.toFloat())
+                      is String -> e.putString(k, v)
+                  }
+              }
+
               private fun snapshot(): JSONObject {
                   val root = JSONObject()
                   root.put("app", "GreyGecko")
@@ -4187,26 +4228,133 @@ jobs:
                   for (n in names) {
                       val o = JSONObject()
                       for ((k, v) in prefs(n).all) {
-                          when (v) {
-                              is String -> {
-                                  val t = v.trimStart()
-                                  var put: Any = v
-                                  if (t.startsWith("[")) {
-                                      put = try { JSONArray(v) } catch (e: Exception) { v }
-                                  } else if (t.startsWith("{")) {
-                                      put = try { JSONObject(v) } catch (e: Exception) { v }
-                                  }
-                                  o.put(k, put)
-                              }
-                              is Boolean -> o.put(k, v)
-                              is Int -> o.put(k, v)
-                              is Long -> o.put(k, v)
-                              is Float -> o.put(k, v.toDouble())
-                          }
+                          if (n == "browser" && shared.contains(k)) continue
+                          val j = toJson(v) ?: continue
+                          o.put(k, j)
                       }
                       root.put(n, o)
                   }
                   return root
+              }
+
+              private fun sharedSnapshot(): JSONObject {
+                  val o = JSONObject()
+                  for ((k, v) in prefs("browser").all) {
+                      if (!shared.contains(k)) continue
+                      val j = toJson(v) ?: continue
+                      o.put(k, j)
+                  }
+                  return o
+              }
+
+              private fun writeShared(s: JSONObject) {
+                  if (!sharedOk) return
+                  try {
+                      val sf = sharedFile()
+                      if (!s.has("filters") && sf.exists() && sf.length() > 20L) return
+                      val w = JSONObject()
+                      w.put("app", "GreyGecko")
+                      w.put("version", 1)
+                      val keys = s.keys()
+                      while (keys.hasNext()) {
+                          val k = keys.next()
+                          w.put(k, s.get(k))
+                      }
+                      val text = w.toString(1)
+                      if (sf.exists() && sf.readText() == text) return
+                      val tmp = java.io.File(dir(), "adfilters.json.tmp")
+                      tmp.writeText(text)
+                      JSONObject(tmp.readText())
+                      if (!tmp.renameTo(sf)) {
+                          tmp.copyTo(sf, overwrite = true)
+                          tmp.delete()
+                      }
+                  } catch (e: Exception) {
+                      Log.e(TAG, "adfilters.json write failed", e)
+                  }
+              }
+
+              private fun restoreShared() {
+                  try {
+                      val e = prefs("browser").edit()
+                      for (k in shared) e.remove(k)
+                      val sf = sharedFile()
+                      if (sf.exists() && sf.length() > 0L) {
+                          val o = JSONObject(sf.readText())
+                          val keys = o.keys()
+                          while (keys.hasNext()) {
+                              val k = keys.next()
+                              if (shared.contains(k)) putJson(e, k, o.get(k))
+                          }
+                      }
+                      e.commit()
+                  } catch (ex: Exception) {
+                      sharedOk = false
+                      Log.e(TAG, "adfilters.json restore failed", ex)
+                      toast(Gecko.appCtx, "adfilters.json is unreadable. Ad filter sharing is off. Fix or delete the file.")
+                  }
+              }
+
+              private fun seedShared() {
+                  try {
+                      val sf = sharedFile()
+                      if (sf.exists() && sf.length() > 0L) return
+                      val out = JSONObject()
+                      val lists = JSONArray()
+                      val ids = HashSet<String>()
+                      val urls = HashSet<String>()
+                      val hide = JSONObject()
+                      val order = ArrayList<String>()
+                      order.add(cur)
+                      for (p in list()) if (p != cur) order.add(p)
+                      for (p in order) {
+                          val f = java.io.File(java.io.File(profilesDir(), p), "greygecko.json")
+                          if (!f.exists()) continue
+                          var b0: JSONObject? = null
+                          try {
+                              b0 = JSONObject(f.readText()).optJSONObject("browser")
+                          } catch (e: Exception) {
+                          }
+                          val b = b0 ?: continue
+                          val arr = b.optJSONArray("filters")
+                          if (arr != null) {
+                              for (i in 0 until arr.length()) {
+                                  val o = arr.optJSONObject(i) ?: continue
+                                  val id = o.optString("id")
+                                  val url = o.optString("url")
+                                  if (id.isEmpty() || ids.contains(id)) continue
+                                  if (url.isNotBlank() && urls.contains(url)) continue
+                                  ids.add(id)
+                                  if (url.isNotBlank()) urls.add(url)
+                                  lists.put(o)
+                              }
+                          }
+                          val h = b.optJSONObject("hide")
+                          if (h != null) {
+                              val ks = h.keys()
+                              while (ks.hasNext()) {
+                                  val host = ks.next()
+                                  val src = h.optJSONArray(host) ?: continue
+                                  val dst = hide.optJSONArray(host) ?: JSONArray()
+                                  val seen = HashSet<String>()
+                                  for (i in 0 until dst.length()) seen.add(dst.opt(i).toString())
+                                  for (i in 0 until src.length()) {
+                                      val s = src.opt(i)
+                                      if (s != null && seen.add(s.toString())) dst.put(s)
+                                  }
+                                  hide.put(host, dst)
+                              }
+                          }
+                          for (k in listOf("adblock", "adcos")) {
+                              if (b.has(k) && !out.has(k)) out.put(k, b.get(k))
+                          }
+                      }
+                      out.put("filters", lists)
+                      out.put("hide", hide)
+                      writeShared(out)
+                  } catch (e: Exception) {
+                      Log.e(TAG, "seed shared failed", e)
+                  }
               }
 
               @Synchronized
@@ -4236,7 +4384,9 @@ jobs:
                               }
                           }
                           if (ok) {
-                              syncFilters(root)
+                              val sh = sharedSnapshot()
+                              writeShared(sh)
+                              syncFilters(sh)
                               syncThumbs(root)
                           }
                           ok
@@ -4252,7 +4402,7 @@ jobs:
                       val src = appFilters()
                       val dst = filtersDir()
                       val ids = HashSet<String>()
-                      val arr = root.optJSONObject("browser")?.optJSONArray("filters")
+                      val arr = root.optJSONArray("filters")
                       if (arr != null) {
                           for (i in 0 until arr.length()) ids.add(arr.getJSONObject(i).optString("id"))
                       }
