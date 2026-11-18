@@ -2134,6 +2134,8 @@ jobs:
               var stream: InputStream? = null
               var tries = 0
               var pursue = false
+              @Volatile
+              var resumePart = false
               val conns = java.util.concurrent.CopyOnWriteArrayList<java.net.HttpURLConnection>()
               var nextFree = 0L
               val limLock = Any()
@@ -2183,6 +2185,7 @@ jobs:
               private val main = Handler(Looper.getMainLooper())
               private val active = AtomicInteger(0)
               private var lastNotif = 0L
+              private var loaded = false
               private val pool = java.util.concurrent.Executors.newCachedThreadPool { r ->
                   val t = Thread(r)
                   t.isDaemon = true
@@ -2239,6 +2242,11 @@ jobs:
               }
 
               fun load() {
+                  if (loaded) {
+                      save()
+                      return
+                  }
+                  loaded = true
                   items.clear()
                   folderState = sp().getString("dlpath", "") ?: ""
                   limitKbps = sp().getInt("dllimit", 0)
@@ -2505,8 +2513,19 @@ jobs:
                   if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) return
                   d.error = ""
                   d.note = ""
-                  d.done = 0L
-                  d.total = 0L
+                  var resumable = false
+                  if (d.kind == "file" && d.path.isNotBlank()) {
+                      val pf = File(d.path + ".part")
+                      if (pf.exists() && pf.length() > 0L) {
+                          resumable = true
+                          d.done = pf.length()
+                      }
+                  }
+                  d.resumePart = resumable
+                  if (!resumable) {
+                      d.done = 0L
+                      d.total = 0L
+                  }
                   if (d.kind == "stream") d.kind = "file"
                   begin(d)
               }
@@ -2959,7 +2978,10 @@ jobs:
                       c.readTimeout = 30000
                       c.instanceFollowRedirects = false
                       c.setRequestProperty("User-Agent", h["User-Agent"] ?: DEFAULT_UA)
-                      if (range != null) c.setRequestProperty("Range", range)
+                      if (range != null) {
+                          c.setRequestProperty("Range", range)
+                          c.setRequestProperty("Accept-Encoding", "identity")
+                      }
                       for (k in listOf("Referer", "Cookie", "Origin")) {
                           val v = h[k]
                           if (!v.isNullOrBlank()) c.setRequestProperty(k, v)
@@ -3041,13 +3063,23 @@ jobs:
               private fun runFile(d: DlItem, dir: File) {
                   var target: File? = null
                   var part: File? = null
-                  if (d.tries > 0 && d.path.isNotBlank() && File(d.path + ".part").exists()) {
+                  if ((d.tries > 0 || d.resumePart) && d.path.isNotBlank() && File(d.path + ".part").exists()) {
                       target = File(d.path)
                       part = File(d.path + ".part")
                   }
+                  d.resumePart = false
                   while (true) {
                       val existing = if (part != null) part.length() else 0L
-                      val c = openConn(d.url, d.headers, if (existing > 0L) "bytes=" + existing + "-" else null, d)
+                      val c = try {
+                          openConn(d.url, d.headers, if (existing > 0L) "bytes=" + existing + "-" else null, d)
+                      } catch (e: Exception) {
+                          if (existing > 0L && e.message == "HTTP 416") {
+                              part?.delete()
+                              d.done = 0L
+                              continue
+                          }
+                          throw e
+                      }
                       try {
                           val resumed = existing > 0L && c.responseCode == 206
                           if (target == null) {
@@ -3455,7 +3487,7 @@ jobs:
                   if (list.isEmpty()) return
                   val live = list.filter { !it.paused && !it.cancel }
                   if (live.isEmpty()) {
-                      DlNotif.update(Gecko.appCtx, "Paused", -1)
+                      DlNotif.update(Gecko.appCtx, "Paused", -1, true)
                       return
                   }
                   val first = live[0]
@@ -3485,14 +3517,26 @@ jobs:
 
           object DlNotif {
               const val ID = 4711
+              const val ACT_PAUSE = "com.grey.gecko.DL_PAUSE"
+              const val ACT_RESUME = "com.grey.gecko.DL_RESUME"
+              const val ACT_STOP = "com.grey.gecko.DL_STOP"
               private const val CH = "downloads"
+
+              private fun act(c: Context, code: Int, a: String): PendingIntent =
+                  PendingIntent.getService(
+                      c,
+                      code,
+                      Intent(c, DownloadService::class.java).setAction(a),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
 
               fun ensureChannel(c: Context) {
                   val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                   nm.createNotificationChannel(NotificationChannel(CH, "Downloads", NotificationManager.IMPORTANCE_LOW))
               }
 
-              fun build(c: Context, text: String, pct: Int): Notification {
+              @Suppress("DEPRECATION")
+              fun build(c: Context, text: String, pct: Int, paused: Boolean = false): Notification {
                   val open = PendingIntent.getActivity(
                       c,
                       0,
@@ -3507,13 +3551,15 @@ jobs:
                       .setOnlyAlertOnce(true)
                       .setContentIntent(open)
                   if (pct >= 0) b.setProgress(100, pct, false)
+                  b.addAction(0, if (paused) "Resume all" else "Pause all", act(c, 1, if (paused) ACT_RESUME else ACT_PAUSE))
+                  b.addAction(0, "Stop all", act(c, 2, ACT_STOP))
                   return b.build()
               }
 
-              fun update(c: Context, text: String, pct: Int) {
+              fun update(c: Context, text: String, pct: Int, paused: Boolean = false) {
                   try {
                       val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                      nm.notify(ID, build(c, text, pct))
+                      nm.notify(ID, build(c, text, pct, paused))
                   } catch (e: Exception) {
                   }
               }
@@ -3524,11 +3570,28 @@ jobs:
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   DlNotif.ensureChannel(this)
-                  val n = DlNotif.build(this, "Downloading…", -1)
-                  if (Build.VERSION.SDK_INT >= 29) {
-                      startForeground(DlNotif.ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  val act = intent?.action
+                  if (act == null) {
+                      val n = DlNotif.build(this, "Downloading…", -1)
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          startForeground(DlNotif.ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                      } else {
+                          startForeground(DlNotif.ID, n)
+                      }
                   } else {
-                      startForeground(DlNotif.ID, n)
+                      when (act) {
+                          DlNotif.ACT_PAUSE -> Downloads.pauseAll()
+                          DlNotif.ACT_RESUME -> Downloads.resumeAll()
+                          DlNotif.ACT_STOP -> Downloads.stopAll()
+                      }
+                  }
+                  if (!Downloads.hasActive()) {
+                      stopForeground(true)
+                      stopSelf()
+                      try {
+                          (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(DlNotif.ID)
+                      } catch (e: Exception) {
+                      }
                   }
                   return START_NOT_STICKY
               }
