@@ -2514,7 +2514,7 @@ jobs:
                   d.error = ""
                   d.note = ""
                   var resumable = false
-                  if (d.kind == "file" && d.path.isNotBlank()) {
+                  if ((d.kind == "file" || d.kind == "stream") && d.path.isNotBlank()) {
                       val pf = File(d.path + ".part")
                       if (pf.exists() && pf.length() > 0L) {
                           resumable = true
@@ -2552,6 +2552,20 @@ jobs:
                   }
               }
 
+              private fun dropPart(path: String) {
+                  if (path.isBlank()) return
+                  try {
+                      File(path + ".part").delete()
+                  } catch (e: Exception) {
+                  }
+                  main.postDelayed({
+                      try {
+                          File(path + ".part").delete()
+                      } catch (e: Exception) {
+                      }
+                  }, 1500L)
+              }
+
               fun remove(d: DlItem) {
                   if (d.state == DL_RUNNING || d.state == DL_QUEUED || d.state == DL_PAUSED) {
                       d.cancel = true
@@ -2561,6 +2575,7 @@ jobs:
                   pending.remove(d)
                   synchronized(qLock) { waiting.remove(d) }
                   items.remove(d)
+                  if (d.state != DL_DONE) dropPart(d.path)
                   save()
               }
 
@@ -2610,6 +2625,7 @@ jobs:
                           killConns(d)
                       }
                       pending.remove(d)
+                      if (d.state != DL_DONE) dropPart(d.path)
                   }
                   synchronized(qLock) { waiting.clear() }
                   items.clear()
@@ -2641,6 +2657,7 @@ jobs:
               }
 
               fun clearFinished() {
+                  for (d in ArrayList(items)) if (d.state == DL_FAILED || d.state == DL_CANCELED) dropPart(d.path)
                   items.removeAll { it.state == DL_DONE || it.state == DL_FAILED || it.state == DL_CANCELED }
                   save()
               }
@@ -2853,10 +2870,6 @@ jobs:
                               val msg = d.error
                               main.post { toast(Gecko.appCtx, "Download failed: " + msg) }
                               Log.e("GreyScript", "download failed " + d.url, e)
-                              try {
-                                  if (d.path.isNotBlank() && d.kind != "hls" && d.kind != "dash") File(d.path + ".part").delete()
-                              } catch (x: Exception) {
-                              }
                               break
                           }
                       }
@@ -3050,12 +3063,12 @@ jobs:
                   val target = File(dir, name)
                   d.name = name
                   d.path = target.path
+                  save()
                   val part = File(dir, name + ".part")
                   try {
                       java.io.FileOutputStream(part).use { out -> copyStream(d, ins, out) }
                       if (!part.renameTo(target)) throw Exception("Could not save file")
                   } catch (e: Exception) {
-                      part.delete()
                       throw e
                   }
               }
@@ -3098,6 +3111,7 @@ jobs:
                               part = File(dir, nm + ".part")
                               d.name = nm
                               d.path = target.path
+                              save()
                           }
                           val p = part ?: throw Exception("No file")
                           val startAt = if (resumed) existing else 0L
@@ -3108,7 +3122,6 @@ jobs:
                               val finished = java.io.FileOutputStream(p, resumed).use { out -> copyStream(d, c.inputStream, out, true) }
                               if (finished) break
                           } catch (e: Exception) {
-                              if (!shouldRetry(d, e)) p.delete()
                               throw e
                           }
                       } finally {
