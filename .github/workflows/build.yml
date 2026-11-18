@@ -6573,6 +6573,19 @@ jobs:
           }
 
           @Composable
+          fun ColumnScope.Body(content: @Composable ColumnScope.() -> Unit) {
+              var ready by remember { mutableStateOf(false) }
+              LaunchedEffect(Unit) {
+                  withFrameNanos { }
+                  ready = true
+              }
+              val a by animateFloatAsState(if (ready) 1f else 0f, tween(150), label = "body")
+              Box(Modifier.weight(1f).fillMaxWidth().graphicsLayer { alpha = a }) {
+                  if (ready) Column(Modifier.fillMaxSize(), content = content)
+              }
+          }
+
+          @Composable
           fun App(tabs: TabManager) {
               MaterialTheme(
                   colorScheme = darkColorScheme(
@@ -8136,108 +8149,110 @@ jobs:
                       }
                       Spacer(Modifier.width(8.dp))
                   }
-                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
-                  BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                      val railW = (maxWidth * 0.38f).coerceIn(120.dp, 160.dp)
-                      Row(Modifier.fillMaxSize()) {
-                          Column(
-                              Modifier
-                                  .width(railW)
-                                  .fillMaxHeight()
-                                  .background(Bar)
-                                  .verticalScroll(rememberScrollState())
-                                  .padding(vertical = 8.dp)
-                          ) {
-                              for (g in groups) {
-                                  key(g.key) {
-                                      val dragging = dragKey == g.key
-                                      Box(
-                                          Modifier
-                                              .onSizeChanged { heights[g.key] = it.height }
-                                              .zIndex(if (dragging) 1f else 0f)
-                                              .graphicsLayer { translationY = if (dragging) dragOffset else 0f }
-                                              .background(if (dragging) Color(0xFF454545) else Color.Transparent)
-                                              .pointerInput(g.key) {
-                                                  detectDragGesturesAfterLongPress(
-                                                      onDragStart = {
-                                                          dragKey = g.key
-                                                          dragOffset = 0f
-                                                          haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                      },
-                                                      onDrag = { change, amount ->
-                                                          change.consume()
-                                                          dragOffset += amount.y
-                                                          val cur = groupTabs(tabs.tabs.filter { !it.preview })
-                                                          val i = cur.indexOfFirst { it.key == g.key }
-                                                          if (dragOffset > 0f && i >= 0 && i < cur.size - 1) {
-                                                              val nh = (heights[cur[i + 1].key] ?: 160).toFloat()
-                                                              if (dragOffset > nh / 2f) {
-                                                                  tabs.moveGroupBy(g.key, 1)
-                                                                  dragOffset -= nh
+                  Body {
+                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
+                      BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                          val railW = (maxWidth * 0.38f).coerceIn(120.dp, 160.dp)
+                          Row(Modifier.fillMaxSize()) {
+                              Column(
+                                  Modifier
+                                      .width(railW)
+                                      .fillMaxHeight()
+                                      .background(Bar)
+                                      .verticalScroll(rememberScrollState())
+                                      .padding(vertical = 8.dp)
+                              ) {
+                                  for (g in groups) {
+                                      key(g.key) {
+                                          val dragging = dragKey == g.key
+                                          Box(
+                                              Modifier
+                                                  .onSizeChanged { heights[g.key] = it.height }
+                                                  .zIndex(if (dragging) 1f else 0f)
+                                                  .graphicsLayer { translationY = if (dragging) dragOffset else 0f }
+                                                  .background(if (dragging) Color(0xFF454545) else Color.Transparent)
+                                                  .pointerInput(g.key) {
+                                                      detectDragGesturesAfterLongPress(
+                                                          onDragStart = {
+                                                              dragKey = g.key
+                                                              dragOffset = 0f
+                                                              haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                          },
+                                                          onDrag = { change, amount ->
+                                                              change.consume()
+                                                              dragOffset += amount.y
+                                                              val cur = groupTabs(tabs.tabs.filter { !it.preview })
+                                                              val i = cur.indexOfFirst { it.key == g.key }
+                                                              if (dragOffset > 0f && i >= 0 && i < cur.size - 1) {
+                                                                  val nh = (heights[cur[i + 1].key] ?: 160).toFloat()
+                                                                  if (dragOffset > nh / 2f) {
+                                                                      tabs.moveGroupBy(g.key, 1)
+                                                                      dragOffset -= nh
+                                                                  }
+                                                              } else if (dragOffset < 0f && i > 0) {
+                                                                  val ph = (heights[cur[i - 1].key] ?: 160).toFloat()
+                                                                  if (-dragOffset > ph / 2f) {
+                                                                      tabs.moveGroupBy(g.key, -1)
+                                                                      dragOffset += ph
+                                                                  }
                                                               }
-                                                          } else if (dragOffset < 0f && i > 0) {
-                                                              val ph = (heights[cur[i - 1].key] ?: 160).toFloat()
-                                                              if (-dragOffset > ph / 2f) {
-                                                                  tabs.moveGroupBy(g.key, -1)
-                                                                  dragOffset += ph
-                                                              }
+                                                          },
+                                                          onDragEnd = {
+                                                              dragKey = null
+                                                              dragOffset = 0f
+                                                          },
+                                                          onDragCancel = {
+                                                              dragKey = null
+                                                              dragOffset = 0f
                                                           }
-                                                      },
-                                                      onDragEnd = {
-                                                          dragKey = null
-                                                          dragOffset = 0f
-                                                      },
-                                                      onDragCancel = {
-                                                          dragKey = null
-                                                          dragOffset = 0f
-                                                      }
-                                                  )
-                                              }
-                                      ) {
-                                          GroupItem(
-                                              g,
-                                              active = g.key == active?.key,
-                                              foreground = g.tabs.any { it === tabs.current },
-                                              onClick = { activeKey = g.key }
-                                          )
+                                                      )
+                                                  }
+                                          ) {
+                                              GroupItem(
+                                                  g,
+                                                  active = g.key == active?.key,
+                                                  foreground = g.tabs.any { it === tabs.current },
+                                                  onClick = { activeKey = g.key }
+                                              )
+                                          }
                                       }
                                   }
                               }
-                          }
-                          Box(Modifier.width(0.5.dp).fillMaxHeight().background(Field))
-                          Column(
-                              Modifier
-                                  .weight(1f)
-                                  .fillMaxHeight()
-                                  .verticalScroll(rememberScrollState())
-                                  .padding(12.dp)
-                          ) {
-                              if (active != null) {
-                                  Row(
-                                      Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp),
-                                      verticalAlignment = Alignment.CenterVertically
-                                  ) {
-                                      FaviconBox(active.key, 18.dp, 4.dp, 10)
-                                      Spacer(Modifier.width(8.dp))
-                                      Text(
-                                          active.label.uppercase(),
-                                          color = Soft,
-                                          fontSize = 11.sp,
-                                          fontWeight = FontWeight.SemiBold,
-                                          letterSpacing = 0.5.sp
-                                      )
-                                  }
-                                  for (t in active.tabs) {
-                                      key(t.id) {
-                                          TabCard(
-                                              t,
-                                              foreground = t === tabs.current,
-                                              closing = tabs.closingIds.contains(t.id),
-                                              onClick = { onSelect(t) },
-                                              onToggleClose = {
-                                                  if (tabs.closingIds.contains(t.id)) tabs.undoClose(t) else tabs.requestClose(t)
-                                              }
+                              Box(Modifier.width(0.5.dp).fillMaxHeight().background(Field))
+                              Column(
+                                  Modifier
+                                      .weight(1f)
+                                      .fillMaxHeight()
+                                      .verticalScroll(rememberScrollState())
+                                      .padding(12.dp)
+                              ) {
+                                  if (active != null) {
+                                      Row(
+                                          Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp),
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          FaviconBox(active.key, 18.dp, 4.dp, 10)
+                                          Spacer(Modifier.width(8.dp))
+                                          Text(
+                                              active.label.uppercase(),
+                                              color = Soft,
+                                              fontSize = 11.sp,
+                                              fontWeight = FontWeight.SemiBold,
+                                              letterSpacing = 0.5.sp
                                           )
+                                      }
+                                      for (t in active.tabs) {
+                                          key(t.id) {
+                                              TabCard(
+                                                  t,
+                                                  foreground = t === tabs.current,
+                                                  closing = tabs.closingIds.contains(t.id),
+                                                  onClick = { onSelect(t) },
+                                                  onToggleClose = {
+                                                      if (tabs.closingIds.contains(t.id)) tabs.undoClose(t) else tabs.requestClose(t)
+                                                  }
+                                              )
+                                          }
                                       }
                                   }
                               }
@@ -8306,18 +8321,20 @@ jobs:
                           TextButton(onClick = { confirmClear = true }) { Text("Clear", color = Danger) }
                       }
                   }
-                  if (hist.isEmpty()) EmptyNote("No history yet.")
-                  LazyColumn(Modifier.weight(1f)) {
-                      items(hist) { e ->
-                          val host = android.net.Uri.parse(e.url).host ?: e.url
-                          SheetRow(
-                              title = e.title.ifBlank { e.url },
-                              sub = host + " · " + fmt.format(java.util.Date(e.time)),
-                              active = false,
-                              onClick = { onOpen(e.url) },
-                              onRemove = null,
-                              leading = { FaviconBox(keyOfUrl(e.url), 24.dp, 6.dp, 12) }
-                          )
+                  Body {
+                      if (hist.isEmpty()) EmptyNote("No history yet.")
+                      LazyColumn(Modifier.weight(1f)) {
+                          items(hist) { e ->
+                              val host = android.net.Uri.parse(e.url).host ?: e.url
+                              SheetRow(
+                                  title = e.title.ifBlank { e.url },
+                                  sub = host + " · " + fmt.format(java.util.Date(e.time)),
+                                  active = false,
+                                  onClick = { onOpen(e.url) },
+                                  onRemove = null,
+                                  leading = { FaviconBox(keyOfUrl(e.url), 24.dp, 6.dp, 12) }
+                              )
+                          }
                       }
                   }
               }
@@ -8409,61 +8426,63 @@ jobs:
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Bookmarks", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                   }
-                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
-                  if (groups.isEmpty()) {
-                      EmptyNote("No bookmarks yet. Open a page, then use the menu and tap Add to bookmark.")
-                  } else {
-                      BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                          val railW = (maxWidth * 0.38f).coerceIn(120.dp, 160.dp)
-                          Row(Modifier.fillMaxSize()) {
-                              Column(
-                                  Modifier
-                                      .width(railW)
-                                      .fillMaxHeight()
-                                      .background(Bar)
-                                      .verticalScroll(rememberScrollState())
-                                      .padding(vertical = 8.dp)
-                              ) {
-                                  for (g in groups) {
-                                      RailItem(
-                                          g.key,
-                                          if (g.key == "newtab") "Other" else g.key,
-                                          g.items.size,
-                                          "bookmark",
-                                          g.key == active?.key,
-                                          false,
-                                          { activeKey = g.key }
-                                      )
+                  Body {
+                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Field))
+                      if (groups.isEmpty()) {
+                          EmptyNote("No bookmarks yet. Open a page, then use the menu and tap Add to bookmark.")
+                      } else {
+                          BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                              val railW = (maxWidth * 0.38f).coerceIn(120.dp, 160.dp)
+                              Row(Modifier.fillMaxSize()) {
+                                  Column(
+                                      Modifier
+                                          .width(railW)
+                                          .fillMaxHeight()
+                                          .background(Bar)
+                                          .verticalScroll(rememberScrollState())
+                                          .padding(vertical = 8.dp)
+                                  ) {
+                                      for (g in groups) {
+                                          RailItem(
+                                              g.key,
+                                              if (g.key == "newtab") "Other" else g.key,
+                                              g.items.size,
+                                              "bookmark",
+                                              g.key == active?.key,
+                                              false,
+                                              { activeKey = g.key }
+                                          )
+                                      }
                                   }
-                              }
-                              Box(Modifier.width(0.5.dp).fillMaxHeight().background(Field))
-                              Column(
-                                  Modifier
-                                      .weight(1f)
-                                      .fillMaxHeight()
-                                      .verticalScroll(rememberScrollState())
-                                      .padding(12.dp)
-                              ) {
-                                  if (active != null) {
-                                      Text(
-                                          (if (active.key == "newtab") "Other" else active.key).uppercase(),
-                                          color = Soft,
-                                          fontSize = 11.sp,
-                                          fontWeight = FontWeight.SemiBold,
-                                          letterSpacing = 0.5.sp,
-                                          modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp)
-                                      )
-                                      for (e in active.items) {
-                                          key(e.url) {
-                                              BookmarkCard(
-                                                  e,
-                                                  closing = BookmarkStore.closing.contains(e.url),
-                                                  onClick = { onOpen(e.url) },
-                                                  onToggleClose = {
-                                                      if (BookmarkStore.closing.contains(e.url)) BookmarkStore.undoRemove(e.url)
-                                                      else BookmarkStore.requestRemove(e.url)
-                                                  }
-                                              )
+                                  Box(Modifier.width(0.5.dp).fillMaxHeight().background(Field))
+                                  Column(
+                                      Modifier
+                                          .weight(1f)
+                                          .fillMaxHeight()
+                                          .verticalScroll(rememberScrollState())
+                                          .padding(12.dp)
+                                  ) {
+                                      if (active != null) {
+                                          Text(
+                                              (if (active.key == "newtab") "Other" else active.key).uppercase(),
+                                              color = Soft,
+                                              fontSize = 11.sp,
+                                              fontWeight = FontWeight.SemiBold,
+                                              letterSpacing = 0.5.sp,
+                                              modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp)
+                                          )
+                                          for (e in active.items) {
+                                              key(e.url) {
+                                                  BookmarkCard(
+                                                      e,
+                                                      closing = BookmarkStore.closing.contains(e.url),
+                                                      onClick = { onOpen(e.url) },
+                                                      onToggleClose = {
+                                                          if (BookmarkStore.closing.contains(e.url)) BookmarkStore.undoRemove(e.url)
+                                                          else BookmarkStore.requestRemove(e.url)
+                                                      }
+                                                  )
+                                              }
                                           }
                                       }
                                   }
@@ -8502,61 +8521,63 @@ jobs:
                       TextButton(onClick = { showImport = true }) { Text("Import", color = Color.White) }
                       TextButton(onClick = { onEdit(null) }) { Text("New", color = Color.White) }
                   }
-                  Row(
-                      Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Text(
-                          scripts.size.toString() + " scripts · " + scripts.count { it.enabled } + " enabled",
-                          color = Soft,
-                          fontSize = 12.sp,
-                          modifier = Modifier.weight(1f)
-                      )
-                      TextButton(onClick = {
-                          if (!busy) {
-                              busy = true
-                              status = "Checking…"
-                              scope.launch {
-                                  val n = withContext(Dispatchers.IO) { Updater.checkAll() }
-                                  reload()
-                                  busy = false
-                                  status = if (n == 0) "All scripts are up to date" else n.toString() + " update(s) available"
-                              }
-                          }
-                      }) { Text("Check updates", color = Color.White, fontSize = 12.sp) }
-                      if (updates > 0) {
+                  Body {
+                      Row(
+                          Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text(
+                              scripts.size.toString() + " scripts · " + scripts.count { it.enabled } + " enabled",
+                              color = Soft,
+                              fontSize = 12.sp,
+                              modifier = Modifier.weight(1f)
+                          )
                           TextButton(onClick = {
                               if (!busy) {
                                   busy = true
-                                  status = "Updating…"
+                                  status = "Checking…"
                                   scope.launch {
-                                      val n = withContext(Dispatchers.IO) { Updater.applyAll() }
+                                      val n = withContext(Dispatchers.IO) { Updater.checkAll() }
                                       reload()
                                       busy = false
-                                      status = n.toString() + " script(s) updated"
+                                      status = if (n == 0) "All scripts are up to date" else n.toString() + " update(s) available"
                                   }
                               }
-                          }) { Text("Update all", color = Color.White, fontSize = 12.sp) }
+                          }) { Text("Check updates", color = Color.White, fontSize = 12.sp) }
+                          if (updates > 0) {
+                              TextButton(onClick = {
+                                  if (!busy) {
+                                      busy = true
+                                      status = "Updating…"
+                                      scope.launch {
+                                          val n = withContext(Dispatchers.IO) { Updater.applyAll() }
+                                          reload()
+                                          busy = false
+                                          status = n.toString() + " script(s) updated"
+                                      }
+                                  }
+                              }) { Text("Update all", color = Color.White, fontSize = 12.sp) }
+                          }
                       }
-                  }
-                  if (status.isNotBlank()) {
-                      Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
-                  }
-                  if (scripts.isEmpty()) {
-                      Text(
-                          "No scripts yet. Tap New to start from a template, or tap ? for a guide you can give to an AI.",
-                          color = Soft,
-                          fontSize = 13.sp,
-                          modifier = Modifier.padding(12.dp)
-                      )
-                  }
-                  LazyColumn(Modifier.weight(1f)) {
-                      items(scripts, key = { it.id }) { s ->
-                          ScriptRow(
-                              s,
-                              onClick = { onEdit(s.id) },
-                              onToggle = { v -> Store.setEnabled(s.id, v); reload() }
+                      if (status.isNotBlank()) {
+                          Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
+                      }
+                      if (scripts.isEmpty()) {
+                          Text(
+                              "No scripts yet. Tap New to start from a template, or tap ? for a guide you can give to an AI.",
+                              color = Soft,
+                              fontSize = 13.sp,
+                              modifier = Modifier.padding(12.dp)
                           )
+                      }
+                      LazyColumn(Modifier.weight(1f)) {
+                          items(scripts, key = { it.id }) { s ->
+                              ScriptRow(
+                                  s,
+                                  onClick = { onEdit(s.id) },
+                                  onToggle = { v -> Store.setEnabled(s.id, v); reload() }
+                              )
+                          }
                       }
                   }
               }
@@ -8746,121 +8767,123 @@ jobs:
                       }) { Text("Save") }
                       Spacer(Modifier.width(6.dp))
                   }
-                  Column(
-                      Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)
-                  ) {
-                      Text("Parsed from header", color = Color(0xFF888888), fontSize = 11.sp)
-                      Spacer(Modifier.height(6.dp))
-                      Row(Modifier.horizontalScroll(rememberScrollState())) {
-                          InfoChip(meta.name)
-                          if (meta.version.isNotBlank()) { Spacer(Modifier.width(6.dp)); InfoChip("v" + meta.version) }
-                          Spacer(Modifier.width(6.dp))
-                          InfoChip((meta.matches.size + meta.includes.size).toString() + " match")
-                          Spacer(Modifier.width(6.dp))
-                          InfoChip("run-at " + meta.runAt.removePrefix("document-"))
-                          if (meta.excludes.isNotEmpty()) { Spacer(Modifier.width(6.dp)); InfoChip(meta.excludes.size.toString() + " exclude") }
-                          if (meta.requires.isNotEmpty()) { Spacer(Modifier.width(6.dp)); InfoChip(meta.requires.size.toString() + " require") }
-                      }
-                      if (meta.matches.isEmpty() && meta.includes.isEmpty()) {
-                          Text(
-                              "No @match or @include: this script will never run.",
-                              color = Danger,
-                              fontSize = 12.sp,
-                              modifier = Modifier.padding(top = 6.dp)
+                  Body {
+                      Column(
+                          Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)
+                      ) {
+                          Text("Parsed from header", color = Color(0xFF888888), fontSize = 11.sp)
+                          Spacer(Modifier.height(6.dp))
+                          Row(Modifier.horizontalScroll(rememberScrollState())) {
+                              InfoChip(meta.name)
+                              if (meta.version.isNotBlank()) { Spacer(Modifier.width(6.dp)); InfoChip("v" + meta.version) }
+                              Spacer(Modifier.width(6.dp))
+                              InfoChip((meta.matches.size + meta.includes.size).toString() + " match")
+                              Spacer(Modifier.width(6.dp))
+                              InfoChip("run-at " + meta.runAt.removePrefix("document-"))
+                              if (meta.excludes.isNotEmpty()) { Spacer(Modifier.width(6.dp)); InfoChip(meta.excludes.size.toString() + " exclude") }
+                              if (meta.requires.isNotEmpty()) { Spacer(Modifier.width(6.dp)); InfoChip(meta.requires.size.toString() + " require") }
+                          }
+                          if (meta.matches.isEmpty() && meta.includes.isEmpty()) {
+                              Text(
+                                  "No @match or @include: this script will never run.",
+                                  color = Danger,
+                                  fontSize = 12.sp,
+                                  modifier = Modifier.padding(top = 6.dp)
+                              )
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text("Enabled", color = Color.White, modifier = Modifier.weight(1f))
+                              Switch(checked = enabled, onCheckedChange = { enabled = it }, colors = switchColors())
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          Text("Update URL (used if the header has no @updateURL or @downloadURL)", color = Color(0xFF888888), fontSize = 11.sp)
+                          Spacer(Modifier.height(6.dp))
+                          OutlinedTextField(
+                              value = srcUrl,
+                              onValueChange = { srcUrl = it },
+                              modifier = Modifier.fillMaxWidth(),
+                              singleLine = true,
+                              textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
+                              colors = fieldColors()
                           )
-                      }
-                      Spacer(Modifier.height(10.dp))
-                      Row(verticalAlignment = Alignment.CenterVertically) {
-                          Text("Enabled", color = Color.White, modifier = Modifier.weight(1f))
-                          Switch(checked = enabled, onCheckedChange = { enabled = it }, colors = switchColors())
-                      }
-                      Spacer(Modifier.height(10.dp))
-                      Text("Update URL (used if the header has no @updateURL or @downloadURL)", color = Color(0xFF888888), fontSize = 11.sp)
-                      Spacer(Modifier.height(6.dp))
-                      OutlinedTextField(
-                          value = srcUrl,
-                          onValueChange = { srcUrl = it },
-                          modifier = Modifier.fillMaxWidth(),
-                          singleLine = true,
-                          textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
-                          colors = fieldColors()
-                      )
-                      Spacer(Modifier.height(8.dp))
-                      Row(verticalAlignment = Alignment.CenterVertically) {
-                          Button(onClick = {
-                              val u = checkUrlFor(meta, srcUrl)
-                              if (u.isBlank()) {
-                                  status = "Add an update URL first"
-                              } else {
-                                  status = "Checking…"
-                                  scope.launch {
-                                      val r = withContext(Dispatchers.IO) {
-                                          try { httpGet(u) } catch (e: Exception) { "ERR:" + e.message }
-                                      }
-                                      if (r.startsWith("ERR:")) {
-                                          status = r.substring(4)
-                                      } else {
-                                          val rv = parseMeta(r).version
-                                          if (rv.isNotBlank() && compareVersions(rv, meta.version) > 0) {
-                                              remoteVer = rv
-                                              status = "Update " + rv + " available"
-                                          } else {
-                                              remoteVer = ""
-                                              status = "Up to date"
-                                          }
-                                      }
-                                  }
-                              }
-                          }) { Text("Check") }
-                          if (remoteVer.isNotBlank()) {
-                              Spacer(Modifier.width(8.dp))
+                          Spacer(Modifier.height(8.dp))
+                          Row(verticalAlignment = Alignment.CenterVertically) {
                               Button(onClick = {
-                                  val u = applyUrlFor(meta, srcUrl)
+                                  val u = checkUrlFor(meta, srcUrl)
                                   if (u.isBlank()) {
-                                      status = "No update URL"
+                                      status = "Add an update URL first"
                                   } else {
-                                      status = "Downloading…"
+                                      status = "Checking…"
                                       scope.launch {
                                           val r = withContext(Dispatchers.IO) {
                                               try { httpGet(u) } catch (e: Exception) { "ERR:" + e.message }
                                           }
                                           if (r.startsWith("ERR:")) {
                                               status = r.substring(4)
-                                          } else if (!r.contains("==UserScript==")) {
-                                              status = "Downloaded file has no script header"
                                           } else {
-                                              code = r
-                                              remoteVer = ""
-                                              save()
-                                              status = "Updated to v" + parseMeta(r).version
+                                              val rv = parseMeta(r).version
+                                              if (rv.isNotBlank() && compareVersions(rv, meta.version) > 0) {
+                                                  remoteVer = rv
+                                                  status = "Update " + rv + " available"
+                                              } else {
+                                                  remoteVer = ""
+                                                  status = "Up to date"
+                                              }
                                           }
                                       }
                                   }
-                              }) { Text("Update to v" + remoteVer) }
+                              }) { Text("Check") }
+                              if (remoteVer.isNotBlank()) {
+                                  Spacer(Modifier.width(8.dp))
+                                  Button(onClick = {
+                                      val u = applyUrlFor(meta, srcUrl)
+                                      if (u.isBlank()) {
+                                          status = "No update URL"
+                                      } else {
+                                          status = "Downloading…"
+                                          scope.launch {
+                                              val r = withContext(Dispatchers.IO) {
+                                                  try { httpGet(u) } catch (e: Exception) { "ERR:" + e.message }
+                                              }
+                                              if (r.startsWith("ERR:")) {
+                                                  status = r.substring(4)
+                                              } else if (!r.contains("==UserScript==")) {
+                                                  status = "Downloaded file has no script header"
+                                              } else {
+                                                  code = r
+                                                  remoteVer = ""
+                                                  save()
+                                                  status = "Updated to v" + parseMeta(r).version
+                                              }
+                                          }
+                                      }
+                                  }) { Text("Update to v" + remoteVer) }
+                              }
                           }
-                      }
-                      if (status.isNotBlank()) {
-                          Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
-                      }
-                      if (curId != null) {
-                          Text(
-                              "Delete script",
-                              color = Danger,
-                              fontSize = 14.sp,
-                              modifier = Modifier
-                                  .padding(top = 20.dp, bottom = 12.dp)
-                                  .clickable { showDelete = true }
+                          if (status.isNotBlank()) {
+                              Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+                          }
+                          if (curId != null) {
+                              Text(
+                                  "Delete script",
+                                  color = Danger,
+                                  fontSize = 14.sp,
+                                  modifier = Modifier
+                                      .padding(top = 20.dp, bottom = 12.dp)
+                                      .clickable { showDelete = true }
+                              )
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          OutlinedTextField(
+                              value = code,
+                              onValueChange = { code = it },
+                              modifier = Modifier.fillMaxWidth(),
+                              minLines = 12,
+                              textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
+                              colors = fieldColors()
                           )
                       }
-                      Spacer(Modifier.height(10.dp))
-                      OutlinedTextField(
-                          value = code,
-                          onValueChange = { code = it },
-                          modifier = Modifier.fillMaxWidth(),
-                          minLines = 12,
-                          textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color.White),
-                          colors = fieldColors()
-                      )
                   }
               }
               if (showDiscard) {
@@ -9071,84 +9094,86 @@ jobs:
                       TextButton(onClick = { picker.launch(arrayOf("*/*")) }) { Text("Import", color = Color.White) }
                       TextButton(onClick = { showUrl = true }) { Text("URL", color = Color.White) }
                   }
-                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                      FilterToggleRow("Ad blocking", on) { v ->
-                          on = v
-                          Filters.setOn(v)
-                      }
-
-                      Text(
-                          "Rules loaded: " + loadedNet + " · blocked this session: " + blocked,
-                          color = Soft,
-                          fontSize = 12.sp,
-                          modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                      )
-                      Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                          if (lists.any { it.url.isNotBlank() }) {
-                              TextButton(onClick = {
-                                  if (!busy) {
-                                      busy = true
-                                      status = "Updating…"
-                                      scope.launch {
-                                          val res = withContext(Dispatchers.IO) {
-                                              var ok = 0
-                                              var tot = 0
-                                              for (f in Filters.load()) {
-                                                  if (f.url.isBlank()) continue
-                                                  tot++
-                                                  if (Filters.refresh(f.id).isEmpty()) ok++
-                                              }
-                                              ok.toString() + "/" + tot
-                                          }
-                                          busy = false
-                                          reload()
-                                          status = "Updated " + res + ". Reload the page."
-                                      }
-                                  }
-                              }) { Text("Update all", color = Color.White, fontSize = 12.sp) }
+                  Body {
+                      Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                          FilterToggleRow("Ad blocking", on) { v ->
+                              on = v
+                              Filters.setOn(v)
                           }
-                      }
-                      if (status.isNotBlank()) {
-                          Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
-                      }
-                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
-                      if (lists.isEmpty()) {
-                          EmptyNote("No filter lists yet. Tap URL to download one or Import to load a .txt file. Tap ? for links to popular lists.")
-                      }
-                      for (f in lists) {
-                          key(f.id) {
-                              Row(
-                                  Modifier.fillMaxWidth().clickable { sel = f }.padding(horizontal = 12.dp, vertical = 10.dp),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Column(Modifier.weight(1f)) {
-                                      Text(
-                                          f.name,
-                                          color = if (f.enabled) Color.White else Color(0xFF888888),
-                                          fontSize = 14.sp,
-                                          maxLines = 1,
-                                          overflow = TextOverflow.Ellipsis
-                                      )
-                                      Text(
-                                          f.count.toString() + " rules" +
-                                              (if (f.updated > 0) " · " + fmt.format(java.util.Date(f.updated)) else "") +
-                                              (if (f.url.isBlank()) " · imported file" else " · " + hostOf(f.url)),
-                                          color = Soft,
-                                          fontSize = 12.sp,
-                                          maxLines = 1,
-                                          overflow = TextOverflow.Ellipsis
+
+                          Text(
+                              "Rules loaded: " + loadedNet + " · blocked this session: " + blocked,
+                              color = Soft,
+                              fontSize = 12.sp,
+                              modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                          )
+                          Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                              if (lists.any { it.url.isNotBlank() }) {
+                                  TextButton(onClick = {
+                                      if (!busy) {
+                                          busy = true
+                                          status = "Updating…"
+                                          scope.launch {
+                                              val res = withContext(Dispatchers.IO) {
+                                                  var ok = 0
+                                                  var tot = 0
+                                                  for (f in Filters.load()) {
+                                                      if (f.url.isBlank()) continue
+                                                      tot++
+                                                      if (Filters.refresh(f.id).isEmpty()) ok++
+                                                  }
+                                                  ok.toString() + "/" + tot
+                                              }
+                                              busy = false
+                                              reload()
+                                              status = "Updated " + res + ". Reload the page."
+                                          }
+                                      }
+                                  }) { Text("Update all", color = Color.White, fontSize = 12.sp) }
+                              }
+                          }
+                          if (status.isNotBlank()) {
+                              Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
+                          }
+                          Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                          if (lists.isEmpty()) {
+                              EmptyNote("No filter lists yet. Tap URL to download one or Import to load a .txt file. Tap ? for links to popular lists.")
+                          }
+                          for (f in lists) {
+                              key(f.id) {
+                                  Row(
+                                      Modifier.fillMaxWidth().clickable { sel = f }.padding(horizontal = 12.dp, vertical = 10.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Column(Modifier.weight(1f)) {
+                                          Text(
+                                              f.name,
+                                              color = if (f.enabled) Color.White else Color(0xFF888888),
+                                              fontSize = 14.sp,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                          Text(
+                                              f.count.toString() + " rules" +
+                                                  (if (f.updated > 0) " · " + fmt.format(java.util.Date(f.updated)) else "") +
+                                                  (if (f.url.isBlank()) " · imported file" else " · " + hostOf(f.url)),
+                                              color = Soft,
+                                              fontSize = 12.sp,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                      }
+                                      Switch(
+                                          checked = f.enabled,
+                                          onCheckedChange = { v ->
+                                              Filters.setEnabled(f.id, v)
+                                              reload()
+                                          },
+                                          colors = switchColors()
                                       )
                                   }
-                                  Switch(
-                                      checked = f.enabled,
-                                      onCheckedChange = { v ->
-                                          Filters.setEnabled(f.id, v)
-                                          reload()
-                                      },
-                                      colors = switchColors()
-                                  )
+                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                               }
-                              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                           }
                       }
                   }
@@ -9214,36 +9239,38 @@ jobs:
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Filter guide", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                   }
-                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
-                      Text(FILTER_GUIDE, color = Color.White, fontSize = 13.sp)
-                      Spacer(Modifier.height(14.dp))
-                      Text("LISTS", color = Soft, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                      if (status.isNotBlank()) {
-                          Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
-                      }
-                      for (l in FILTER_LINKS) {
-                          Column(Modifier.fillMaxWidth().padding(top = 10.dp)) {
-                              Text(l.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                              Text(l.note, color = Soft, fontSize = 12.sp)
-                              Text(l.url, color = Color(0xFFBBBBBB), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                              Row {
-                                  TextButton(onClick = {
-                                      copyText(ctx, l.url)
-                                      toast(ctx, "Link copied")
-                                  }) { Text("Copy", color = Color.White, fontSize = 13.sp) }
-                                  TextButton(onClick = {
-                                      if (!busy) {
-                                          busy = true
-                                          status = "Downloading " + l.name + "…"
-                                          scope.launch {
-                                              val e = withContext(Dispatchers.IO) { Filters.addFromUrl(l.url, l.name) }
-                                              busy = false
-                                              status = if (e.isEmpty()) l.name + " added. Reload the page." else e
+                  Body {
+                      Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
+                          Text(FILTER_GUIDE, color = Color.White, fontSize = 13.sp)
+                          Spacer(Modifier.height(14.dp))
+                          Text("LISTS", color = Soft, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                          if (status.isNotBlank()) {
+                              Text(status, color = Soft, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
+                          }
+                          for (l in FILTER_LINKS) {
+                              Column(Modifier.fillMaxWidth().padding(top = 10.dp)) {
+                                  Text(l.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                  Text(l.note, color = Soft, fontSize = 12.sp)
+                                  Text(l.url, color = Color(0xFFBBBBBB), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                                  Row {
+                                      TextButton(onClick = {
+                                          copyText(ctx, l.url)
+                                          toast(ctx, "Link copied")
+                                      }) { Text("Copy", color = Color.White, fontSize = 13.sp) }
+                                      TextButton(onClick = {
+                                          if (!busy) {
+                                              busy = true
+                                              status = "Downloading " + l.name + "…"
+                                              scope.launch {
+                                                  val e = withContext(Dispatchers.IO) { Filters.addFromUrl(l.url, l.name) }
+                                                  busy = false
+                                                  status = if (e.isEmpty()) l.name + " added. Reload the page." else e
+                                              }
                                           }
-                                      }
-                                  }) { Text("Add", color = Color.White, fontSize = 13.sp) }
+                                      }) { Text("Add", color = Color.White, fontSize = 13.sp) }
+                                  }
+                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                               }
-                              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                           }
                       }
                   }
@@ -9307,71 +9334,73 @@ jobs:
                       TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
                       Text("Element rules", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
                   }
-                  if (rules.isEmpty()) {
-                      EmptyNote("No hidden elements yet. In the menu tap Hide element, tap something on the page, then tap Hide.")
-                  }
-                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                      for ((host, list) in groups) {
-                          Row(
-                              Modifier
-                                  .fillMaxWidth()
-                                  .background(Bar)
-                                  .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              FaviconBox(host, 22.dp, 6.dp, 11)
-                              Spacer(Modifier.width(10.dp))
-                              Column(Modifier.weight(1f)) {
-                                  Text(
-                                      host,
-                                      color = Color.White,
-                                      fontSize = 13.sp,
-                                      fontWeight = FontWeight.SemiBold,
-                                      maxLines = 1,
-                                      overflow = TextOverflow.Ellipsis
-                                  )
-                                  Text(
-                                      list.size.toString() + (if (list.size == 1) " rule" else " rules"),
-                                      color = Soft,
-                                      fontSize = 11.sp
-                                  )
-                              }
-                              TextButton(onClick = { confirmHost = host }) { Text("Clear", color = Danger, fontSize = 12.sp) }
-                          }
-                          for (r in list) {
-                              key(r.host + "|" + r.path + "|" + r.sel) {
-                                  val isClosing = HideRules.closing.contains(HideRules.keyOf(r))
-                                  val rowBg by animateColorAsState(if (isClosing) Color(0xFF4A2A2A) else Color.Transparent, label = "ruleBg")
-                                  Row(
-                                      Modifier
-                                          .fillMaxWidth()
-                                          .background(rowBg)
-                                          .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 8.dp),
-                                      verticalAlignment = Alignment.CenterVertically
-                                  ) {
-                                      Column(Modifier.weight(1f)) {
-                                          Text(
-                                              r.sel,
-                                              color = Color.White,
-                                              fontSize = 11.sp,
-                                              fontFamily = FontFamily.Monospace,
-                                              maxLines = 2,
-                                              overflow = TextOverflow.Ellipsis
-                                          )
-                                          Text(
-                                              if (r.path.isEmpty()) "Whole site" else "Page: " + r.path,
-                                              color = Soft,
-                                              fontSize = 11.sp,
-                                              maxLines = 1,
-                                              overflow = TextOverflow.Ellipsis
-                                          )
-                                      }
-                                      Spacer(Modifier.width(8.dp))
-                                      UndoClose(isClosing) {
-                                          if (isClosing) HideRules.undoRemove(r) else HideRules.requestRemove(r)
-                                      }
+                  Body {
+                      if (rules.isEmpty()) {
+                          EmptyNote("No hidden elements yet. In the menu tap Hide element, tap something on the page, then tap Hide.")
+                      }
+                      Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                          for ((host, list) in groups) {
+                              Row(
+                                  Modifier
+                                      .fillMaxWidth()
+                                      .background(Bar)
+                                      .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  FaviconBox(host, 22.dp, 6.dp, 11)
+                                  Spacer(Modifier.width(10.dp))
+                                  Column(Modifier.weight(1f)) {
+                                      Text(
+                                          host,
+                                          color = Color.White,
+                                          fontSize = 13.sp,
+                                          fontWeight = FontWeight.SemiBold,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis
+                                      )
+                                      Text(
+                                          list.size.toString() + (if (list.size == 1) " rule" else " rules"),
+                                          color = Soft,
+                                          fontSize = 11.sp
+                                      )
                                   }
-                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                                  TextButton(onClick = { confirmHost = host }) { Text("Clear", color = Danger, fontSize = 12.sp) }
+                              }
+                              for (r in list) {
+                                  key(r.host + "|" + r.path + "|" + r.sel) {
+                                      val isClosing = HideRules.closing.contains(HideRules.keyOf(r))
+                                      val rowBg by animateColorAsState(if (isClosing) Color(0xFF4A2A2A) else Color.Transparent, label = "ruleBg")
+                                      Row(
+                                          Modifier
+                                              .fillMaxWidth()
+                                              .background(rowBg)
+                                              .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 8.dp),
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          Column(Modifier.weight(1f)) {
+                                              Text(
+                                                  r.sel,
+                                                  color = Color.White,
+                                                  fontSize = 11.sp,
+                                                  fontFamily = FontFamily.Monospace,
+                                                  maxLines = 2,
+                                                  overflow = TextOverflow.Ellipsis
+                                              )
+                                              Text(
+                                                  if (r.path.isEmpty()) "Whole site" else "Page: " + r.path,
+                                                  color = Soft,
+                                                  fontSize = 11.sp,
+                                                  maxLines = 1,
+                                                  overflow = TextOverflow.Ellipsis
+                                              )
+                                          }
+                                          Spacer(Modifier.width(8.dp))
+                                          UndoClose(isClosing) {
+                                              if (isClosing) HideRules.undoRemove(r) else HideRules.requestRemove(r)
+                                          }
+                                      }
+                                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                                  }
                               }
                           }
                       }
@@ -9971,18 +10000,20 @@ jobs:
                           }
                       }
                   }
-                  Text(
-                      if (Downloads.folderState.isBlank()) "No folder chosen yet. Use the menu to pick one." else "Saving to: " + Downloads.folderState,
-                      color = Soft,
-                      fontSize = 11.sp,
-                      modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                  )
-                  if (Downloads.items.isEmpty()) {
-                      EmptyNote("No downloads yet. Use Save in the video list, Download in the long-press menu, or open a downloadable file.")
-                  }
-                  LazyColumn(Modifier.weight(1f)) {
-                      items(Downloads.items, key = { it.id }) { d ->
-                          DlRow(d, onOpen = { openDownload(ctx, it) }, onDeleteFile = { fileTarget = it })
+                  Body {
+                      Text(
+                          if (Downloads.folderState.isBlank()) "No folder chosen yet. Use the menu to pick one." else "Saving to: " + Downloads.folderState,
+                          color = Soft,
+                          fontSize = 11.sp,
+                          modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                      )
+                      if (Downloads.items.isEmpty()) {
+                          EmptyNote("No downloads yet. Use Save in the video list, Download in the long-press menu, or open a downloadable file.")
+                      }
+                      LazyColumn(Modifier.weight(1f)) {
+                          items(Downloads.items, key = { it.id }) { d ->
+                              DlRow(d, onOpen = { openDownload(ctx, it) }, onDeleteFile = { fileTarget = it })
+                          }
                       }
                   }
               }
@@ -10039,15 +10070,17 @@ jobs:
                       }) { Text(if (copied) "Copied" else "Copy for AI") }
                       Spacer(Modifier.width(6.dp))
                   }
-                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
-                      Text(
-                          "Copy this and paste it into your AI chat, then describe the script you want.",
-                          color = Color(0xFFBBBBBB),
-                          fontSize = 13.sp
-                      )
-                      Spacer(Modifier.height(10.dp))
-                      SelectionContainer {
-                          Text(GUIDE, color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 11.5.sp)
+                  Body {
+                      Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(12.dp)) {
+                          Text(
+                              "Copy this and paste it into your AI chat, then describe the script you want.",
+                              color = Color(0xFFBBBBBB),
+                              fontSize = 13.sp
+                          )
+                          Spacer(Modifier.height(10.dp))
+                          SelectionContainer {
+                              Text(GUIDE, color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 11.5.sp)
+                          }
                       }
                   }
               }
@@ -10086,30 +10119,32 @@ jobs:
                       }) { Text("Copy") }
                       Spacer(Modifier.width(6.dp))
                   }
-                  Column(Modifier.fillMaxSize().padding(10.dp)) {
-                      OutlinedTextField(
-                          value = filter,
-                          onValueChange = { filter = it },
-                          modifier = Modifier.fillMaxWidth(),
-                          singleLine = true,
-                          placeholder = { Text("Filter (e.g. GreyScript)", color = Color(0xFF999999)) },
-                          colors = fieldColors()
-                      )
-                      Spacer(Modifier.height(6.dp))
-                      Box(
-                          Modifier
-                              .fillMaxSize()
-                              .background(Field)
-                              .padding(6.dp)
-                              .verticalScroll(scroll)
-                      ) {
-                          SelectionContainer {
-                              Text(
-                                  shown,
-                                  color = Color.White,
-                                  fontFamily = FontFamily.Monospace,
-                                  fontSize = 11.sp
-                              )
+                  Body {
+                      Column(Modifier.fillMaxSize().padding(10.dp)) {
+                          OutlinedTextField(
+                              value = filter,
+                              onValueChange = { filter = it },
+                              modifier = Modifier.fillMaxWidth(),
+                              singleLine = true,
+                              placeholder = { Text("Filter (e.g. GreyScript)", color = Color(0xFF999999)) },
+                              colors = fieldColors()
+                          )
+                          Spacer(Modifier.height(6.dp))
+                          Box(
+                              Modifier
+                                  .fillMaxSize()
+                                  .background(Field)
+                                  .padding(6.dp)
+                                  .verticalScroll(scroll)
+                          ) {
+                              SelectionContainer {
+                                  Text(
+                                      shown,
+                                      color = Color.White,
+                                      fontFamily = FontFamily.Monospace,
+                                      fontSize = 11.sp
+                                  )
+                              }
                           }
                       }
                   }
@@ -10138,58 +10173,60 @@ jobs:
                           onClick = { input = Backup.nextName(); adding = true }
                       ) { Text("New", color = if (ready) Color.White else Soft, fontSize = 14.sp) }
                   }
-                  if (!ready) {
-                      EmptyNote("Profiles need All files access. Allow it for GreyGecko and restart the app.")
-                  }
-                  Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                      for (n in names) {
-                          key(n) {
-                              val isCur = n == cur
-                              Row(
-                                  Modifier
-                                      .fillMaxWidth()
-                                      .clickable(enabled = !isCur) { switchTo = n }
-                                      .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Column(Modifier.weight(1f)) {
-                                      Text(n, color = Color.White, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                      Text(
-                                          if (isCur) "Current profile" else "Tap to switch",
-                                          color = if (isCur) TmGreen else Soft,
-                                          fontSize = 11.sp
-                                      )
-                                  }
-                                  Box {
-                                      TextButton(onClick = { menuFor = n }) { Text("⋮", color = Color.White, fontSize = 20.sp) }
-                                      DropdownMenu(
-                                          expanded = menuFor == n,
-                                          onDismissRequest = { menuFor = null },
-                                          modifier = Modifier.background(Bar)
-                                      ) {
-                                          DropdownMenuItem(
-                                              text = { Text("Rename", color = Color.White) },
-                                              onClick = { menuFor = null; input = n; renameFor = n }
+                  Body {
+                      if (!ready) {
+                          EmptyNote("Profiles need All files access. Allow it for GreyGecko and restart the app.")
+                      }
+                      Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                          for (n in names) {
+                              key(n) {
+                                  val isCur = n == cur
+                                  Row(
+                                      Modifier
+                                          .fillMaxWidth()
+                                          .clickable(enabled = !isCur) { switchTo = n }
+                                          .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Column(Modifier.weight(1f)) {
+                                          Text(n, color = Color.White, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                          Text(
+                                              if (isCur) "Current profile" else "Tap to switch",
+                                              color = if (isCur) TmGreen else Soft,
+                                              fontSize = 11.sp
                                           )
-                                          DropdownMenuItem(
-                                              text = { Text("Duplicate", color = Color.White) },
-                                              onClick = {
-                                                  menuFor = null
-                                                  val r = Backup.duplicate(n, null)
-                                                  toast(ctx, if (r != null) "Created " + r else "Could not duplicate")
-                                                  rev++
-                                              }
-                                          )
-                                          if (!isCur) {
+                                      }
+                                      Box {
+                                          TextButton(onClick = { menuFor = n }) { Text("⋮", color = Color.White, fontSize = 20.sp) }
+                                          DropdownMenu(
+                                              expanded = menuFor == n,
+                                              onDismissRequest = { menuFor = null },
+                                              modifier = Modifier.background(Bar)
+                                          ) {
                                               DropdownMenuItem(
-                                                  text = { Text("Delete", color = Danger) },
-                                                  onClick = { menuFor = null; deleteFor = n }
+                                                  text = { Text("Rename", color = Color.White) },
+                                                  onClick = { menuFor = null; input = n; renameFor = n }
                                               )
+                                              DropdownMenuItem(
+                                                  text = { Text("Duplicate", color = Color.White) },
+                                                  onClick = {
+                                                      menuFor = null
+                                                      val r = Backup.duplicate(n, null)
+                                                      toast(ctx, if (r != null) "Created " + r else "Could not duplicate")
+                                                      rev++
+                                                  }
+                                              )
+                                              if (!isCur) {
+                                                  DropdownMenuItem(
+                                                      text = { Text("Delete", color = Danger) },
+                                                      onClick = { menuFor = null; deleteFor = n }
+                                                  )
+                                              }
                                           }
                                       }
                                   }
+                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                               }
-                              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                           }
                       }
                   }
