@@ -1,0 +1,517 @@
+name: YMLhelper
+
+# Small helper workflow. Add it once as .github/workflows/YMLhelper.yml and leave it alone.
+# The real build is the full workflow text saved as build.txt in the repo root.
+# Replace build.txt and push to build. Steps, versions, scripts and the artifact are all read from it.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read build file
+        id: plan
+        run: |
+          python3 -c "import yaml" 2>/dev/null || sudo apt-get install -y -qq python3-yaml >/dev/null 2>&1 || pip install -q --break-system-packages pyyaml
+          python3 -c "import yaml" || { echo "::error::PyYAML is not available"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/yh"
+          cat > "$RUNNER_TEMP/yh/yh.py" <<'PYEOF'
+          # YMLhelper: reads the big build file (a normal workflow written in a .txt)
+          # and runs its steps, so the real workflow yml stays tiny.
+          import glob
+          import hashlib
+          import json
+          import os
+          import re
+          import shlex
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          import yaml
+
+          WS = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
+          TMP = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
+          WORK = os.path.join(TMP, "yh")
+          PLAN = os.path.join(WORK, "plan.json")
+          DRY = bool(os.environ.get("YH_DRY"))
+          EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+
+
+          def say(msg):
+              print(msg)
+              sys.stdout.flush()
+
+
+          def fail(msg):
+              say("::error::" + msg)
+              sys.exit(1)
+
+
+          def find_build_file():
+              for n in ("build.txt", "build_yml.txt", "build.yml.txt"):
+                  p = os.path.join(WS, n)
+                  if os.path.isfile(p):
+                      return p
+              found = []
+              for p in sorted(glob.glob(os.path.join(WS, "*.txt"))):
+                  try:
+                      t = open(p, encoding="utf-8", errors="replace").read()
+                  except Exception:
+                      continue
+                  if re.search(r"^jobs:\s*$", t, re.M) and "steps:" in t:
+                      found.append(p)
+              if len(found) == 1:
+                  return found[0]
+              if not found:
+                  fail("No build file found. Put build.txt (the full workflow text) in the repo root.")
+              fail("More than one build file candidate in the repo root: " + ", ".join(os.path.basename(x) for x in found) + ". Keep one, or name it build.txt.")
+
+
+          def load_doc(path):
+              try:
+                  doc = yaml.safe_load(open(path, encoding="utf-8").read())
+              except Exception as e:
+                  fail("The build file is not valid YAML: " + str(e))
+              if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), dict):
+                  fail("The build file has no jobs: section.")
+              return doc
+
+
+          def kv_file(path):
+              res = {}
+              if not os.path.isfile(path):
+                  return res
+              lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+              i = 0
+              while i < len(lines):
+                  l = lines[i]
+                  eq = l.find("=")
+                  hd = l.find("<<")
+                  if hd > 0 and (eq < 0 or hd < eq):
+                      name = l[:hd]
+                      delim = l[hd + 2:]
+                      buf = []
+                      i += 1
+                      while i < len(lines) and lines[i] != delim:
+                          buf.append(lines[i])
+                          i += 1
+                      res[name] = "\n".join(buf)
+                  elif eq > 0:
+                      res[l[:eq]] = l[eq + 1:]
+                  i += 1
+              return res
+
+
+          class Ctx:
+              def __init__(self):
+                  self.steps = {}
+                  self.env = dict(os.environ)
+                  self.failed = False
+                  try:
+                      raw = json.loads(os.environ.get("SECRETS_JSON") or "{}")
+                  except Exception:
+                      raw = {}
+                  self.secrets = {str(k).lower(): v for k, v in raw.items()}
+
+              def S(self, sid, key):
+                  return self.steps.get(sid, {}).get("outputs", {}).get(key, "")
+
+              def SO(self, sid, key):
+                  return self.steps.get(sid, {}).get(key, "")
+
+              def E(self, k):
+                  return self.env.get(k, "")
+
+              def SEC(self, k):
+                  return self.secrets.get(str(k).lower(), "")
+
+              def G(self, k):
+                  return self.env.get("GITHUB_" + str(k).upper().replace(".", "_"), "")
+
+              def R(self, k):
+                  return self.env.get("RUNNER_" + str(k).upper(), "")
+
+              def hash_files(self, *pats):
+                  h = hashlib.sha256()
+                  for pat in pats:
+                      for p in sorted(glob.glob(os.path.join(WS, pat), recursive=True)):
+                          if os.path.isfile(p):
+                              h.update(open(p, "rb").read())
+                  return h.hexdigest()
+
+
+          def translate(e):
+              parts = re.split(r"('(?:[^']|'')*')", e)
+              for i, p in enumerate(parts):
+                  if i % 2 == 1:
+                      parts[i] = "'" + p[1:-1].replace("''", "\\'") + "'"
+                      continue
+                  p = re.sub(r"\bsteps\.([\w-]+)\.outputs\.([\w-]+)", lambda m: "S(%r,%r)" % (m.group(1), m.group(2)), p)
+                  p = re.sub(r"\bsteps\.([\w-]+)\.(outcome|conclusion)", lambda m: "SO(%r,%r)" % (m.group(1), m.group(2)), p)
+                  p = re.sub(r"\benv\.([\w-]+)", lambda m: "E(%r)" % m.group(1), p)
+                  p = re.sub(r"\bsecrets\.([\w-]+)", lambda m: "SEC(%r)" % m.group(1), p)
+                  p = re.sub(r"\bgithub\.([\w.]+)", lambda m: "G(%r)" % m.group(1), p)
+                  p = re.sub(r"\brunner\.(\w+)", lambda m: "R(%r)" % m.group(1), p)
+                  p = p.replace("&&", " and ").replace("||", " or ")
+                  p = re.sub(r"!(?!=)", " not ", p)
+                  p = re.sub(r"\btrue\b", "True", p)
+                  p = re.sub(r"\bfalse\b", "False", p)
+                  p = re.sub(r"\bnull\b", "None", p)
+                  parts[i] = p
+              return "".join(parts)
+
+
+          def ev(ctx, expr):
+              code = translate(expr.strip())
+              ns = {
+                  "S": ctx.S, "SO": ctx.SO, "E": ctx.E, "SEC": ctx.SEC, "G": ctx.G, "R": ctx.R,
+                  "success": lambda: not ctx.failed,
+                  "failure": lambda: ctx.failed,
+                  "always": lambda: True,
+                  "cancelled": lambda: False,
+                  "contains": lambda a, b: str(b).lower() in str(a).lower(),
+                  "startsWith": lambda a, b: str(a).lower().startswith(str(b).lower()),
+                  "endsWith": lambda a, b: str(a).lower().endswith(str(b).lower()),
+                  "toJSON": lambda v: json.dumps(v, indent=2),
+                  "fromJSON": lambda v: json.loads(v),
+                  "hashFiles": ctx.hash_files,
+              }
+              try:
+                  return eval(code, {"__builtins__": {}}, ns)
+              except Exception as ex:
+                  fail("Cannot evaluate expression: " + expr.strip() + " (" + str(ex) + ")")
+
+
+          def fmt(v):
+              if v is True:
+                  return "true"
+              if v is False:
+                  return "false"
+              if v is None:
+                  return ""
+              if isinstance(v, (dict, list)):
+                  return json.dumps(v)
+              return str(v)
+
+
+          def expand(ctx, text):
+              if not isinstance(text, str):
+                  return text
+              return EXPR.sub(lambda m: fmt(ev(ctx, m.group(1))), text)
+
+
+          def condition(ctx, cond):
+              if cond is None:
+                  return not ctx.failed
+              if isinstance(cond, bool):
+                  return cond and not ctx.failed
+              c = str(cond).strip()
+              m = EXPR.fullmatch(c)
+              if m:
+                  c = m.group(1).strip()
+              if not re.search(r"\b(always|failure|success|cancelled)\(\)", c):
+                  c = "success() && (" + c + ")"
+              return bool(ev(ctx, c))
+
+
+          SLOT_NAMES = {
+              "actions/checkout": "checkout",
+              "actions/setup-java": "java",
+              "gradle/actions/setup-gradle": "gradle",
+              "actions/setup-node": "node",
+              "actions/setup-python": "python",
+              "actions/cache": "cache",
+              "actions/upload-artifact": "upload",
+          }
+          MAX_SLOTS = 3
+
+
+          def setout(k, v):
+              path = os.environ.get("GITHUB_OUTPUT")
+              if not path:
+                  say("output " + k + "=" + str(v))
+                  return
+              with open(path, "a", encoding="utf-8") as f:
+                  v = str(v)
+                  if "\n" in v:
+                      f.write(k + "<<YH_EOF\n" + v + "\nYH_EOF\n")
+                  else:
+                      f.write(k + "=" + v + "\n")
+
+
+          def mode_plan():
+              path = find_build_file()
+              doc = load_doc(path)
+              ctx = Ctx()
+              say("Build file: " + os.path.relpath(path, WS) + " (" + str(os.path.getsize(path) // 1024) + " KB)")
+              meta = {"file": path, "cache_ids": {}}
+              counts = {"cache": 0, "upload": 0}
+              seen = set()
+              problems = []
+              for jn, job in doc["jobs"].items():
+                  if isinstance(job, dict) and job.get("strategy"):
+                      problems.append("job " + str(jn) + " uses strategy/matrix, which the helper does not support")
+                  for st in (job or {}).get("steps") or []:
+                      if "uses" not in st:
+                          continue
+                      action = str(st["uses"]).split("@")[0].strip().lower()
+                      kind = SLOT_NAMES.get(action)
+                      if kind is None:
+                          problems.append("unsupported action: " + str(st["uses"]))
+                          continue
+                      w = {}
+                      for k, v in (st.get("with") or {}).items():
+                          try:
+                              w[k] = expand(ctx, str(v))
+                          except SystemExit:
+                              w[k] = str(v)
+                      if kind == "checkout":
+                          continue
+                      if kind in ("java", "gradle", "node", "python"):
+                          if kind in seen:
+                              problems.append("more than one " + action + " step (only one is supported)")
+                              continue
+                          seen.add(kind)
+                      if kind == "java":
+                          setout("java_dist", w.get("distribution", "temurin"))
+                          setout("java_version", w.get("java-version", "17"))
+                      elif kind == "gradle":
+                          setout("gradle_version", w.get("gradle-version", "wrapper"))
+                      elif kind == "node":
+                          setout("node_version", w.get("node-version", "20"))
+                      elif kind == "python":
+                          setout("python_version", w.get("python-version", "3.12"))
+                      elif kind == "cache":
+                          counts["cache"] += 1
+                          n = counts["cache"]
+                          if n > MAX_SLOTS:
+                              problems.append("more than " + str(MAX_SLOTS) + " cache steps")
+                              continue
+                          if not w.get("path") or not w.get("key"):
+                              problems.append("a cache step needs both path and key")
+                              continue
+                          setout("c%d_path" % n, w["path"])
+                          setout("c%d_key" % n, w["key"])
+                          setout("c%d_restore" % n, w.get("restore-keys", ""))
+                          if st.get("id"):
+                              meta["cache_ids"][st["id"]] = n
+                      elif kind == "upload":
+                          counts["upload"] += 1
+                          n = counts["upload"]
+                          if n > MAX_SLOTS:
+                              problems.append("more than " + str(MAX_SLOTS) + " upload-artifact steps")
+                              continue
+                          if not w.get("path"):
+                              problems.append("an upload-artifact step needs a path")
+                              continue
+                          setout("u%d_name" % n, w.get("name", "artifact"))
+                          setout("u%d_path" % n, w["path"])
+                          setout("u%d_missing" % n, w.get("if-no-files-found", "warn"))
+                          setout("u%d_days" % n, w.get("retention-days", "0"))
+              if problems:
+                  for p in problems:
+                      say("::error::" + p)
+                  say("::error::Update YMLhelper.yml (or change the build file) to cover this, then run again.")
+                  sys.exit(1)
+              os.makedirs(WORK, exist_ok=True)
+              json.dump(meta, open(PLAN, "w"))
+              say("Plan ready: " + json.dumps({"cache_slots": counts["cache"], "upload_slots": counts["upload"]}))
+
+
+          def shell_cmd(shell, script_path):
+              if shell in (None, "bash"):
+                  return ["bash", "--noprofile", "--norc", "-eo", "pipefail", script_path]
+              if shell == "sh":
+                  return ["sh", "-e", script_path]
+              if isinstance(shell, str) and "{0}" in shell:
+                  return [a.replace("{0}", script_path) for a in shlex.split(shell)]
+              fail("Unsupported shell: " + str(shell))
+
+
+          def mode_run():
+              meta = json.load(open(PLAN))
+              doc = load_doc(meta["file"])
+              ctx = Ctx()
+              for sid, n in meta["cache_ids"].items():
+                  ctx.steps[sid] = {"outputs": {"cache-hit": os.environ.get("CACHE_HIT_%d" % n, "")}}
+              top_env = doc.get("env") or {}
+              top_defaults = (doc.get("defaults") or {}).get("run") or {}
+              t0 = time.time()
+              ran = 0
+              for jn, job in doc["jobs"].items():
+                  job = job or {}
+                  scope_env = {}
+                  for src in (top_env, job.get("env") or {}):
+                      for k, v in src.items():
+                          scope_env[str(k)] = expand(ctx, v)
+                          ctx.env[str(k)] = scope_env[str(k)]
+                  defaults = dict(top_defaults)
+                  defaults.update((job.get("defaults") or {}).get("run") or {})
+                  say("Job: " + str(jn))
+                  idx = 0
+                  for st in job.get("steps") or []:
+                      idx += 1
+                      name = str(st.get("name") or st.get("id") or st.get("uses") or "step " + str(idx))
+                      if "uses" in st:
+                          say("[helper] " + name + " is done by YMLhelper.yml (" + str(st["uses"]) + ")")
+                          continue
+                      if "run" not in st:
+                          continue
+                      if not condition(ctx, st.get("if")):
+                          say("[skip] " + name)
+                          continue
+                      step_env = dict(ctx.env)
+                      for k, v in (st.get("env") or {}).items():
+                          step_env[str(k)] = fmt(expand(ctx, v))
+                      script = expand(ctx, str(st["run"]))
+                      cwd = WS
+                      if st.get("working-directory"):
+                          cwd = os.path.join(WS, str(expand(ctx, st["working-directory"])))
+                      os.makedirs(WORK, exist_ok=True)
+                      sp = os.path.join(WORK, "step-%d.sh" % idx)
+                      with open(sp, "w", encoding="utf-8", newline="\n") as f:
+                          f.write(script)
+                      f_env = os.path.join(WORK, "env-%d" % idx)
+                      f_out = os.path.join(WORK, "out-%d" % idx)
+                      f_path = os.path.join(WORK, "path-%d" % idx)
+                      for p in (f_env, f_out, f_path):
+                          open(p, "w").close()
+                      step_env["GITHUB_ENV"] = f_env
+                      step_env["GITHUB_OUTPUT"] = f_out
+                      step_env["GITHUB_PATH"] = f_path
+                      say("::group::" + name)
+                      started = time.time()
+                      if DRY:
+                          rc = subprocess.run(["bash", "-n", sp]).returncode
+                          say("[dry run] syntax check " + ("ok" if rc == 0 else "FAILED") + ", " + str(len(script)) + " chars")
+                      else:
+                          rc = subprocess.run(shell_cmd(st.get("shell") or defaults.get("shell"), sp), env=step_env, cwd=cwd).returncode
+                      say("::endgroup::")
+                      ran += 1
+                      for k, v in kv_file(f_env).items():
+                          ctx.env[k] = v
+                      paths = [l.strip() for l in open(f_path, encoding="utf-8", errors="replace").read().split("\n") if l.strip()]
+                      if paths:
+                          ctx.env["PATH"] = os.pathsep.join(paths + [ctx.env.get("PATH", "")])
+                      outs = kv_file(f_out)
+                      sid = st.get("id")
+                      result = "success" if rc == 0 else "failure"
+                      if sid:
+                          ctx.steps[sid] = {"outputs": outs, "outcome": result, "conclusion": result}
+                      if rc != 0:
+                          coe = st.get("continue-on-error")
+                          if isinstance(coe, str):
+                              coe = bool(ev(ctx, EXPR.fullmatch(coe.strip()).group(1))) if EXPR.fullmatch(coe.strip()) else coe.strip().lower() == "true"
+                          say("::error::Step failed: " + name + " (exit code " + str(rc) + ", " + str(int(time.time() - started)) + "s)")
+                          if not coe:
+                              ctx.failed = True
+                      else:
+                          say("[ok] " + name + " (" + str(int(time.time() - started)) + "s)")
+              say("Finished " + str(ran) + " steps in " + str(int(time.time() - t0)) + "s")
+              sys.exit(1 if ctx.failed else 0)
+
+
+          if __name__ == "__main__":
+              if len(sys.argv) < 2 or sys.argv[1] not in ("plan", "run"):
+                  fail("usage: yh.py plan|run")
+              if sys.argv[1] == "plan":
+                  mode_plan()
+              else:
+                  mode_run()
+          PYEOF
+          python3 "$RUNNER_TEMP/yh/yh.py" plan
+
+      - name: Java
+        if: steps.plan.outputs.java_version != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ steps.plan.outputs.java_dist }}
+          java-version: ${{ steps.plan.outputs.java_version }}
+
+      - name: Gradle
+        if: steps.plan.outputs.gradle_version != ''
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.plan.outputs.gradle_version }}
+
+      - name: Node
+        if: steps.plan.outputs.node_version != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.plan.outputs.node_version }}
+
+      - name: Python
+        if: steps.plan.outputs.python_version != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.plan.outputs.python_version }}
+
+      - name: Cache 1
+        id: c1
+        if: steps.plan.outputs.c1_key != ''
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.plan.outputs.c1_path }}
+          key: ${{ steps.plan.outputs.c1_key }}
+          restore-keys: ${{ steps.plan.outputs.c1_restore }}
+
+      - name: Cache 2
+        id: c2
+        if: steps.plan.outputs.c2_key != ''
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.plan.outputs.c2_path }}
+          key: ${{ steps.plan.outputs.c2_key }}
+          restore-keys: ${{ steps.plan.outputs.c2_restore }}
+
+      - name: Cache 3
+        id: c3
+        if: steps.plan.outputs.c3_key != ''
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.plan.outputs.c3_path }}
+          key: ${{ steps.plan.outputs.c3_key }}
+          restore-keys: ${{ steps.plan.outputs.c3_restore }}
+
+      - name: Run build file
+        id: build
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CACHE_HIT_1: ${{ steps.c1.outputs.cache-hit }}
+          CACHE_HIT_2: ${{ steps.c2.outputs.cache-hit }}
+          CACHE_HIT_3: ${{ steps.c3.outputs.cache-hit }}
+        run: python3 "$RUNNER_TEMP/yh/yh.py" run
+
+      - name: Upload 1
+        if: steps.plan.outputs.u1_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.plan.outputs.u1_name }}
+          path: ${{ steps.plan.outputs.u1_path }}
+          if-no-files-found: ${{ steps.plan.outputs.u1_missing }}
+          retention-days: ${{ steps.plan.outputs.u1_days }}
+
+      - name: Upload 2
+        if: steps.plan.outputs.u2_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.plan.outputs.u2_name }}
+          path: ${{ steps.plan.outputs.u2_path }}
+          if-no-files-found: ${{ steps.plan.outputs.u2_missing }}
+          retention-days: ${{ steps.plan.outputs.u2_days }}
+
+      - name: Upload 3
+        if: steps.plan.outputs.u3_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.plan.outputs.u3_name }}
+          path: ${{ steps.plan.outputs.u3_path }}
+          if-no-files-found: ${{ steps.plan.outputs.u3_missing }}
+          retention-days: ${{ steps.plan.outputs.u3_days }}
