@@ -8191,6 +8191,13 @@ jobs:
               }
           }
 
+          object TabMgrMemory {
+              var activeKey: String? = null
+              var railScroll = 0
+              val listScroll = HashMap<String, Int>()
+              var curIdAtOpen: Int? = null
+          }
+
           @Composable
           fun TabManagerScreen(
               tabs: TabManager,
@@ -8200,7 +8207,14 @@ jobs:
           ) {
               val groups = groupTabs(tabs.tabs.filter { !it.preview })
               val curKey = groupKeyOf(tabs.current)
-              var activeKey by remember { mutableStateOf(curKey) }
+              val mem = TabMgrMemory
+              val startKey = remember {
+                  val prev = mem.activeKey
+                  val changed = mem.curIdAtOpen != tabs.current?.id
+                  mem.curIdAtOpen = tabs.current?.id
+                  if (prev != null && !(changed && prev != curKey)) prev else curKey
+              }
+              var activeKey by remember { mutableStateOf(startKey) }
               var dragKey by remember { mutableStateOf<String?>(null) }
               var dragOffset by remember { mutableStateOf(0f) }
               val heights = remember { mutableStateMapOf<String, Int>() }
@@ -8208,6 +8222,18 @@ jobs:
               val active = groups.firstOrNull { it.key == activeKey }
                   ?: groups.firstOrNull { it.key == curKey }
                   ?: groups.firstOrNull()
+              val railScroll = rememberScrollState(mem.railScroll)
+              val listScroll = remember(active?.key) {
+                  androidx.compose.foundation.ScrollState(mem.listScroll[active?.key ?: ""] ?: 0)
+              }
+              LaunchedEffect(railScroll) {
+                  snapshotFlow { railScroll.value }.collect { mem.railScroll = it }
+              }
+              LaunchedEffect(listScroll) {
+                  val k = active?.key ?: ""
+                  snapshotFlow { listScroll.value }.collect { mem.listScroll[k] = it }
+              }
+              LaunchedEffect(active?.key) { mem.activeKey = active?.key }
 
               Column(Modifier.fillMaxSize().background(BG)) {
                   Header {
@@ -8235,7 +8261,7 @@ jobs:
                                       .width(railW)
                                       .fillMaxHeight()
                                       .background(Bar)
-                                      .verticalScroll(rememberScrollState())
+                                      .verticalScroll(railScroll)
                                       .padding(vertical = 8.dp)
                               ) {
                                   for (g in groups) {
@@ -8299,7 +8325,7 @@ jobs:
                                   Modifier
                                       .weight(1f)
                                       .fillMaxHeight()
-                                      .verticalScroll(rememberScrollState())
+                                      .verticalScroll(listScroll)
                                       .padding(12.dp)
                               ) {
                                   if (active != null) {
@@ -9403,6 +9429,7 @@ jobs:
               val rulesRev = HideRules.rev
               val rules = remember(rulesRev) { HideRules.all() }
               var confirmHost by remember { mutableStateOf<String?>(null) }
+              var openHosts by remember { mutableStateOf(setOf<String>()) }
               fun reload() { HideRules.rev = HideRules.rev + 1 }
               val groups = rules.groupBy { it.host }
               Column(Modifier.fillMaxSize()) {
@@ -9416,13 +9443,16 @@ jobs:
                       }
                       Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
                           for ((host, list) in groups) {
+                              val expanded = openHosts.contains(host)
                               Row(
                                   Modifier
                                       .fillMaxWidth()
+                                      .clickable { openHosts = if (expanded) openHosts - host else openHosts + host }
                                       .background(Bar)
                                       .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
                                   verticalAlignment = Alignment.CenterVertically
                               ) {
+                                  Text(if (expanded) "▾" else "▸", color = Soft, fontSize = 14.sp, modifier = Modifier.width(16.dp))
                                   FaviconBox(host, 22.dp, 6.dp, 11)
                                   Spacer(Modifier.width(10.dp))
                                   Column(Modifier.weight(1f)) {
@@ -9442,40 +9472,44 @@ jobs:
                                   }
                                   TextButton(onClick = { confirmHost = host }) { Text("Clear", color = Danger, fontSize = 12.sp) }
                               }
-                              for (r in list) {
-                                  key(r.host + "|" + r.path + "|" + r.sel) {
-                                      val isClosing = HideRules.closing.contains(HideRules.keyOf(r))
-                                      val rowBg by animateColorAsState(if (isClosing) Color(0xFF4A2A2A) else Color.Transparent, label = "ruleBg")
-                                      Row(
-                                          Modifier
-                                              .fillMaxWidth()
-                                              .background(rowBg)
-                                              .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 8.dp),
-                                          verticalAlignment = Alignment.CenterVertically
-                                      ) {
-                                          Column(Modifier.weight(1f)) {
-                                              Text(
-                                                  r.sel,
-                                                  color = Color.White,
-                                                  fontSize = 11.sp,
-                                                  fontFamily = FontFamily.Monospace,
-                                                  maxLines = 2,
-                                                  overflow = TextOverflow.Ellipsis
-                                              )
-                                              Text(
-                                                  if (r.path.isEmpty()) "Whole site" else "Page: " + r.path,
-                                                  color = Soft,
-                                                  fontSize = 11.sp,
-                                                  maxLines = 1,
-                                                  overflow = TextOverflow.Ellipsis
-                                              )
-                                          }
-                                          Spacer(Modifier.width(8.dp))
-                                          UndoClose(isClosing) {
-                                              if (isClosing) HideRules.undoRemove(r) else HideRules.requestRemove(r)
+                              androidx.compose.animation.AnimatedVisibility(visible = expanded) {
+                                  Column {
+                                      for (r in list) {
+                                          key(r.host + "|" + r.path + "|" + r.sel) {
+                                              val isClosing = HideRules.closing.contains(HideRules.keyOf(r))
+                                              val rowBg by animateColorAsState(if (isClosing) Color(0xFF4A2A2A) else Color.Transparent, label = "ruleBg")
+                                              Row(
+                                                  Modifier
+                                                      .fillMaxWidth()
+                                                      .background(rowBg)
+                                                      .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 8.dp),
+                                                  verticalAlignment = Alignment.CenterVertically
+                                              ) {
+                                                  Column(Modifier.weight(1f)) {
+                                                      Text(
+                                                          r.sel,
+                                                          color = Color.White,
+                                                          fontSize = 11.sp,
+                                                          fontFamily = FontFamily.Monospace,
+                                                          maxLines = 2,
+                                                          overflow = TextOverflow.Ellipsis
+                                                      )
+                                                      Text(
+                                                          if (r.path.isEmpty()) "Whole site" else "Page: " + r.path,
+                                                          color = Soft,
+                                                          fontSize = 11.sp,
+                                                          maxLines = 1,
+                                                          overflow = TextOverflow.Ellipsis
+                                                      )
+                                                  }
+                                                  Spacer(Modifier.width(8.dp))
+                                                  UndoClose(isClosing) {
+                                                      if (isClosing) HideRules.undoRemove(r) else HideRules.requestRemove(r)
+                                                  }
+                                              }
+                                              Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                                           }
                                       }
-                                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                                   }
                               }
                           }
