@@ -296,14 +296,20 @@ jobs:
           {
             "manifest_version": 2,
             "name": "GreyScripts",
-            "version": "4.0",
+            "version": "4.1",
             "browser_specific_settings": { "gecko": { "id": "scripts@grey.gecko" } },
-            "background": { "scripts": ["background.js"] },
+            "background": { "scripts": ["background.js", "capbg.js"] },
             "content_scripts": [
               {
                 "matches": ["<all_urls>"],
                 "js": ["content.js"],
                 "run_at": "document_start"
+              },
+              {
+                "matches": ["<all_urls>"],
+                "js": ["capture.js"],
+                "run_at": "document_start",
+                "all_frames": true
               }
             ],
             "permissions": ["nativeMessaging", "geckoViewAddons", "tabs", "webRequest", "webRequestBlocking", "<all_urls>"]
@@ -1288,6 +1294,7 @@ jobs:
           var nport = null;
 
           function onPortMsg(m) {
+            if (m && m.type === "capcmd") { if (typeof capCmd === "function") capCmd(m); return; }
             if (m && m.type === "saver") { blockImg = !!m.img; if (typeof m.go === "boolean") grabOnly = m.go; return; }
             if (!m || m.type !== "pick") return;
             var tid = m.tabId;
@@ -1323,6 +1330,435 @@ jobs:
           connectPort();
 
           nlog("background started");
+          EOF
+
+          cat > app/src/main/assets/ext/capbg.js <<'EOF'
+          (function () {
+            var on = false;
+            var listening = false;
+            var buf = [];
+            var timer = null;
+            var reqs = {};
+            var reqN = 0;
+            var quiet = {};
+            var rm = {};
+            var WR = { urls: ["<all_urls>"] };
+            var QUIET = { image: 1, imageset: 1, font: 1, stylesheet: 1, script: 1 };
+            var MEDIA_URL = /\.(m3u8|mpd|mp4|m4v|webm|mkv|m4s|ts|mp3|m4a|aac|ogg|flac|wav|vtt)(\?|#|$)/i;
+
+            function count(k) {
+              rm[k] = (rm[k] || 0) + 1;
+            }
+
+            function hostOf(u) {
+              var m = /^[a-z][a-z0-9+.-]*:\/\/([^\/:?#]+)/i.exec(u);
+              return m ? m[1].toLowerCase() : "";
+            }
+
+            function flush() {
+              timer = null;
+              var b = buf;
+              var r = rm;
+              buf = [];
+              rm = {};
+              if (!b.length && !Object.keys(r).length) return;
+              try {
+                browser.runtime.sendNativeMessage(APP, { type: "cap", ev: b, rm: r }).catch(function () {});
+              } catch (e) {}
+            }
+
+            function emit(kind, tab, text) {
+              buf.push([Date.now(), kind, typeof tab === "number" ? tab : -1, String(text)]);
+              if (buf.length >= 150) {
+                if (timer) clearTimeout(timer);
+                flush();
+              } else if (!timer) {
+                timer = setTimeout(flush, 400);
+              }
+            }
+
+            function onBefore(d) {
+              if (!on) return;
+              if (reqN > 3000) { reqs = {}; reqN = 0; }
+              reqN++;
+              reqs[d.requestId] = { t: Date.now(), m: d.method, u: d.url, ty: d.type, tab: d.tabId, s: 0, ct: "", len: "", ref: "", org: "", loc: "", oh: "", rng: "", cr: "", cd: "" };
+            }
+
+            function onSend(d) {
+              var r = reqs[d.requestId];
+              if (!r) return;
+              var h = d.requestHeaders || [];
+              var others = [];
+              for (var i = 0; i < h.length; i++) {
+                var n = h[i].name.toLowerCase();
+                if (n === "cookie") count("cookie");
+                else if (n === "authorization" || n === "proxy-authorization") count("auth");
+                else if (n === "referer") r.ref = h[i].value || "";
+                else if (n === "origin") r.org = h[i].value || "";
+                else if (n === "content-type") r.rct = h[i].value || "";
+                else if (n === "range") r.rng = h[i].value || "";
+                else if (n.indexOf("x-") === 0) others.push(n);
+              }
+              r.oh = others.join(",");
+            }
+
+            function onHdrs(d) {
+              var r = reqs[d.requestId];
+              if (!r) return;
+              r.s = d.statusCode;
+              var h = d.responseHeaders || [];
+              for (var i = 0; i < h.length; i++) {
+                var n = h[i].name.toLowerCase();
+                var v = h[i].value || "";
+                if (n === "content-type") r.ct = v.split(";")[0];
+                else if (n === "content-length") r.len = v;
+                else if (n === "location") r.loc = v;
+                else if (n === "set-cookie") count("setcookie");
+                else if (n === "content-range") r.cr = v;
+                else if (n === "content-disposition") r.cd = v;
+              }
+            }
+
+            function onRedirect(d) {
+              if (!on) return;
+              emit("REDIR", d.tabId, d.statusCode + " " + d.url + " -> " + d.redirectUrl);
+            }
+
+            function finish(d, err) {
+              var r = reqs[d.requestId];
+              if (!r) return;
+              delete reqs[d.requestId];
+              if (reqN > 0) reqN--;
+              var status = err ? "ERR:" + err : (r.s || d.statusCode || 0);
+              var host = hostOf(r.u);
+              var bytes = parseInt(r.len, 10) || 0;
+              if (err && /ABORT/i.test(err)) {
+                var qa = quiet[host + "|aborted"] || (quiet[host + "|aborted"] = [0, 0]);
+                qa[0]++;
+                return;
+              }
+              if (QUIET[r.ty] && !err && (status < 400)) {
+                var q = quiet[host + "|" + r.ty] || (quiet[host + "|" + r.ty] = [0, 0]);
+                q[0]++;
+                q[1] += bytes;
+                return;
+              }
+              var media = MEDIA_URL.test(r.u) || /^(video|audio)\//i.test(r.ct) || /mpegurl|dash\+xml/i.test(r.ct);
+              var t = r.m + " " + status + " " + r.ty;
+              if (r.ct) t += " " + r.ct;
+              if (r.len) t += " " + r.len + "B";
+              t += " " + (Date.now() - r.t) + "ms";
+              if (r.rct && r.m !== "GET") t += " sent=" + r.rct.split(";")[0];
+              if (r.ref && r.ty !== "image") t += " ref=" + r.ref;
+              if (r.org) t += " origin=" + r.org;
+              if (r.loc) t += " location=" + r.loc;
+              if (r.rng) t += " range=" + r.rng;
+              if (r.cr) t += " content-range=" + r.cr;
+              if (r.cd) t += " disposition=" + r.cd;
+              if (r.oh) t += " hdrs=" + r.oh;
+              t += " " + r.u;
+              emit(media ? "MEDIA" : "NET", r.tab, t);
+            }
+
+            function onDone(d) { finish(d, null); }
+            function onFail(d) { finish(d, d.error || "error"); }
+
+            function listen(v) {
+              if (v === listening) return;
+              listening = v;
+              var w = browser.webRequest;
+              var f = v ? "addListener" : "removeListener";
+              w.onBeforeRequest[f](onBefore, WR);
+              w.onSendHeaders[f](onSend, WR, ["requestHeaders"]);
+              w.onHeadersReceived[f](onHdrs, WR, ["responseHeaders"]);
+              w.onBeforeRedirect[f](onRedirect, WR);
+              w.onCompleted[f](onDone, WR);
+              w.onErrorOccurred[f](onFail, WR);
+            }
+
+            function tellTabs(v) {
+              browser.tabs.query({}).then(function (tabs) {
+                for (var i = 0; i < tabs.length; i++) {
+                  browser.tabs.sendMessage(tabs[i].id, { type: "capstate", on: v }).catch(function () {});
+                }
+              }).catch(function () {});
+            }
+
+            window.capCmd = function (m) {
+              try {
+                if (m.cmd === "on") {
+                  reqs = {};
+                  reqN = 0;
+                  quiet = {};
+                  on = true;
+                  listen(true);
+                  tellTabs(true);
+                  nlog("capture on");
+                } else if (m.cmd === "off") {
+                  on = false;
+                  listen(false);
+                  tellTabs(false);
+                  for (var k in quiet) {
+                    var p = k.split("|");
+                    emit("NETSUM", -1, p[0] + "|" + p[1] + "|" + quiet[k][0] + "|" + quiet[k][1]);
+                  }
+                  quiet = {};
+                  reqs = {};
+                  if (timer) clearTimeout(timer);
+                  flush();
+                  nlog("capture off");
+                }
+              } catch (e) {
+                nlog("capture cmd failed: " + e);
+              }
+            };
+
+            browser.runtime.onMessage.addListener(function (msg, sender) {
+              if (!msg || typeof msg.type !== "string" || msg.type.indexOf("cap") !== 0) return;
+              if (msg.type === "caphello") {
+                if (on && sender.tab) {
+                  browser.tabs.sendMessage(sender.tab.id, { type: "capstate", on: true }, { frameId: sender.frameId }).catch(function () {});
+                }
+                return;
+              }
+              if (msg.type === "capev" && on) {
+                if (msg.rm) count(String(msg.rm));
+                emit(String(msg.k), sender.tab ? sender.tab.id : -1, msg.x);
+              }
+            });
+          })();
+          EOF
+
+          cat > app/src/main/assets/ext/capture.js <<'EOF'
+          (function () {
+            if (window.__greyCapLoaded) return;
+            window.__greyCapLoaded = true;
+            var on = false;
+            var isTop = window === window.top;
+            var sent = 0;
+            var windowStart = Date.now();
+            var lastHref = location.href;
+            var spaTimer = null;
+            var typedAt = new WeakMap();
+            var scrollTimers = new WeakMap();
+            var mediaSeen = new WeakMap();
+
+            function send(kind, text, rm) {
+              var now = Date.now();
+              if (now - windowStart > 10000) { windowStart = now; sent = 0; }
+              if (sent++ > 400) return;
+              try {
+                browser.runtime.sendMessage({ type: "capev", k: kind, x: text, rm: rm || "" }).catch(function () {});
+              } catch (e) {}
+            }
+
+            function stable(s) {
+              return !!s && s.length <= 32 && !/\d{3,}/.test(s) && !/^(css|sc|jsx|styled|emotion)-/i.test(s);
+            }
+            function esc(s) {
+              return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+            }
+            function one(el) {
+              var tag = el.tagName.toLowerCase();
+              if (el.id && stable(el.id)) return tag + "#" + esc(el.id);
+              var s = tag;
+              var n = 0;
+              if (el.classList) {
+                for (var i = 0; i < el.classList.length && n < 2; i++) {
+                  if (stable(el.classList[i])) { s += "." + esc(el.classList[i]); n++; }
+                }
+              }
+              var p = el.parentElement;
+              if (p) {
+                var same = 0;
+                var idx = 0;
+                for (var c = p.firstElementChild; c; c = c.nextElementSibling) {
+                  if (c.tagName === el.tagName) { same++; if (c === el) idx = same; }
+                }
+                if (same > 1) s += ":nth-of-type(" + idx + ")";
+              }
+              return s;
+            }
+            function cssPath(el) {
+              var parts = [];
+              var cur = el;
+              while (cur && cur.nodeType === 1 && parts.length < 6) {
+                parts.unshift(one(cur));
+                var sel = parts.join(" > ");
+                try { if (document.querySelectorAll(sel).length === 1) return sel; } catch (e) {}
+                cur = cur.parentElement;
+              }
+              return parts.join(" > ");
+            }
+            function txt(el) {
+              var t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+              return t.length > 60 ? t.slice(0, 57) + "..." : t;
+            }
+            function attr(el, n) {
+              var v = el.getAttribute ? el.getAttribute(n) : null;
+              return v ? String(v).replace(/\s+/g, " ").slice(0, 80) : "";
+            }
+            function isField(el) {
+              var t = el.tagName.toLowerCase();
+              return t === "input" || t === "textarea" || t === "select" || !!el.isContentEditable;
+            }
+            function describe(el) {
+              var tag = el.tagName.toLowerCase();
+              var o = "sel=\"" + cssPath(el) + "\" tag=" + tag;
+              if (!isField(el)) {
+                var t = txt(el);
+                if (t) o += " text=\"" + t + "\"";
+              }
+              var names = ["href", "src", "name", "type", "role", "aria-label", "title", "placeholder", "data-testid", "data-id", "alt", "action", "target"];
+              for (var i = 0; i < names.length; i++) {
+                var v = attr(el, names[i]);
+                if (v) o += " " + names[i] + "=\"" + v + "\"";
+              }
+              try {
+                var r = el.getBoundingClientRect();
+                o += " rect=" + Math.round(r.left) + "," + Math.round(r.top) + "," + Math.round(r.width) + "x" + Math.round(r.height);
+              } catch (e) {}
+              if (!isTop) o += " frame=" + location.origin + location.pathname;
+              return o;
+            }
+
+            var INTERACTIVE = "a,button,input,select,textarea,label,summary,[role=button],[role=link],[onclick],[tabindex]";
+
+            function pageInfo(why) {
+              try {
+                var title = isTop ? " title=\"" + (document.title || "").slice(0, 80) + "\"" : "";
+                send("PAGE", why + " " + location.origin + location.pathname + title +
+                  " forms=" + document.forms.length +
+                  " fields=" + document.querySelectorAll("input,textarea,select").length +
+                  " links=" + document.querySelectorAll("a[href]").length +
+                  " iframes=" + document.querySelectorAll("iframe").length +
+                  " media=" + document.querySelectorAll("video,audio").length +
+                  (isTop ? "" : " (iframe)"));
+              } catch (e) {}
+            }
+
+            document.addEventListener("click", function (e) {
+              if (!on || !e.target || !e.target.tagName) return;
+              var hit = e.target;
+              var target = hit.closest ? (hit.closest(INTERACTIVE) || hit) : hit;
+              var extra = target !== hit ? " hit=" + hit.tagName.toLowerCase() : "";
+              send("CLICK", describe(target) + extra);
+            }, true);
+
+            document.addEventListener("submit", function (e) {
+              if (!on || !e.target || !e.target.tagName) return;
+              var f = e.target;
+              var names = [];
+              try {
+                var els = f.elements || [];
+                for (var i = 0; i < els.length && i < 30; i++) {
+                  var n = els[i].name || els[i].id || els[i].type || els[i].tagName.toLowerCase();
+                  names.push(String(n).slice(0, 30) + ":" + (els[i].type || els[i].tagName.toLowerCase()));
+                }
+              } catch (x) {}
+              send("SUBMIT", "form sel=\"" + cssPath(f) + "\" method=" + (f.method || "get") + " action=\"" + attr(f, "action") + "\" fields=" + names.join(","));
+            }, true);
+
+            document.addEventListener("input", function (e) {
+              if (!on || !e.target || !e.target.tagName || !isField(e.target)) return;
+              var el = e.target;
+              var now = Date.now();
+              var last = typedAt.get(el) || 0;
+              typedAt.set(el, now);
+              if (now - last < 1500) return;
+              var type = (el.type || "").toLowerCase();
+              var len = 0;
+              try { len = (el.value || el.textContent || "").length; } catch (x) {}
+              send("INPUT", describe(el) + " value=[removed]" + (type === "password" ? " (password field)" : ""), type === "password" ? "pw" : "typed");
+            }, true);
+
+            document.addEventListener("change", function (e) {
+              if (!on || !e.target || !e.target.tagName) return;
+              var el = e.target;
+              var tag = el.tagName.toLowerCase();
+              var type = (el.type || "").toLowerCase();
+              if (tag === "select") send("CHANGE", describe(el) + " selectedIndex=" + el.selectedIndex);
+              else if (type === "checkbox" || type === "radio") send("CHANGE", describe(el) + " checked=" + !!el.checked);
+            }, true);
+
+            document.addEventListener("keydown", function (e) {
+              if (!on || e.key !== "Enter" || !e.target || !e.target.tagName) return;
+              send("KEY", "Enter on " + describe(e.target));
+            }, true);
+
+            window.addEventListener("scroll", function (e) {
+              if (!on) return;
+              var t = e.target;
+              var key = (t === document || t === window) ? document : t;
+              var prev = scrollTimers.get(key);
+              if (prev) clearTimeout(prev);
+              scrollTimers.set(key, setTimeout(function () {
+                if (!on) return;
+                if (key === document) {
+                  var de = document.documentElement;
+                  send("SCROLL", "page y=" + Math.round(window.scrollY) + " of " + Math.round(de.scrollHeight) + " viewport=" + window.innerHeight + (isTop ? "" : " (iframe)"));
+                } else if (key.tagName) {
+                  send("SCROLL", "element " + describe(key) + " top=" + Math.round(key.scrollTop) + " of " + Math.round(key.scrollHeight));
+                }
+              }, 400));
+            }, true);
+
+            window.addEventListener("error", function (e) {
+              if (!on) return;
+              send("ERROR", String(e.message || "error").slice(0, 200) + " at " + (e.filename || "") + ":" + (e.lineno || 0));
+            });
+            window.addEventListener("unhandledrejection", function (e) {
+              if (!on) return;
+              var r = e.reason;
+              var m = r && r.message ? r.message : String(r);
+              send("ERROR", "unhandled promise rejection: " + String(m).slice(0, 200));
+            });
+
+            function mediaEvent(e) {
+              if (!on || !e.target || !e.target.tagName) return;
+              var t = e.target.tagName.toLowerCase();
+              if (t !== "video" && t !== "audio") return;
+              var src = e.target.currentSrc || e.target.src || "";
+              if (mediaSeen.get(e.target) === src) return;
+              mediaSeen.set(e.target, src);
+              send("MEDIAEL", t + " src=\"" + src + "\" duration=" + (isFinite(e.target.duration) ? Math.round(e.target.duration) : "?") + " " + describe(e.target));
+            }
+            document.addEventListener("loadedmetadata", mediaEvent, true);
+            document.addEventListener("play", mediaEvent, true);
+
+            function startSpa() {
+              if (spaTimer) return;
+              lastHref = location.href;
+              spaTimer = setInterval(function () {
+                if (!on) return;
+                if (location.href !== lastHref) {
+                  send("SPA", "address changed " + lastHref + " -> " + location.href + (isTop ? "" : " (iframe)"));
+                  lastHref = location.href;
+                }
+              }, 500);
+            }
+            function stopSpa() {
+              if (spaTimer) { clearInterval(spaTimer); spaTimer = null; }
+            }
+
+            window.addEventListener("load", function () { if (on) pageInfo("loaded"); });
+
+            browser.runtime.onMessage.addListener(function (m) {
+              if (!m || m.type !== "capstate") return;
+              var was = on;
+              on = !!m.on;
+              if (on && !was) {
+                startSpa();
+                pageInfo(document.readyState === "complete" ? "open" : "loading");
+              } else if (!on) {
+                stopSpa();
+              }
+            });
+
+            try {
+              browser.runtime.sendMessage({ type: "caphello" }).catch(function () {});
+            } catch (e) {}
+          })();
           EOF
 
           cat > app/src/main/java/com/grey/gecko/Scripts.kt <<'EOF'
@@ -1963,6 +2399,8 @@ jobs:
 
               private fun tabFor(extId: Int): BrowserTab? = tabs?.tabs?.firstOrNull { it.extId == extId }
 
+              fun appTabId(extId: Int): Int = tabFor(extId)?.id ?: -1
+
               fun bind(extId: Int, url: String) {
                   val tm = tabs ?: return
                   val u = url.substringBefore('#')
@@ -1980,6 +2418,14 @@ jobs:
               }
 
               fun onDetected(extId: Int, url: String, ctype: String, size: Long, hdr: Map<String, String>, kind: String = "") {
+                  if (extId >= 0) {
+                      val ct = tabFor(extId)
+                      Capture.event(
+                          "GRAB",
+                          (if (ct != null) "tab" + ct.id + " " else "") + "grabber saw " + (if (kind.isBlank()) "file" else kind) +
+                              " type=" + ctype + " size=" + size + (if (!enabled) " (grabber off)" else "") + " " + url
+                      )
+                  }
                   if (!enabled || extId < 0) return
                   val t = tabFor(extId)
                   val key = url.substringBefore('#')
@@ -2236,6 +2682,7 @@ jobs:
                   pending.clear()
                   for (d in list) {
                       d.state = DL_CANCELED
+                      Capture.dl(d, "canceled")
                       d.error = "No folder chosen"
                   }
                   save()
@@ -2435,6 +2882,7 @@ jobs:
               private fun begin(d: DlItem) {
                   if (!Backup.hasAccess()) {
                       d.state = DL_FAILED
+                      Capture.dl(d, "failed")
                       d.error = "Allow All files access for GreyGecko"
                       save()
                       toast(Gecko.appCtx, "Downloads need All files access")
@@ -2442,6 +2890,7 @@ jobs:
                   }
                   if (folder() == null) {
                       d.state = DL_QUEUED
+                      Capture.dl(d, "queued")
                       pending.add(d)
                       askFolder = true
                       save()
@@ -2474,6 +2923,7 @@ jobs:
                   private fun failItem(d: DlItem, msg: String) {
                       d.name = clean(d.name)
                       d.state = DL_FAILED
+                      Capture.dl(d, "failed")
                       d.error = msg
                       try {
                           d.stream?.close()
@@ -2493,6 +2943,7 @@ jobs:
                       d.tries = 0
                       d.nextFree = 0L
                       d.state = DL_QUEUED
+                      Capture.dl(d, "queued")
                       synchronized(qLock) { if (!waiting.contains(d)) waiting.add(d) }
                       save()
                       pump()
@@ -2548,6 +2999,7 @@ jobs:
                       pending.remove(d)
                       synchronized(qLock) { waiting.remove(d) }
                       d.state = DL_CANCELED
+                      Capture.dl(d, "canceled")
                       save()
                   }
               }
@@ -2589,6 +3041,7 @@ jobs:
                       d.paused = true
                       d.speed = 0L
                       d.state = DL_PAUSED
+                      Capture.dl(d, "paused")
                       notifyProgress(true)
                   }
               }
@@ -2801,6 +3254,7 @@ jobs:
                       Log.e("GreyScript", "download thread crashed", t)
                       if (d.state == DL_RUNNING || d.state == DL_QUEUED) {
                           d.state = DL_FAILED
+                          Capture.dl(d, "failed")
                           d.error = "Crashed: " + t.javaClass.simpleName
                           save()
                       }
@@ -2816,6 +3270,7 @@ jobs:
               private fun runItemInner(d: DlItem) {
                   if (d.cancel) {
                       d.state = DL_CANCELED
+                      Capture.dl(d, "canceled")
                       save()
                       return
                   }
@@ -2823,11 +3278,13 @@ jobs:
                       awaitResume(d)
                   } catch (e: Exception) {
                       d.state = DL_CANCELED
+                      Capture.dl(d, "canceled")
                       save()
                       return
                   }
                   d.started = true
                   d.state = DL_RUNNING
+                  Capture.dl(d, "started")
                   d.error = ""
                   d.note = ""
                   running.add(d)
@@ -2845,12 +3302,14 @@ jobs:
                                   else -> runFile(d, dir)
                               }
                               d.state = DL_DONE
+                              Capture.dl(d, "finished")
                               val done = d.name
                               main.post { toast(Gecko.appCtx, "Downloaded " + done) }
                               break
                           } catch (e: Exception) {
                               if (d.cancel) {
                                   d.state = DL_CANCELED
+                                  Capture.dl(d, "canceled")
                                   break
                               }
                               if (shouldRetry(d, e)) {
@@ -2860,12 +3319,14 @@ jobs:
                                   Log.e("GreyScript", "download retry " + d.tries + " " + d.url, e)
                                   if (!waitRetry(d, minOf(2000L * d.tries, 10000L))) {
                                       d.state = DL_CANCELED
+                                      Capture.dl(d, "canceled")
                                       break
                                   }
                                   d.note = ""
                                   continue
                               }
                               d.state = DL_FAILED
+                              Capture.dl(d, "failed")
                               d.error = e.message ?: "Failed"
                               val msg = d.error
                               main.post { toast(Gecko.appCtx, "Download failed: " + msg) }
@@ -4559,6 +5020,8 @@ jobs:
 
               fun current(): String = cur
 
+              fun capturesDir(): java.io.File = java.io.File(dir(), "Captures")
+
               fun isActive(): Boolean = active
 
               private fun profilesDir(): java.io.File = java.io.File(dir(), "Profiles")
@@ -4777,6 +5240,470 @@ jobs:
                   finish()
                   Runtime.getRuntime().exit(0)
               }
+          }
+          EOF
+
+          cat > app/src/main/java/com/grey/gecko/Capture.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import org.json.JSONObject
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class Ev(val t: Long, val k: String, val x: String)
+
+          object Capture {
+              private const val TAG = "GreyScript"
+              private const val MAX_EVENTS = 30000
+
+              private val main = Handler(Looper.getMainLooper())
+              private val lock = Any()
+              private val events = ArrayList<Ev>()
+              private val quiet = HashMap<String, LongArray>()
+              private val hosts = HashMap<String, Int>()
+              private val removed = HashMap<String, Int>()
+              private var dropped = 0
+              private var appLog = ""
+              private var stoppedAt = 0L
+              private var lastUi = 0L
+
+              @Volatile
+              private var accepting = false
+
+              @Volatile
+              var startedAt = 0L
+
+              var recording by mutableStateOf(false)
+              var finishing by mutableStateOf(false)
+              var count by mutableStateOf(0)
+              var report by mutableStateOf("")
+              var savedPath by mutableStateOf("")
+              var extLinked by mutableStateOf(false)
+
+              private val urlRx = Regex("https?://[^\\s\"'<>)\\]]+")
+              private val hostRx = Regex("^[a-z][a-z0-9+.-]*://([^/:?#]+)", RegexOption.IGNORE_CASE)
+              private val queryRx = Regex("([?&;])([^=&#;\\s]+)=([^&#;\\s]*)")
+              private val userInfoRx = Regex("^(https?://)[^/@\\s]+@")
+              private val jwtRx = Regex("eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}")
+              private val bearerRx = Regex("(?i)(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}")
+              private val sensitiveKey = Regex(
+                  "(?i)^(.*[-_.])?(token|key|auth|sig|signature|secret|pass|passwd|password|pwd|session|sid|jwt|bearer|credential|cred|otp|code|ticket|csrf|xsrf|hmac|policy|access|apikey)([-_.].*)?$"
+              )
+
+              private fun hostOf(u: String): String = hostRx.find(u)?.groupValues?.get(1)?.lowercase() ?: ""
+
+              private fun bump(why: String, n: Int = 1) {
+                  synchronized(lock) { removed[why] = (removed[why] ?: 0) + n }
+              }
+
+              private fun rmLabel(k: String): String = when (k) {
+                  "cookie" -> "cookie headers"
+                  "auth" -> "authorization headers"
+                  "setcookie" -> "Set-Cookie headers"
+                  "typed" -> "typed text values"
+                  "pw" -> "password field values"
+                  else -> k
+              }
+
+              private fun redactUrl(u: String): String {
+                  var s = u
+                  if (userInfoRx.containsMatchIn(s)) {
+                      s = userInfoRx.replace(s) { it.groupValues[1] + "[removed]@" }
+                      bump("credentials inside links")
+                  }
+                  s = queryRx.replace(s) { m ->
+                      val k = m.groupValues[2]
+                      if (m.groupValues[3].isNotEmpty() && sensitiveKey.matches(k)) {
+                          bump("tokens and keys inside links")
+                          m.groupValues[1] + k + "=[removed]"
+                      } else m.value
+                  }
+                  return s
+              }
+
+              private fun clean(t: String): String {
+                  var s = t
+                  s = urlRx.replace(s) { redactUrl(it.value) }
+                  if (jwtRx.containsMatchIn(s)) {
+                      s = jwtRx.replace(s, "[removed]")
+                      bump("login tokens (jwt)")
+                  }
+                  if (bearerRx.containsMatchIn(s)) {
+                      s = bearerRx.replace(s) { it.groupValues[1] + " [removed]" }
+                      bump("authorization values")
+                  }
+                  return s
+              }
+
+              fun hv(h: Map<String, String>?, k: String): String {
+                  if (h == null) return ""
+                  for ((a, b) in h) if (a.equals(k, true)) return b
+                  return ""
+              }
+
+              fun event(kind: String, text: String) = add(System.currentTimeMillis(), kind, text)
+
+              private fun add(at: Long, kind: String, text: String) {
+                  if (!accepting) return
+                  val body = try {
+                      clean(text)
+                  } catch (e: Exception) {
+                      "[unreadable]"
+                  }
+                  synchronized(lock) {
+                      if (events.size >= MAX_EVENTS) {
+                          dropped++
+                          return
+                      }
+                      events.add(Ev(at, kind, body))
+                  }
+                  ui()
+              }
+
+              private fun ui() {
+                  val now = System.currentTimeMillis()
+                  if (now - lastUi < 300L) return
+                  lastUi = now
+                  val n = synchronized(lock) { events.size }
+                  main.post { count = n }
+              }
+
+              fun dl(d: DlItem, what: String) {
+                  if (!accepting) return
+                  event(
+                      "DL",
+                      what + " " + d.name + " kind=" + d.kind + " " + d.done + "/" + d.total + "B" +
+                          (if (d.error.isNotBlank()) " error=" + d.error else "") + " " + d.url
+                  )
+              }
+
+              fun mark(note: String) {
+                  val t = note.trim()
+                  event("MARK", if (t.isEmpty()) "(mark)" else t)
+              }
+
+              private fun push(cmd: String): Boolean {
+                  val p = HideTool.port ?: return false
+                  return try {
+                      val o = JSONObject()
+                      o.put("type", "capcmd")
+                      o.put("cmd", cmd)
+                      p.postMessage(o)
+                      true
+                  } catch (e: Exception) {
+                      Log.d(TAG, "capture push failed: " + e)
+                      false
+                  }
+              }
+
+              fun start() {
+                  if (recording || finishing) return
+                  synchronized(lock) {
+                      events.clear()
+                      quiet.clear()
+                      hosts.clear()
+                      removed.clear()
+                      dropped = 0
+                  }
+                  appLog = ""
+                  startedAt = System.currentTimeMillis()
+                  stoppedAt = 0L
+                  report = ""
+                  savedPath = ""
+                  count = 0
+                  accepting = true
+                  recording = true
+                  extLinked = push("on")
+                  event(
+                      "START",
+                      "capture started" + (if (extLinked) "" else " (page extension not connected, only app-side events)")
+                  )
+              }
+
+              fun stop() {
+                  if (!recording) return
+                  recording = false
+                  finishing = true
+                  push("off")
+                  main.postDelayed({ finish() }, 1500L)
+              }
+
+              fun clear() {
+                  if (recording || finishing) return
+                  synchronized(lock) {
+                      events.clear()
+                      quiet.clear()
+                      hosts.clear()
+                      removed.clear()
+                      dropped = 0
+                  }
+                  appLog = ""
+                  report = ""
+                  savedPath = ""
+                  count = 0
+              }
+
+              private fun finish() {
+                  event("STOP", "capture stopped")
+                  accepting = false
+                  stoppedAt = System.currentTimeMillis()
+                  Thread {
+                      var text = ""
+                      var path = ""
+                      try {
+                          appLog = readAppLog()
+                          text = compose(Int.MAX_VALUE)
+                          path = save(text)
+                      } catch (e: Exception) {
+                          Log.e(TAG, "capture report failed", e)
+                          text = "Capture report failed: " + e
+                      }
+                      val n = synchronized(lock) { events.size }
+                      main.post {
+                          report = text
+                          savedPath = path
+                          count = n
+                          finishing = false
+                      }
+                  }.start()
+              }
+
+              fun ingest(m: JSONObject) {
+                  if (!accepting) return
+                  val rm = m.optJSONObject("rm")
+                  if (rm != null) {
+                      val ks = rm.keys()
+                      while (ks.hasNext()) {
+                          val k = ks.next()
+                          val n = rm.optInt(k, 0)
+                          if (n > 0) bump(rmLabel(k), n)
+                      }
+                  }
+                  val arr = m.optJSONArray("ev") ?: return
+                  for (i in 0 until arr.length()) {
+                      val e = arr.optJSONArray(i) ?: continue
+                      val at = e.optLong(0, System.currentTimeMillis())
+                      val kind = e.optString(1)
+                      val ext = e.optInt(2, -1)
+                      val text = e.optString(3)
+                      if (kind == "NETSUM") {
+                          val p = text.split("|")
+                          if (p.size >= 4) {
+                              synchronized(lock) {
+                                  val cur = quiet.getOrPut(p[0] + "|" + p[1]) { LongArray(2) }
+                                  cur[0] += p[2].toLongOrNull() ?: 0L
+                                  cur[1] += p[3].toLongOrNull() ?: 0L
+                              }
+                          }
+                          continue
+                      }
+                      val tid = if (ext >= 0) Videos.appTabId(ext) else -1
+                      val lbl = if (tid > 0) "tab" + tid + " " else if (ext >= 0) "x" + ext + " " else ""
+                      if (kind == "NET" || kind == "MEDIA") {
+                          val um = urlRx.find(text)
+                          if (um != null) {
+                              val hst = hostOf(um.value)
+                              if (hst.isNotEmpty()) synchronized(lock) { hosts[hst] = (hosts[hst] ?: 0) + 1 }
+                          }
+                      }
+                      add(at, kind, lbl + text)
+                  }
+              }
+
+              private fun readAppLog(): String {
+                  return try {
+                      val from = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date(startedAt))
+                      val p = Runtime.getRuntime().exec(
+                          arrayOf("logcat", "-d", "-v", "threadtime", "-t", "8000", "GreyScript:D", "*:W")
+                      )
+                      val out = ArrayList<String>()
+                      p.inputStream.bufferedReader().useLines { seq ->
+                          for (l in seq) {
+                              if (l.length > 18 && l.substring(0, 18) >= from) {
+                                  out.add(if (l.length > 400) l.substring(0, 400) else l)
+                              }
+                          }
+                      }
+                      val tail = if (out.size > 1500) out.subList(out.size - 1500, out.size) else out
+                      clean(tail.joinToString("\n"))
+                  } catch (e: Exception) {
+                      "logcat error: " + e
+                  }
+              }
+
+              private fun fmtT(ms: Long): String = String.format(Locale.US, "+%.3f", ms / 1000.0)
+
+              private fun fmtSize(b: Long): String =
+                  if (b >= 1048576L) String.format(Locale.US, "%.1f MB", b / 1048576.0)
+                  else if (b >= 1024L) (b / 1024L).toString() + " KB"
+                  else b.toString() + " B"
+
+              fun compose(limit: Int): String {
+                  val evs = ArrayList<Ev>()
+                  val q = HashMap<String, LongArray>()
+                  val h = HashMap<String, Int>()
+                  val rem = HashMap<String, Int>()
+                  var drop = 0
+                  synchronized(lock) {
+                      evs.addAll(events)
+                      for ((k, v) in quiet) q[k] = v.copyOf()
+                      h.putAll(hosts)
+                      rem.putAll(removed)
+                      drop = dropped
+                  }
+                  val df = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                  val end = if (stoppedAt > 0L) stoppedAt else System.currentTimeMillis()
+                  val dur = (end - startedAt) / 1000
+                  val sb = StringBuilder()
+                  sb.append("# GreyGecko capture\n")
+                  sb.append("Started: ").append(df.format(Date(startedAt)))
+                  sb.append("   Duration: ").append(dur / 60).append("m ").append(dur % 60).append("s")
+                  sb.append("   Events: ").append(evs.size)
+                  if (drop > 0) sb.append(" (").append(drop).append(" more were dropped: size cap reached)")
+                  sb.append("\nDevice: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+                  sb.append(", Android ").append(Build.VERSION.RELEASE).append("\n")
+                  sb.append("Page capture extension: ")
+                  sb.append(if (extLinked) "connected" else "NOT connected (only app-side events)").append("\n")
+                  sb.append("\n## Privacy\n")
+                  sb.append("Sensitive data is removed automatically and replaced with [removed].\n")
+                  if (rem.isEmpty()) {
+                      sb.append("Nothing needed removing in this capture.\n")
+                  } else {
+                      sb.append("Removed in this capture:\n")
+                      for (e in rem.entries.sortedBy { it.key }) sb.append("- ").append(e.key).append(": ").append(e.value).append("\n")
+                  }
+                  sb.append("Never recorded at all: cookie values, Authorization headers, typed text, passwords, request and response bodies.\n")
+                  sb.append("\n## How to read this\n").append(CaptureText.READ).append("\n")
+                  if (h.isNotEmpty()) {
+                      sb.append("\n## Sites (requests per host)\n")
+                      for (e in h.entries.sortedByDescending { it.value }.take(20)) sb.append(e.value).append("  ").append(e.key).append("\n")
+                  }
+                  if (q.isNotEmpty()) {
+                      sb.append("\n## Resources not listed one by one (images, fonts, styles, scripts, blocked or aborted)\n")
+                      for (e in q.entries.sortedByDescending { it.value[0] }.take(40)) {
+                          val p = e.key.split("|")
+                          sb.append(p[0]).append("  ").append(if (p.size > 1) p[1] else "").append(" x").append(e.value[0])
+                          if (e.value[1] > 0L) sb.append(" (").append(fmtSize(e.value[1])).append(")")
+                          sb.append("\n")
+                      }
+                  }
+                  sb.append("\n## Timeline\n")
+                  val tl = ArrayList<Pair<String, Boolean>>()
+                  for (e in evs) tl.add(Pair(fmtT(e.t - startedAt) + " " + e.k + " " + e.x, e.k == "NET"))
+                  var netBudget = Int.MAX_VALUE
+                  var logBudget = Int.MAX_VALUE
+                  if (limit < Int.MAX_VALUE) {
+                      var fixed = sb.length + 600
+                      for (p in tl) if (!p.second) fixed += p.first.length + 1
+                      val rest = limit - fixed
+                      netBudget = if (rest > 0) rest * 7 / 10 else 0
+                      logBudget = if (rest > 0) rest - netBudget else 0
+                  }
+                  var omittedNet = 0
+                  for (p in tl) {
+                      if (p.second) {
+                          if (p.first.length + 1 <= netBudget) {
+                              sb.append(p.first).append("\n")
+                              netBudget -= p.first.length + 1
+                          } else omittedNet++
+                      } else sb.append(p.first).append("\n")
+                  }
+                  if (omittedNet > 0) {
+                      sb.append("[").append(omittedNet).append(" network lines left out to fit the size. Use Copy all or open the saved file for everything.]\n")
+                  }
+                  if (appLog.isNotBlank()) {
+                      sb.append("\n## App log (logcat during the capture)\n")
+                      var omittedLog = 0
+                      for (l in appLog.lines()) {
+                          if (l.length + 1 <= logBudget) {
+                              sb.append(l).append("\n")
+                              logBudget -= l.length + 1
+                          } else omittedLog++
+                      }
+                      if (omittedLog > 0) sb.append("[").append(omittedLog).append(" log lines left out to fit the size.]\n")
+                  }
+                  if (sb.length > limit) {
+                      sb.setLength(limit)
+                      sb.append("\n[trimmed to fit]")
+                  }
+                  return sb.toString()
+              }
+
+              private fun save(text: String): String {
+                  return try {
+                      val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(startedAt))
+                      val base = if (Backup.isActive()) Backup.capturesDir()
+                      else File(Gecko.appCtx.getExternalFilesDir(null) ?: Gecko.appCtx.cacheDir, "Captures")
+                      base.mkdirs()
+                      val f = File(base, "capture-" + stamp + ".txt")
+                      f.writeText(text)
+                      val old = base.listFiles { x -> x.name.startsWith("capture-") }?.sortedBy { it.lastModified() } ?: emptyList()
+                      if (old.size > 20) for (x in old.subList(0, old.size - 20)) x.delete()
+                      f.path
+                  } catch (e: Exception) {
+                      Log.e(TAG, "capture save failed", e)
+                      ""
+                  }
+              }
+          }
+
+          object CaptureText {
+              const val READ = "Times are seconds since the capture started. Each line is: time, kind, details.\n" +
+                  "NAV page navigation and loading. TAB tab opened, selected or closed. PROMPT alert, confirm or prompt dialog.\n" +
+                  "NET network request: METHOD STATUS TYPE content-type size time [ref=referer] [hdrs=custom header names] URL\n" +
+                  "MEDIA video, audio or stream request (m3u8, mpd, mp4 and similar). REDIR redirect.\n" +
+                  "CLICK a tapped element. sel= is a CSS selector that can be used in a script. text= is what the element shows.\n" +
+                  "INPUT typing in a field (the typed value is never recorded). CHANGE checkbox, radio or select changed.\n" +
+                  "SUBMIT a form was sent (field names only). KEY the Enter key. SCROLL scroll position.\n" +
+                  "PAGE summary of a loaded page (forms, inputs, links, iframes, videos). SPA the address changed without a page load.\n" +
+                  "ERROR a script error on the page. MEDIAEL a video or audio element and its source.\n" +
+                  "DL download events. GRAB video grabber detections. SCRIPT userscripts that matched a page. MARK a note added by me.\n" +
+                  "Requests that follow a tap within about a second are usually caused by that tap."
+
+              const val GUIDE = "CAPTURE GUIDE\n\n" +
+                  "WHAT IT IS\n" +
+                  "Capture records what happens in the browser between Start and Stop: pages you open, taps, network requests, downloads, errors and more. " +
+                  "The result is one text report you can copy and paste to an AI so it can write or fix a script or an automation using what really happened.\n\n" +
+                  "HOW TO USE\n" +
+                  "1. Open Capture from the menu and tap Start capture. A red dot shows next to the menu button while recording.\n" +
+                  "2. Do what you want to automate: browse, tap, log in, download. Use Mark moment (in the menu) to leave short notes like \"now logging in\" or \"tapping download\".\n" +
+                  "3. Open Capture again and tap Stop capture. Wait a moment while the report is built.\n" +
+                  "4. Tap Copy for AI and paste it into an AI chat with a request. The report is also saved as a text file (the path is shown).\n\n" +
+                  "A GOOD REQUEST TO SEND WITH IT\n" +
+                  "\"Below is a capture from my Android browser (GreyGecko, a GeckoView browser with Tampermonkey style userscripts). " +
+                  "Read the 'How to read this' part first. I want a userscript that does: (describe what you want). " +
+                  "Use the CSS selectors from the CLICK lines and the requests from NET lines. Ask me if something is missing.\"\n\n" +
+                  "WHAT IS RECORDED\n" +
+                  "Navigation and tab events, network requests (method, status, type, size, time, referer, names of custom headers), taps with selector, text and attributes, " +
+                  "typing events (without values), form submits (field names only), scroll positions, page summaries, script errors, video and audio elements, " +
+                  "downloads, video grabber detections, userscript matches, dialogs and the app log.\n\n" +
+                  "PRIVACY\n" +
+                  "Sensitive data is removed and replaced with [removed]: tokens, keys and passwords inside links, login tokens, authorization values, and credentials in links. " +
+                  "Cookie values, Authorization headers, typed text, passwords and request or response bodies are never recorded. " +
+                  "The report header lists how many values were removed. Still read the report before sharing it: page titles, link texts and addresses are kept as they are.\n\n" +
+                  "LIMITATIONS\n" +
+                  "- It records requests and taps, not the full text of pages.\n" +
+                  "- Request and response bodies are not recorded (for example the JSON an API returns). Ask the AI to work from the URLs and your notes, or add body capture later.\n" +
+                  "- Pages that were already open when you pressed Start are only fully observed after they are reloaded.\n" +
+                  "- Taps are recorded as clicks. Swipes and long presses are not, except scrolling.\n" +
+                  "- Selectors are generated automatically. Sites that change class names often may need a more stable selector.\n" +
+                  "- The console output of pages (console.log) is not recorded yet. Script errors are.\n" +
+                  "- Heavy pages can produce thousands of requests. Images, fonts, styles and scripts are counted instead of listed. The capture stops adding events at 30000.\n" +
+                  "- Copy for AI shortens the report to about 60000 characters and drops network lines first. Copy all and the saved file keep everything.\n" +
+                  "- Video players inside iframes are covered, but a few sites may block or confuse the recording.\n" +
+                  "- The red dot and recording only exist while the app is running. If the app is closed or killed, the capture is lost.\n" +
+                  "- Only the last 20 saved reports are kept.\n\n" +
+                  "IDEAS FOR LATER\n" +
+                  "Request and response bodies for selected sites, console output, page structure snapshot, a list of saved captures, filtering by site, and per tab capture."
           }
           EOF
 
@@ -5636,6 +6563,7 @@ jobs:
                   t.url = url
                   tabs.add(insertIndexFor(url).coerceIn(0, tabs.size), t)
                   ensureLive(t, url)
+                  Capture.event("TAB", "new tab" + t.id + " " + url + (if (opener != 0) " opener=tab" + opener else ""))
                   if (makeCurrent || current == null) select(t)
                   enforceLimit()
                   persist()
@@ -5713,6 +6641,7 @@ jobs:
                   ensureLive(t)
                   t.lastUsed = System.currentTimeMillis()
                   current = t
+                  Capture.event("TAB", "select tab" + t.id + " " + t.url)
                   if (prev != null && prev !== t && prev.preview) removeTab(prev, false)
                   enforceLimit()
                   persist()
@@ -5740,6 +6669,7 @@ jobs:
               private fun removeTab(t: BrowserTab, keepOne: Boolean) {
                   val i = tabs.indexOf(t)
                   if (i < 0) return
+                  Capture.event("TAB", "close tab" + t.id + " " + t.url)
                   tabs.removeAt(i)
                   val s = t.session
                   t.session = null
@@ -5953,6 +6883,7 @@ jobs:
                               t.errorUrl = null
                               t.url = nu
                           }
+                          Capture.event("NAV", "tab" + t.id + " location " + nu + (if (hasUserGesture) " (user gesture)" else ""))
                           dedupe(t)
                           Favicons.request(groupKeyOf(t))
                           persist()
@@ -5965,6 +6896,7 @@ jobs:
                       ): GeckoResult<String>? {
                           val failed = uri ?: ""
                           if (failed.isBlank() || isErrorUri(failed)) return null
+                          Capture.event("NAV", "tab" + t.id + " LOAD ERROR " + failed + " code=" + error.code)
                           t.errorUrl = failed
                           return GeckoResult.fromValue(errorPageUri(failed, error.code))
                       }
@@ -5977,6 +6909,7 @@ jobs:
                           session: GeckoSession,
                           request: GeckoSession.NavigationDelegate.LoadRequest
                       ): GeckoResult<AllowOrDeny>? {
+                          Capture.event("NAV", "tab" + t.id + " load request " + request.uri + (if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) " [new window]" else ""))
                           if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
                               newTab(request.uri, true, t.id)
                               return GeckoResult.fromValue(AllowOrDeny.DENY)
@@ -5986,6 +6919,7 @@ jobs:
                   }
                   s.progressDelegate = object : GeckoSession.ProgressDelegate {
                       override fun onPageStart(session: GeckoSession, url: String) {
+                          Capture.event("NAV", "tab" + t.id + " page start " + url)
                           t.loading = true
                           t.progress = 8
                           t.title = ""
@@ -6004,6 +6938,7 @@ jobs:
                       }
 
                       override fun onPageStop(session: GeckoSession, success: Boolean) {
+                          Capture.event("NAV", "tab" + t.id + " page stop " + (if (success) "ok" else "FAILED") + " " + t.url + " title=\"" + t.title + "\"")
                           t.loading = false
                           t.progress = 0
                           if (success && t.errorUrl == null) HistoryStore.add(t.url, t.title)
@@ -6040,6 +6975,7 @@ jobs:
                           prompt: GeckoSession.PromptDelegate.AlertPrompt
                       ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
                           val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          Capture.event("PROMPT", "tab" + t.id + " alert: " + (prompt.message ?: ""))
                           showJs(JsReq(0, prompt.message ?: "", "", res, { prompt.dismiss() }, { prompt.dismiss() }))
                           return res
                       }
@@ -6049,6 +6985,7 @@ jobs:
                           prompt: GeckoSession.PromptDelegate.ButtonPrompt
                       ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
                           val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          Capture.event("PROMPT", "tab" + t.id + " confirm: " + (prompt.message ?: ""))
                           showJs(
                               JsReq(
                                   1, prompt.message ?: "", "", res,
@@ -6064,6 +7001,7 @@ jobs:
                           prompt: GeckoSession.PromptDelegate.TextPrompt
                       ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
                           val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                          Capture.event("PROMPT", "tab" + t.id + " prompt: " + (prompt.message ?: ""))
                           showJs(
                               JsReq(
                                   2, prompt.message ?: "", prompt.defaultValue ?: "", res,
@@ -6096,10 +7034,12 @@ jobs:
                   }
                   s.contentDelegate = object : GeckoSession.ContentDelegate {
                       override fun onCrash(session: GeckoSession) {
+                          Capture.event("APP", "tab" + t.id + " content process crashed")
                           recover(t, session)
                       }
 
                       override fun onKill(session: GeckoSession) {
+                          Capture.event("APP", "tab" + t.id + " content process was killed")
                           recover(t, session)
                       }
 
@@ -6109,6 +7049,11 @@ jobs:
                       }
 
                       override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
+                          Capture.event(
+                              "DL",
+                              "tab" + t.id + " page handed over a download " + response.uri + " type=" + Capture.hv(response.headers, "Content-Type") +
+                                  " length=" + Capture.hv(response.headers, "Content-Length") + " disposition=" + Capture.hv(response.headers, "Content-Disposition")
+                          )
                           Downloads.fromResponse(response)
                       }
                       override fun onTitleChange(session: GeckoSession, title: String?) {
@@ -6391,6 +7336,7 @@ jobs:
                           val m = message as JSONObject
                           when (m.optString("type")) {
                               "log" -> Log.d("GreyScript", "ext: " + m.optString("msg"))
+                              "cap" -> Capture.ingest(m)
                               "get" -> {
                                   val url = m.optString("url")
                                   val tid = m.optInt("tabId", -1)
@@ -6424,6 +7370,11 @@ jobs:
                                   val pathName = try { android.net.Uri.parse(url).path ?: "/" } catch (e: Exception) { "/" }
                                   reply.put("hide", JSONArray(HideRules.forPage(hostName, pathName)))
                                   Log.d("GreyScript", "scripts for " + url + ": " + arr.length())
+                                  if (arr.length() > 0) {
+                                      val sn = ArrayList<String>()
+                                      for (si in 0 until arr.length()) sn.add(arr.getJSONObject(si).optString("name"))
+                                      Capture.event("SCRIPT", "userscripts matched " + url + " : " + sn.joinToString(", "))
+                                  }
                               }
                               "cfg" -> {
                                   reply.put("grabber", Videos.enabled)
@@ -6736,6 +7687,7 @@ jobs:
                               onElements = { screen = "elements" },
                               onDownloads = { screen = "downloads" },
                               onProfiles = { screen = "profiles" },
+                              onCapture = { screen = "capture" },
                               onLogs = { screen = "logs" }
                           )
                           StartupWarmup(tabs)
@@ -6793,6 +7745,7 @@ jobs:
                                       "elements" -> ElementRulesScreen { screen = "browser" }
                                       "downloads" -> DownloadsScreen { screen = "browser" }
                                       "profiles" -> ProfilesScreen(tabs) { screen = "browser" }
+                                      "capture" -> CaptureScreen { screen = "browser" }
                                       "logs" -> LogScreen { screen = "browser" }
                                       else -> {}
                                   } } }
@@ -7100,6 +8053,7 @@ jobs:
               onElements: () -> Unit,
               onDownloads: () -> Unit,
               onProfiles: () -> Unit,
+              onCapture: () -> Unit,
               onLogs: () -> Unit
           ) {
               val cur = tabs.current
@@ -7122,6 +8076,7 @@ jobs:
               val density = LocalDensity.current
               val pullTrigger = with(density) { 80.dp.toPx() }
               var pull by remember { mutableStateOf(0f) }
+              var markDlg by remember { mutableStateOf(false) }
 
 
               LaunchedEffect(cur?.id, tabs.home) {
@@ -7250,8 +8205,10 @@ jobs:
                           }
                           Box {
                               TextButton(onClick = { menu = true }) {
+                                  if (Capture.recording) Text("●", fontSize = 14.sp, color = Color(0xFFFF4D4D))
                                   Text("⋮", fontSize = 24.sp, color = Color.White)
                               }
+                              if (markDlg) MarkDialog { markDlg = false }
                               DropdownMenu(
                                   expanded = menu,
                                   onDismissRequest = { menu = false },
@@ -7417,6 +8374,16 @@ jobs:
                                       text = { Text("Profiles", color = Color.White) },
                                       onClick = { menu = false; onProfiles() }
                                   )
+                                  DropdownMenuItem(
+                                      text = { Text(if (Capture.recording) "Capture  ● REC" else "Capture", color = Color.White) },
+                                      onClick = { menu = false; onCapture() }
+                                  )
+                                  if (Capture.recording) {
+                                      DropdownMenuItem(
+                                          text = { Text("Mark moment", color = Color.White) },
+                                          onClick = { menu = false; markDlg = true }
+                                      )
+                                  }
 
 
                                   DropdownMenuItem(
@@ -10432,6 +11399,194 @@ jobs:
                       }
                   )
               }
+          }
+
+          @Composable
+          fun MarkDialog(onClose: () -> Unit) {
+              var text by remember { mutableStateOf("") }
+              AlertDialog(
+                  onDismissRequest = onClose,
+                  containerColor = Bar,
+                  title = { Text("Mark moment", color = Color.White) },
+                  text = {
+                      OutlinedTextField(
+                          value = text,
+                          onValueChange = { text = it },
+                          colors = fieldColors(),
+                          singleLine = true,
+                          placeholder = { Text("What are you doing now?", color = Color(0xFF999999)) },
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                  },
+                  confirmButton = {
+                      TextButton(onClick = {
+                          Capture.mark(text)
+                          onClose()
+                      }) { Text("Add", color = Color.White) }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onClose) { Text("Cancel", color = Color.White) }
+                  }
+              )
+          }
+
+          @Composable
+          fun CaptureScreen(onBack: () -> Unit) {
+              var guide by remember { mutableStateOf(false) }
+              BackHandler(enabled = guide) { guide = false }
+              if (guide) {
+                  CaptureGuide { guide = false }
+              } else {
+                  CaptureMain(onBack) { guide = true }
+              }
+          }
+
+          @Composable
+          fun CaptureGuide(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              Column(Modifier.fillMaxSize()) {
+                  Header {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Capture guide", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                      Button(onClick = {
+                          copyText(ctx, CaptureText.GUIDE)
+                          toast(ctx, "Guide copied")
+                      }) { Text("Copy") }
+                      Spacer(Modifier.width(6.dp))
+                  }
+                  Body {
+                      Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
+                          SelectionContainer {
+                              Text(CaptureText.GUIDE, color = Color.White, fontSize = 13.sp, lineHeight = 19.sp)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun CaptureMain(onBack: () -> Unit, onGuide: () -> Unit) {
+              val ctx = LocalContext.current
+              var markDlg by remember { mutableStateOf(false) }
+              var now by remember { mutableStateOf(System.currentTimeMillis()) }
+              val rec = Capture.recording
+              val fin = Capture.finishing
+              val rep = Capture.report
+              LaunchedEffect(rec) {
+                  while (Capture.recording) {
+                      now = System.currentTimeMillis()
+                      delay(1000)
+                  }
+              }
+              Column(Modifier.fillMaxSize()) {
+                  Header {
+                      TextButton(onClick = onBack) { Text("←", color = Color.White, fontSize = 20.sp) }
+                      Text("Capture", color = Color.White, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                      TextButton(onClick = onGuide) { Text("?", color = Color.White, fontSize = 22.sp) }
+                      Spacer(Modifier.width(4.dp))
+                  }
+                  Body {
+                      Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
+                          val secs = if (rec) ((now - Capture.startedAt) / 1000L).coerceAtLeast(0L) else 0L
+                          val status = if (rec) {
+                              "● Recording  " + (secs / 60) + ":" + (secs % 60).toString().padStart(2, '0') + "  ·  " + Capture.count + " events"
+                          } else if (fin) {
+                              "Building the report..."
+                          } else if (rep.isNotEmpty()) {
+                              "Done  ·  " + Capture.count + " events"
+                          } else {
+                              "Ready"
+                          }
+                          Text(status, color = if (rec) Color(0xFFFF6B6B) else Color.White, fontSize = 16.sp)
+                          if (rec) {
+                              Spacer(Modifier.height(2.dp))
+                              Text(
+                                  if (Capture.extLinked) "Page capture connected" else "Page capture not connected: only app events are recorded",
+                                  color = Soft,
+                                  fontSize = 12.sp
+                              )
+                          }
+                          Spacer(Modifier.height(12.dp))
+                          Button(
+                              onClick = { if (rec) Capture.stop() else Capture.start() },
+                              enabled = !fin,
+                              modifier = Modifier.fillMaxWidth()
+                          ) { Text(if (rec) "Stop capture" else "Start capture") }
+                          Spacer(Modifier.height(8.dp))
+                          Button(
+                              onClick = { markDlg = true },
+                              enabled = rec,
+                              modifier = Modifier.fillMaxWidth()
+                          ) { Text("Mark moment") }
+                          Spacer(Modifier.height(10.dp))
+                          Text(
+                              "Sensitive data (tokens, keys, passwords, cookies, typed text) is removed automatically and the report says what was removed. Tap ? for the guide and limits.",
+                              color = Soft,
+                              fontSize = 12.sp,
+                              lineHeight = 17.sp
+                          )
+                          if (rep.isNotEmpty() && !rec && !fin) {
+                              Spacer(Modifier.height(14.dp))
+                              Row(Modifier.fillMaxWidth()) {
+                                  Button(
+                                      onClick = {
+                                          val t = Capture.compose(60000)
+                                          copyText(ctx, t)
+                                          toast(ctx, "Copied " + t.length + " characters")
+                                      },
+                                      modifier = Modifier.weight(1f)
+                                  ) { Text("Copy for AI", fontSize = 12.sp, maxLines = 1) }
+                                  Spacer(Modifier.width(6.dp))
+                                  Button(
+                                      onClick = {
+                                          val limit = 900000
+                                          val t = if (rep.length > limit) rep.substring(0, limit) else rep
+                                          copyText(ctx, t)
+                                          toast(ctx, if (rep.length > limit) "Too large: copied the first 900000 characters" else "Copied " + t.length + " characters")
+                                      },
+                                      modifier = Modifier.weight(1f)
+                                  ) { Text("Copy all", fontSize = 12.sp, maxLines = 1) }
+                                  Spacer(Modifier.width(6.dp))
+                                  Button(
+                                      onClick = {
+                                          val t = Capture.compose(200000)
+                                          val i = Intent(Intent.ACTION_SEND)
+                                          i.type = "text/plain"
+                                          i.putExtra(Intent.EXTRA_TEXT, t)
+                                          try {
+                                              ctx.startActivity(Intent.createChooser(i, "Share capture"))
+                                          } catch (e: Exception) {
+                                              toast(ctx, "Could not share")
+                                          }
+                                      },
+                                      modifier = Modifier.weight(1f)
+                                  ) { Text("Share", fontSize = 12.sp, maxLines = 1) }
+                              }
+                              Spacer(Modifier.height(6.dp))
+                              if (Capture.savedPath.isNotEmpty()) {
+                                  Text("Saved: " + Capture.savedPath, color = Soft, fontSize = 11.sp)
+                              }
+                              Row(Modifier.fillMaxWidth()) {
+                                  Spacer(Modifier.weight(1f))
+                                  TextButton(onClick = { Capture.clear() }) { Text("Clear", color = Danger) }
+                              }
+                              Text("Preview (first 12000 characters)", color = Soft, fontSize = 11.sp)
+                              Spacer(Modifier.height(4.dp))
+                              Box(Modifier.fillMaxWidth().background(Field).padding(6.dp)) {
+                                  SelectionContainer {
+                                      Text(
+                                          if (rep.length > 12000) rep.substring(0, 12000) else rep,
+                                          color = Color.White,
+                                          fontFamily = FontFamily.Monospace,
+                                          fontSize = 10.sp
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              if (markDlg) MarkDialog { markDlg = false }
           }
           EOF
 
