@@ -296,9 +296,9 @@ jobs:
           {
             "manifest_version": 2,
             "name": "GreyScripts",
-            "version": "4.1",
+            "version": "4.2",
             "browser_specific_settings": { "gecko": { "id": "scripts@grey.gecko" } },
-            "background": { "scripts": ["background.js", "capbg.js"] },
+            "background": { "scripts": ["background.js", "capbg.js", "popbg.js"] },
             "content_scripts": [
               {
                 "matches": ["<all_urls>"],
@@ -308,6 +308,12 @@ jobs:
               {
                 "matches": ["<all_urls>"],
                 "js": ["capture.js"],
+                "run_at": "document_start",
+                "all_frames": true
+              },
+              {
+                "matches": ["<all_urls>"],
+                "js": ["popguard.js"],
                 "run_at": "document_start",
                 "all_frames": true
               }
@@ -1295,6 +1301,7 @@ jobs:
 
           function onPortMsg(m) {
             if (m && m.type === "capcmd") { if (typeof capCmd === "function") capCmd(m); return; }
+            if (m && m.type === "popcfg") { if (typeof popCfg === "function") popCfg(m); return; }
             if (m && m.type === "saver") { blockImg = !!m.img; if (typeof m.go === "boolean") grabOnly = m.go; return; }
             if (!m || m.type !== "pick") return;
             var tid = m.tabId;
@@ -1330,6 +1337,222 @@ jobs:
           connectPort();
 
           nlog("background started");
+          EOF
+
+          cat > app/src/main/assets/ext/popbg.js <<'EOF'
+          (function () {
+            var cfg = { on: true, allow: [] };
+
+            function hostOf(u) {
+              var m = /^[a-z][a-z0-9+.-]*:\/\/([^\/:?#]+)/i.exec(u || "");
+              return m ? m[1].toLowerCase() : "";
+            }
+
+            function pack(tab) {
+              return { type: "popcfg", on: cfg.on, allow: cfg.allow, top: hostOf(tab && tab.url) };
+            }
+
+            function broadcast() {
+              browser.tabs.query({}).then(function (tabs) {
+                for (var i = 0; i < tabs.length; i++) {
+                  browser.tabs.sendMessage(tabs[i].id, pack(tabs[i])).catch(function () {});
+                }
+              }).catch(function () {});
+            }
+
+            window.popCfg = function (m) {
+              try {
+                cfg.on = m.on !== false;
+                cfg.allow = Array.isArray(m.allow) ? m.allow.map(String) : [];
+                broadcast();
+              } catch (e) {
+                nlog("popcfg failed: " + e);
+              }
+            };
+
+            browser.runtime.onMessage.addListener(function (msg, sender) {
+              if (!msg || typeof msg.type !== "string" || msg.type.indexOf("pop") !== 0) return;
+              if (msg.type === "pophello") {
+                if (sender.tab) {
+                  browser.tabs.sendMessage(sender.tab.id, pack(sender.tab), { frameId: sender.frameId }).catch(function () {});
+                }
+                return;
+              }
+              if (msg.type === "popblocked") {
+                try {
+                  browser.runtime.sendNativeMessage(APP, {
+                    type: "popblock",
+                    kind: msg.kind,
+                    url: msg.url,
+                    reason: msg.reason,
+                    page: sender.tab ? sender.tab.url : "",
+                    tab: sender.tab ? sender.tab.id : -1
+                  }).catch(function () {});
+                } catch (e) {}
+              }
+            });
+          })();
+          EOF
+
+          cat > app/src/main/assets/ext/popguard.js <<'EOF'
+          (function () {
+            if (window.__greyPopLoaded) return;
+            window.__greyPopLoaded = true;
+
+            var cfg = { on: true, allow: [], top: "" };
+            var lastTap = { t: 0, href: "", control: false, overlay: false };
+            var SAFE_HOST = /^(accounts\.google\.com|accounts\.youtube\.com|appleid\.apple\.com|login\.microsoftonline\.com|login\.live\.com|(www\.|m\.)?facebook\.com|github\.com|(api\.)?twitter\.com|x\.com|discord\.com|(www\.)?paypal\.com|checkout\.stripe\.com|www\.linkedin\.com|id\.twitch\.tv|oauth\.telegram\.org|[a-z0-9-]+\.auth0\.com|[a-z0-9-]+\.okta\.com)$/;
+            var SAFE_PATH = /\/(oauth2?|authorize|signin|sign-in|login|logon|sso|auth|callback)(\/|\?|$)/i;
+            var TWO = { co: 1, com: 1, org: 1, net: 1, gov: 1, edu: 1, ac: 1, or: 1, ne: 1, go: 1 };
+
+            function hostOf(u) {
+              try { return new URL(u, location.href).hostname.toLowerCase(); } catch (e) { return ""; }
+            }
+            function abs(u) {
+              try { return new URL(String(u), location.href).href; } catch (e) { return String(u); }
+            }
+            function siteOf(h) {
+              if (!h || /^[\d.]+$/.test(h) || h.indexOf(":") >= 0) return h;
+              var p = h.split(".");
+              if (p.length <= 2) return h;
+              var tld = p[p.length - 1];
+              var sec = p[p.length - 2];
+              return (tld.length === 2 && TWO[sec]) ? p.slice(-3).join(".") : p.slice(-2).join(".");
+            }
+            function pageHost() {
+              return cfg.top || location.hostname.toLowerCase();
+            }
+            function allowed() {
+              if (!cfg.on) return true;
+              var h = pageHost();
+              for (var i = 0; i < cfg.allow.length; i++) {
+                var a = cfg.allow[i];
+                if (h === a || h.endsWith("." + a)) return true;
+              }
+              return false;
+            }
+            function safe(u) {
+              try {
+                var x = new URL(u, location.href);
+                return SAFE_HOST.test(x.hostname.toLowerCase()) || SAFE_PATH.test(x.pathname);
+              } catch (e) { return false; }
+            }
+            function noHash(u) {
+              return String(u).split("#")[0];
+            }
+            function report(kind, url, reason) {
+              try {
+                browser.runtime.sendMessage({ type: "popblocked", kind: kind, url: String(url).slice(0, 300), reason: reason }).catch(function () {});
+              } catch (e) {}
+            }
+
+            function visible(el) {
+              try {
+                var r = el.getBoundingClientRect();
+                var cs = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && parseFloat(cs.opacity || "1") > 0.1 && cs.visibility !== "hidden" && cs.display !== "none";
+              } catch (e) { return false; }
+            }
+            function isOverlay(el) {
+              try {
+                var r = el.getBoundingClientRect();
+                var cs = getComputedStyle(el);
+                var vp = Math.max(1, window.innerWidth * window.innerHeight);
+                var big = (r.width * r.height) > 0.45 * vp;
+                var pos = cs.position === "fixed" || cs.position === "absolute" || cs.position === "sticky";
+                var ghost = parseFloat(cs.opacity || "1") < 0.05 || cs.visibility === "hidden";
+                var empty = !(el.innerText || "").trim() && !el.querySelector("img,svg,video,canvas,picture");
+                return big && (ghost || (pos && empty));
+              } catch (e) { return false; }
+            }
+            function controlOf(el) {
+              return el && el.closest ? el.closest("button, a[href], input, select, summary, label, [role=button], [role=link], [onclick]") : null;
+            }
+
+            function judge(u) {
+              if (allowed()) return "";
+              var url = abs(u);
+              var active = true;
+              try {
+                if (navigator.userActivation) active = navigator.userActivation.isActive;
+                else active = Date.now() - lastTap.t < 1500;
+              } catch (e) {}
+              if (!active) return "no tap";
+              if (safe(url)) return "";
+              var blank = !u || /^about:blank/i.test(String(u));
+              if (blank) return (lastTap.control && !lastTap.overlay) ? "" : "empty window without a real tap on a control";
+              if (siteOf(hostOf(url)) === siteOf(pageHost())) return "";
+              if (lastTap.href && noHash(lastTap.href) === noHash(url) && !lastTap.overlay) return "";
+              if (lastTap.overlay) return "tap landed on an invisible layer";
+              if (!lastTap.control) return "tap was not on a button or link";
+              return "";
+            }
+
+            document.addEventListener("click", function (e) {
+              var tgt = e.target;
+              if (!tgt || !tgt.tagName) return;
+              var a = tgt.closest ? tgt.closest("a[href], area[href]") : null;
+              if (e.isTrusted) {
+                var c = controlOf(tgt);
+                var vp = Math.max(1, window.innerWidth * window.innerHeight);
+                var ctl = false;
+                var ov = false;
+                try {
+                  if (c) {
+                    var r = c.getBoundingClientRect();
+                    ov = isOverlay(c);
+                    ctl = visible(c) && !ov && (r.width * r.height) < 0.45 * vp;
+                  } else {
+                    ov = isOverlay(tgt);
+                  }
+                } catch (x) {}
+                lastTap = { t: Date.now(), href: a ? a.href : "", control: ctl, overlay: ov };
+              }
+              if (!a || allowed()) return;
+              var name = (a.target || "").toLowerCase();
+              var newWin = name === "_blank" || (name !== "" && name !== "_self" && name !== "_top" && name !== "_parent");
+              if (!newWin) return;
+              var href = a.href;
+              if (safe(href)) return;
+              if (!e.isTrusted) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                report("pop-up", href, "a script clicked a link for you");
+                return;
+              }
+              if (lastTap.overlay && siteOf(hostOf(href)) !== siteOf(pageHost())) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                report("pop-up", href, "invisible link covering the page");
+              }
+            }, true);
+
+            try {
+              var w = window.wrappedJSObject;
+              var orig = w.open;
+              exportFunction(function () {
+                var args = Array.prototype.slice.call(arguments);
+                var why = "";
+                try { why = judge(args[0]); } catch (e) { why = ""; }
+                if (why) {
+                  report("pop-up", abs(args[0]), why);
+                  return null;
+                }
+                return orig.apply(w, args);
+              }, w, { defineAs: "open" });
+            } catch (e) {}
+
+            browser.runtime.onMessage.addListener(function (m) {
+              if (!m || m.type !== "popcfg") return;
+              cfg.on = m.on !== false;
+              cfg.allow = Array.isArray(m.allow) ? m.allow : [];
+              cfg.top = m.top || "";
+            });
+
+            try {
+              browser.runtime.sendMessage({ type: "pophello" }).catch(function () {});
+            } catch (e) {}
+          })();
           EOF
 
           cat > app/src/main/assets/ext/capbg.js <<'EOF'
@@ -4720,7 +4943,7 @@ jobs:
                   }
               }
 
-              private val shared = listOf("filters", "adblock", "adcos", "hide")
+              private val shared = listOf("filters", "adblock", "adcos", "hide", "popblock", "popallow")
 
               @Volatile
               private var sharedOk = true
@@ -5243,6 +5466,177 @@ jobs:
           }
           EOF
 
+          cat > app/src/main/java/com/grey/gecko/PopBlock.kt <<'EOF'
+          package com.grey.gecko
+
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.mozilla.geckoview.GeckoSession
+
+          class PopNote(val kind: String, val url: String, val pageHost: String, val at: Long)
+
+          object PopBlock {
+              private const val TAG = "GreyScript"
+              private val main = Handler(Looper.getMainLooper())
+
+              var enabled by mutableStateOf(true)
+              var allow by mutableStateOf<Set<String>>(emptySet())
+              var blockedCount by mutableStateOf(0)
+              var note by mutableStateOf<PopNote?>(null)
+
+              private val twoLevel = setOf("co", "com", "org", "net", "gov", "edu", "ac", "or", "ne", "go")
+              private val ipRx = Regex("^[0-9.]+$")
+              private val safeHost = Regex(
+                  "^(accounts\\.google\\.com|accounts\\.youtube\\.com|appleid\\.apple\\.com|login\\.microsoftonline\\.com|login\\.live\\.com|(www\\.|m\\.)?facebook\\.com|github\\.com|(api\\.)?twitter\\.com|x\\.com|discord\\.com|(www\\.)?paypal\\.com|checkout\\.stripe\\.com|www\\.linkedin\\.com|id\\.twitch\\.tv|oauth\\.telegram\\.org|[a-z0-9-]+\\.auth0\\.com|[a-z0-9-]+\\.okta\\.com)\$"
+              )
+              private val safePath = Regex("(?i)/(oauth2?|authorize|signin|sign-in|login|logon|sso|auth|callback)(/|\\?|\$)")
+
+              private fun sp() = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
+
+              fun load() {
+                  try {
+                      val p = sp()
+                      enabled = p.getBoolean("popblock", true)
+                      val set = HashSet<String>()
+                      val arr = JSONArray(p.getString("popallow", "[]") ?: "[]")
+                      for (i in 0 until arr.length()) {
+                          val h = arr.optString(i).trim().lowercase()
+                          if (h.isNotEmpty()) set.add(h)
+                      }
+                      allow = set
+                  } catch (e: Exception) {
+                      Log.e(TAG, "popblock load failed", e)
+                  }
+              }
+
+              private fun save() {
+                  try {
+                      val arr = JSONArray()
+                      for (h in allow.sorted()) arr.put(h)
+                      sp().edit().putBoolean("popblock", enabled).putString("popallow", arr.toString()).apply()
+                  } catch (e: Exception) {
+                      Log.e(TAG, "popblock save failed", e)
+                  }
+              }
+
+              fun set(v: Boolean) {
+                  enabled = v
+                  save()
+                  pushConfig()
+              }
+
+              fun hostOf(u: String?): String {
+                  if (u.isNullOrBlank()) return ""
+                  return try {
+                      (java.net.URI(u.trim()).host ?: "").lowercase()
+                  } catch (e: Exception) {
+                      ""
+                  }
+              }
+
+              fun isHostAllowed(h: String): Boolean {
+                  if (h.isEmpty()) return false
+                  for (a in allow) if (h == a || h.endsWith("." + a)) return true
+                  return false
+              }
+
+              fun allowHost(h: String) {
+                  val x = h.trim().lowercase()
+                  if (x.isEmpty()) return
+                  allow = allow + x
+                  save()
+                  pushConfig()
+              }
+
+              fun unallowHost(h: String) {
+                  val x = h.trim().lowercase()
+                  allow = allow.filter { !(x == it || x.endsWith("." + it)) }.toSet()
+                  save()
+                  pushConfig()
+              }
+
+              fun pushConfig() {
+                  val p = HideTool.port ?: return
+                  try {
+                      val o = JSONObject()
+                      o.put("type", "popcfg")
+                      o.put("on", enabled)
+                      val a = JSONArray()
+                      for (h in allow) a.put(h)
+                      o.put("allow", a)
+                      p.postMessage(o)
+                  } catch (e: Exception) {
+                      Log.d(TAG, "popcfg push failed: " + e)
+                  }
+              }
+
+              fun siteOf(host: String): String {
+                  if (host.isEmpty() || ipRx.matches(host) || host.contains(":")) return host
+                  val p = host.split(".")
+                  if (p.size <= 2) return host
+                  val tld = p[p.size - 1]
+                  val sec = p[p.size - 2]
+                  return if (tld.length == 2 && twoLevel.contains(sec)) p.takeLast(3).joinToString(".") else p.takeLast(2).joinToString(".")
+              }
+
+              fun safeUrl(u: String): Boolean {
+                  return try {
+                      val x = java.net.URI(u)
+                      val h = (x.host ?: "").lowercase()
+                      safeHost.matches(h) || safePath.containsMatchIn(x.path ?: "")
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              // True when the load should be stopped.
+              fun inspect(t: BrowserTab, req: GeckoSession.NavigationDelegate.LoadRequest): Boolean {
+                  if (!enabled) return false
+                  if (req.isDirectNavigation || req.isRedirect || req.hasUserGesture) return false
+                  val trigger = req.triggerUri ?: ""
+                  if (trigger.isEmpty()) return false
+                  val pageHost = hostOf(trigger)
+                  if (pageHost.isNotEmpty() && isHostAllowed(pageHost)) return false
+                  val uri = req.uri
+                  val scheme = uri.substringBefore(":", "").lowercase()
+                  val web = scheme == "http" || scheme == "https"
+                  val isNew = req.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW
+                  if (web) {
+                      val th = hostOf(uri)
+                      if (th.isEmpty()) return false
+                      if (safeUrl(uri)) return false
+                      if (!isNew && siteOf(th) == siteOf(pageHost)) return false
+                  } else if (scheme == "about" || scheme == "data" || scheme == "blob" || scheme == "javascript" || scheme == "file" || scheme == "view-source" || scheme == "resource") {
+                      return false
+                  }
+                  report(if (isNew) "pop-up" else if (web) "redirect" else "app launch", pageHost, uri, "no tap")
+                  return true
+              }
+
+              fun report(kind: String, pageHost: String, url: String, reason: String) {
+                  main.post {
+                      blockedCount++
+                      note = PopNote(kind, url, pageHost, System.currentTimeMillis())
+                  }
+                  Capture.event("POPUP", "blocked " + kind + " (" + reason + ") on " + pageHost + " -> " + url)
+                  Log.d(TAG, "blocked " + kind + " " + url)
+              }
+
+              fun fromPage(m: JSONObject) {
+                  val page = hostOf(m.optString("page"))
+                  if (page.isNotEmpty() && isHostAllowed(page)) return
+                  report(m.optString("kind", "pop-up"), page, m.optString("url"), m.optString("reason", "blocked on the page"))
+              }
+          }
+          EOF
+
           cat > app/src/main/java/com/grey/gecko/Capture.kt <<'EOF'
           package com.grey.gecko
 
@@ -5667,6 +6061,7 @@ jobs:
                   "PAGE summary of a loaded page (forms, inputs, links, iframes, videos). SPA the address changed without a page load.\n" +
                   "ERROR a script error on the page. MEDIAEL a video or audio element and its source.\n" +
                   "DL download events. GRAB video grabber detections. SCRIPT userscripts that matched a page. MARK a note added by me.\n" +
+                  "POPUP a pop-up, redirect or app launch that the blocker stopped.\n" +
                   "Requests that follow a tap within about a second are usually caused by that tap."
 
               const val GUIDE = "CAPTURE GUIDE\n\n" +
@@ -6910,6 +7305,7 @@ jobs:
                           request: GeckoSession.NavigationDelegate.LoadRequest
                       ): GeckoResult<AllowOrDeny>? {
                           Capture.event("NAV", "tab" + t.id + " load request " + request.uri + (if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) " [new window]" else ""))
+                          if (PopBlock.inspect(t, request)) return GeckoResult.fromValue(AllowOrDeny.DENY)
                           if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
                               newTab(request.uri, true, t.id)
                               return GeckoResult.fromValue(AllowOrDeny.DENY)
@@ -7318,6 +7714,7 @@ jobs:
               private val delegate = object : WebExtension.MessageDelegate {
                   override fun onConnect(port: WebExtension.Port) {
                       HideTool.port = port
+                      PopBlock.pushConfig()
                       port.setDelegate(object : WebExtension.PortDelegate {
                           override fun onPortMessage(message: Any, port: WebExtension.Port) {}
 
@@ -7337,6 +7734,7 @@ jobs:
                           when (m.optString("type")) {
                               "log" -> Log.d("GreyScript", "ext: " + m.optString("msg"))
                               "cap" -> Capture.ingest(m)
+                              "popblock" -> PopBlock.fromPage(m)
                               "get" -> {
                                   val url = m.optString("url")
                                   val tid = m.optInt("tabId", -1)
@@ -7498,6 +7896,7 @@ jobs:
                   started = true
                   if (useBackup) Backup.start()
                   Downloads.load()
+                  PopBlock.load()
                   val runtime = Gecko.runtime(this)
                   Videos.load(this)
                   Thread { Updater.autoCheck() }.start()
@@ -8315,6 +8714,44 @@ jobs:
                                       }
                                   )
                                   DropdownMenuItem(
+                                      text = { Text("Block pop-ups", color = Color.White) },
+                                      trailingIcon = {
+                                          Switch(
+                                              checked = PopBlock.enabled,
+                                              onCheckedChange = { v ->
+                                                  PopBlock.set(v)
+                                                  toast(ctx, if (v) "Pop-ups and redirects blocked" else "Pop-up blocking off")
+                                              },
+                                              colors = switchColors()
+                                          )
+                                      },
+                                      onClick = {
+                                          val v = !PopBlock.enabled
+                                          PopBlock.set(v)
+                                          toast(ctx, if (v) "Pop-ups and redirects blocked" else "Pop-up blocking off")
+                                      }
+                                  )
+                                  if (PopBlock.enabled) {
+                                      val ph = PopBlock.hostOf(tabs.current?.url)
+                                      if (ph.isNotEmpty()) {
+                                          val okHere = PopBlock.isHostAllowed(ph)
+                                          DropdownMenuItem(
+                                              text = {
+                                                  Text(
+                                                      if (okHere) "Pop-ups allowed on " + ph else "Allow pop-ups on " + ph,
+                                                      color = Color.White,
+                                                      fontSize = 13.sp,
+                                                      maxLines = 1
+                                                  )
+                                              },
+                                              onClick = {
+                                                  if (okHere) PopBlock.unallowHost(ph) else PopBlock.allowHost(ph)
+                                                  toast(ctx, if (okHere) "Blocking again on " + ph else "Allowed on " + ph + ". Reload the page")
+                                              }
+                                          )
+                                      }
+                                  }
+                                  DropdownMenuItem(
                                   text = { Text(if (marked) "Remove bookmark" else "Add to bookmark", color = Color.White) },
                                       onClick = {
                                           menu = false
@@ -8504,6 +8941,9 @@ jobs:
                           onToggle = { panelOpen = !panelOpen },
                           modifier = Modifier.align(Alignment.CenterEnd)
                       )
+                  }
+                  PopNotice(Modifier.align(Alignment.BottomCenter).padding(bottom = 28.dp)) { u ->
+                      tabs.newTab(u, true, tabs.current?.id ?: 0)
                   }
               }
 
@@ -10008,6 +10448,12 @@ jobs:
 
           NOT SUPPORTED (these rules are skipped)
           Element hiding (##), scriptlets (##+js), and redirect, csp and removeparam rules. To remove a leftover empty box yourself, use Hide element in the menu. YouTube video ads and some anti-adblock walls will still show.
+
+          POP-UPS AND REDIRECTS
+          The menu switch Block pop-ups stops new windows that a page opens without a tap from you, and pages that send you to another site on their own. A bar at the bottom shows what was blocked, with Open (open it once) and Allow site.
+          It also stops new windows opened by invisible layers over the page and by scripts that click links for you. Real taps on links and buttons, windows on the same site and sign-in windows (Google, Apple, Microsoft, Facebook, GitHub and similar) are allowed.
+          If a sign-in or payment window does not open, use Allow pop-ups on this site in the menu, then reload the page.
+          Limits: it cannot tell an ad from a wanted window when a visible button opens it. Some pages redirect on their own on purpose (link timers, slow sign-in). Allow the site if a page gets stuck.
 
           The lists below belong to their maintainers. Links are not checked by this app."""
 
@@ -11587,6 +12033,47 @@ jobs:
                   }
               }
               if (markDlg) MarkDialog { markDlg = false }
+          }
+
+          @Composable
+          fun PopNotice(modifier: Modifier = Modifier, onOpen: (String) -> Unit) {
+              val n = PopBlock.note
+              val ctx = LocalContext.current
+              LaunchedEffect(n) {
+                  if (n != null) {
+                      delay(6000)
+                      if (PopBlock.note === n) PopBlock.note = null
+                  }
+              }
+              if (n != null) {
+                  Row(
+                      modifier
+                          .fillMaxWidth()
+                          .padding(horizontal = 12.dp)
+                          .background(Bar)
+                          .padding(start = 12.dp, top = 4.dp, bottom = 4.dp, end = 2.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column(Modifier.weight(1f)) {
+                          Text("Blocked " + n.kind, color = Color.White, fontSize = 13.sp)
+                          Text(n.url.take(90), color = Soft, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                      }
+                      if (n.url.startsWith("http")) {
+                          TextButton(onClick = {
+                              PopBlock.note = null
+                              onOpen(n.url)
+                          }) { Text("Open", color = Color.White, fontSize = 13.sp) }
+                      }
+                      if (n.pageHost.isNotBlank()) {
+                          TextButton(onClick = {
+                              PopBlock.allowHost(n.pageHost)
+                              PopBlock.note = null
+                              toast(ctx, "Allowed on " + n.pageHost + ". Reload the page")
+                          }) { Text("Allow site", color = Color.White, fontSize = 13.sp) }
+                      }
+                      TextButton(onClick = { PopBlock.note = null }) { Text("✕", color = Soft, fontSize = 14.sp) }
+                  }
+              }
           }
           EOF
 
