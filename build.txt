@@ -1341,7 +1341,7 @@ jobs:
 
           cat > app/src/main/assets/ext/popbg.js <<'EOF'
           (function () {
-            var cfg = { on: true, allow: [] };
+            var cfg = { on: true };
 
             function hostOf(u) {
               var m = /^[a-z][a-z0-9+.-]*:\/\/([^\/:?#]+)/i.exec(u || "");
@@ -1349,7 +1349,7 @@ jobs:
             }
 
             function pack(tab) {
-              return { type: "popcfg", on: cfg.on, allow: cfg.allow, top: hostOf(tab && tab.url) };
+              return { type: "popcfg", on: cfg.on, top: hostOf(tab && tab.url) };
             }
 
             function broadcast() {
@@ -1363,7 +1363,6 @@ jobs:
             window.popCfg = function (m) {
               try {
                 cfg.on = m.on !== false;
-                cfg.allow = Array.isArray(m.allow) ? m.allow.map(String) : [];
                 broadcast();
               } catch (e) {
                 nlog("popcfg failed: " + e);
@@ -1399,7 +1398,7 @@ jobs:
             if (window.__greyPopLoaded) return;
             window.__greyPopLoaded = true;
 
-            var cfg = { on: true, allow: [], top: "" };
+            var cfg = { on: true, top: "" };
             var lastTap = { t: 0, href: "", control: false, overlay: false };
             var SAFE_HOST = /^(accounts\.google\.com|accounts\.youtube\.com|appleid\.apple\.com|login\.microsoftonline\.com|login\.live\.com|(www\.|m\.)?facebook\.com|github\.com|(api\.)?twitter\.com|x\.com|discord\.com|(www\.)?paypal\.com|checkout\.stripe\.com|www\.linkedin\.com|id\.twitch\.tv|oauth\.telegram\.org|[a-z0-9-]+\.auth0\.com|[a-z0-9-]+\.okta\.com)$/;
             var SAFE_PATH = /\/(oauth2?|authorize|signin|sign-in|login|logon|sso|auth|callback)(\/|\?|$)/i;
@@ -1423,13 +1422,7 @@ jobs:
               return cfg.top || location.hostname.toLowerCase();
             }
             function allowed() {
-              if (!cfg.on) return true;
-              var h = pageHost();
-              for (var i = 0; i < cfg.allow.length; i++) {
-                var a = cfg.allow[i];
-                if (h === a || h.endsWith("." + a)) return true;
-              }
-              return false;
+              return !cfg.on;
             }
             function safe(u) {
               try {
@@ -1535,7 +1528,9 @@ jobs:
                 var why = "";
                 try { why = judge(args[0]); } catch (e) { why = ""; }
                 if (why) {
-                  report("pop-up", abs(args[0]), why);
+                  var raw = args[0];
+                  var blank = !raw || /^about:blank/i.test(String(raw));
+                  report("pop-up", blank ? "" : abs(raw), why);
                   return null;
                 }
                 return orig.apply(w, args);
@@ -1545,7 +1540,6 @@ jobs:
             browser.runtime.onMessage.addListener(function (m) {
               if (!m || m.type !== "popcfg") return;
               cfg.on = m.on !== false;
-              cfg.allow = Array.isArray(m.allow) ? m.allow : [];
               cfg.top = m.top || "";
             });
 
@@ -4943,7 +4937,7 @@ jobs:
                   }
               }
 
-              private val shared = listOf("filters", "adblock", "adcos", "hide", "popblock", "popallow")
+              private val shared = listOf("filters", "adblock", "adcos", "hide", "popblock")
 
               @Volatile
               private var sharedOk = true
@@ -5470,26 +5464,28 @@ jobs:
           package com.grey.gecko
 
           import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
           import android.os.Handler
           import android.os.Looper
           import android.util.Log
           import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateListOf
           import androidx.compose.runtime.mutableStateOf
           import androidx.compose.runtime.setValue
-          import org.json.JSONArray
           import org.json.JSONObject
           import org.mozilla.geckoview.GeckoSession
 
-          class PopNote(val kind: String, val url: String, val pageHost: String, val at: Long)
+          class PopNote(val kind: String, val url: String, val pageHost: String, val tabId: Int, val at: Long)
 
           object PopBlock {
               private const val TAG = "GreyScript"
               private val main = Handler(Looper.getMainLooper())
+              private val denied = HashMap<String, Long>()
 
               var enabled by mutableStateOf(true)
-              var allow by mutableStateOf<Set<String>>(emptySet())
               var blockedCount by mutableStateOf(0)
-              var note by mutableStateOf<PopNote?>(null)
+              val pending = mutableStateListOf<PopNote>()
 
               private val twoLevel = setOf("co", "com", "org", "net", "gov", "edu", "ac", "or", "ne", "go")
               private val ipRx = Regex("^[0-9.]+$")
@@ -5502,33 +5498,20 @@ jobs:
 
               fun load() {
                   try {
-                      val p = sp()
-                      enabled = p.getBoolean("popblock", true)
-                      val set = HashSet<String>()
-                      val arr = JSONArray(p.getString("popallow", "[]") ?: "[]")
-                      for (i in 0 until arr.length()) {
-                          val h = arr.optString(i).trim().lowercase()
-                          if (h.isNotEmpty()) set.add(h)
-                      }
-                      allow = set
+                      enabled = sp().getBoolean("popblock", true)
                   } catch (e: Exception) {
                       Log.e(TAG, "popblock load failed", e)
                   }
               }
 
-              private fun save() {
+              fun set(v: Boolean) {
+                  enabled = v
                   try {
-                      val arr = JSONArray()
-                      for (h in allow.sorted()) arr.put(h)
-                      sp().edit().putBoolean("popblock", enabled).putString("popallow", arr.toString()).apply()
+                      sp().edit().putBoolean("popblock", v).apply()
                   } catch (e: Exception) {
                       Log.e(TAG, "popblock save failed", e)
                   }
-              }
-
-              fun set(v: Boolean) {
-                  enabled = v
-                  save()
+                  if (!v) pending.clear()
                   pushConfig()
               }
 
@@ -5541,36 +5524,12 @@ jobs:
                   }
               }
 
-              fun isHostAllowed(h: String): Boolean {
-                  if (h.isEmpty()) return false
-                  for (a in allow) if (h == a || h.endsWith("." + a)) return true
-                  return false
-              }
-
-              fun allowHost(h: String) {
-                  val x = h.trim().lowercase()
-                  if (x.isEmpty()) return
-                  allow = allow + x
-                  save()
-                  pushConfig()
-              }
-
-              fun unallowHost(h: String) {
-                  val x = h.trim().lowercase()
-                  allow = allow.filter { !(x == it || x.endsWith("." + it)) }.toSet()
-                  save()
-                  pushConfig()
-              }
-
               fun pushConfig() {
                   val p = HideTool.port ?: return
                   try {
                       val o = JSONObject()
                       o.put("type", "popcfg")
                       o.put("on", enabled)
-                      val a = JSONArray()
-                      for (h in allow) a.put(h)
-                      o.put("allow", a)
                       p.postMessage(o)
                   } catch (e: Exception) {
                       Log.d(TAG, "popcfg push failed: " + e)
@@ -5596,14 +5555,13 @@ jobs:
                   }
               }
 
-              // True when the load should be stopped.
+              // True when the load should be stopped. The user is asked about it.
               fun inspect(t: BrowserTab, req: GeckoSession.NavigationDelegate.LoadRequest): Boolean {
                   if (!enabled) return false
                   if (req.isDirectNavigation || req.isRedirect || req.hasUserGesture) return false
                   val trigger = req.triggerUri ?: ""
                   if (trigger.isEmpty()) return false
                   val pageHost = hostOf(trigger)
-                  if (pageHost.isNotEmpty() && isHostAllowed(pageHost)) return false
                   val uri = req.uri
                   val scheme = uri.substringBefore(":", "").lowercase()
                   val web = scheme == "http" || scheme == "https"
@@ -5616,23 +5574,61 @@ jobs:
                   } else if (scheme == "about" || scheme == "data" || scheme == "blob" || scheme == "javascript" || scheme == "file" || scheme == "view-source" || scheme == "resource") {
                       return false
                   }
-                  report(if (isNew) "pop-up" else if (web) "redirect" else "app launch", pageHost, uri, "no tap")
+                  report(if (isNew) "pop-up" else if (web) "redirect" else "app launch", pageHost, uri, "no tap", t.id)
                   return true
               }
 
-              fun report(kind: String, pageHost: String, url: String, reason: String) {
-                  main.post {
-                      blockedCount++
-                      note = PopNote(kind, url, pageHost, System.currentTimeMillis())
-                  }
+              fun report(kind: String, pageHost: String, url: String, reason: String, tabId: Int) {
                   Capture.event("POPUP", "blocked " + kind + " (" + reason + ") on " + pageHost + " -> " + url)
                   Log.d(TAG, "blocked " + kind + " " + url)
+                  main.post {
+                      blockedCount++
+                      val now = System.currentTimeMillis()
+                      val until = denied[url]
+                      if (until != null && until > now) return@post
+                      if (pending.any { it.url == url && it.kind == kind }) return@post
+                      if (pending.size >= 8) return@post
+                      pending.add(PopNote(kind, url, pageHost, tabId, now))
+                  }
               }
 
               fun fromPage(m: JSONObject) {
-                  val page = hostOf(m.optString("page"))
-                  if (page.isNotEmpty() && isHostAllowed(page)) return
-                  report(m.optString("kind", "pop-up"), page, m.optString("url"), m.optString("reason", "blocked on the page"))
+                  val ext = m.optInt("tab", -1)
+                  val tid = if (ext >= 0) Videos.appTabId(ext) else -1
+                  report(m.optString("kind", "pop-up"), hostOf(m.optString("page")), m.optString("url"), m.optString("reason", "blocked on the page"), tid)
+              }
+
+              fun block(n: PopNote) {
+                  denied[n.url] = System.currentTimeMillis() + 30000L
+                  pending.remove(n)
+                  Capture.event("POPUP", "you blocked " + n.kind + " -> " + n.url)
+              }
+
+              fun blockAll() {
+                  val now = System.currentTimeMillis()
+                  for (n in pending) denied[n.url] = now + 30000L
+                  Capture.event("POPUP", "you blocked all " + pending.size + " waiting")
+                  pending.clear()
+              }
+
+              fun allowOnce(n: PopNote) {
+                  pending.remove(n)
+                  Capture.event("POPUP", "you allowed " + n.kind + " -> " + n.url)
+              }
+
+              fun openExternal(c: Context, url: String): Boolean {
+                  return try {
+                      val i = if (url.startsWith("intent:")) Intent.parseUri(url, Intent.URI_INTENT_SCHEME) else Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                      i.addCategory(Intent.CATEGORY_BROWSABLE)
+                      i.component = null
+                      i.selector = null
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      c.startActivity(i)
+                      true
+                  } catch (e: Exception) {
+                      Log.d(TAG, "open external failed: " + e)
+                      false
+                  }
               }
           }
           EOF
@@ -8720,7 +8716,7 @@ jobs:
                                               checked = PopBlock.enabled,
                                               onCheckedChange = { v ->
                                                   PopBlock.set(v)
-                                                  toast(ctx, if (v) "Pop-ups and redirects blocked" else "Pop-up blocking off")
+                                                  toast(ctx, if (v) "Pop-ups and redirects blocked. You will be asked each time" else "Pop-up blocking off")
                                               },
                                               colors = switchColors()
                                           )
@@ -8728,29 +8724,9 @@ jobs:
                                       onClick = {
                                           val v = !PopBlock.enabled
                                           PopBlock.set(v)
-                                          toast(ctx, if (v) "Pop-ups and redirects blocked" else "Pop-up blocking off")
+                                          toast(ctx, if (v) "Pop-ups and redirects blocked. You will be asked each time" else "Pop-up blocking off")
                                       }
                                   )
-                                  if (PopBlock.enabled) {
-                                      val ph = PopBlock.hostOf(tabs.current?.url)
-                                      if (ph.isNotEmpty()) {
-                                          val okHere = PopBlock.isHostAllowed(ph)
-                                          DropdownMenuItem(
-                                              text = {
-                                                  Text(
-                                                      if (okHere) "Pop-ups allowed on " + ph else "Allow pop-ups on " + ph,
-                                                      color = Color.White,
-                                                      fontSize = 13.sp,
-                                                      maxLines = 1
-                                                  )
-                                              },
-                                              onClick = {
-                                                  if (okHere) PopBlock.unallowHost(ph) else PopBlock.allowHost(ph)
-                                                  toast(ctx, if (okHere) "Blocking again on " + ph else "Allowed on " + ph + ". Reload the page")
-                                              }
-                                          )
-                                      }
-                                  }
                                   DropdownMenuItem(
                                   text = { Text(if (marked) "Remove bookmark" else "Add to bookmark", color = Color.White) },
                                       onClick = {
@@ -8942,8 +8918,16 @@ jobs:
                           modifier = Modifier.align(Alignment.CenterEnd)
                       )
                   }
-                  PopNotice(Modifier.align(Alignment.BottomCenter).padding(bottom = 28.dp)) { u ->
-                      tabs.newTab(u, true, tabs.current?.id ?: 0)
+                  PopNotice(Modifier.align(Alignment.BottomCenter).padding(bottom = 28.dp)) { n ->
+                      PopBlock.allowOnce(n)
+                      if (n.kind == "redirect") {
+                          val tt = tabs.tabs.firstOrNull { it.id == n.tabId } ?: tabs.current
+                          if (tt != null) tabs.load(tt, n.url) else tabs.newTab(n.url, true, 0)
+                      } else if (n.url.startsWith("http")) {
+                          tabs.newTab(n.url, true, tabs.current?.id ?: 0)
+                      } else if (!PopBlock.openExternal(ctx, n.url)) {
+                          toast(ctx, "No app can open this")
+                      }
                   }
               }
 
@@ -10450,10 +10434,9 @@ jobs:
           Element hiding (##), scriptlets (##+js), and redirect, csp and removeparam rules. To remove a leftover empty box yourself, use Hide element in the menu. YouTube video ads and some anti-adblock walls will still show.
 
           POP-UPS AND REDIRECTS
-          The menu switch Block pop-ups stops new windows that a page opens without a tap from you, and pages that send you to another site on their own. A bar at the bottom shows what was blocked, with Open (open it once) and Allow site.
-          It also stops new windows opened by invisible layers over the page and by scripts that click links for you. Real taps on links and buttons, windows on the same site and sign-in windows (Google, Apple, Microsoft, Facebook, GitHub and similar) are allowed.
-          If a sign-in or payment window does not open, use Allow pop-ups on this site in the menu, then reload the page.
-          Limits: it cannot tell an ad from a wanted window when a visible button opens it. Some pages redirect on their own on purpose (link timers, slow sign-in). Allow the site if a page gets stuck.
+          The menu switch Block pop-ups stops new windows that a page opens without a tap from you, and pages that send you to another site on their own. Each time something is blocked, a prompt at the bottom asks Allow or Block. Allow opens just that one (a redirect loads in the tab it came from). Block keeps it blocked and the same address stays quiet for 30 seconds. If you ignore the prompt for 15 seconds it counts as Block.
+          It also stops new windows opened by invisible layers over the page and by scripts that click links for you. Real taps on buttons and links, windows on the same site and sign-in windows (Google, Apple, Microsoft, Facebook, GitHub and similar) are opened without asking.
+          Limits: it cannot tell an ad from a wanted window when a visible button opens it. Some pages redirect on their own on purpose (link timers, slow sign-in). Tap Allow when that happens.
 
           The lists below belong to their maintainers. Links are not checked by this app."""
 
@@ -12036,42 +12019,49 @@ jobs:
           }
 
           @Composable
-          fun PopNotice(modifier: Modifier = Modifier, onOpen: (String) -> Unit) {
-              val n = PopBlock.note
-              val ctx = LocalContext.current
-              LaunchedEffect(n) {
-                  if (n != null) {
-                      delay(6000)
-                      if (PopBlock.note === n) PopBlock.note = null
+          fun PopNotice(modifier: Modifier = Modifier, onAllow: (PopNote) -> Unit) {
+              val head = PopBlock.pending.firstOrNull()
+              val more = PopBlock.pending.size - 1
+              LaunchedEffect(head) {
+                  if (head != null) {
+                      delay(15000)
+                      if (PopBlock.pending.firstOrNull() === head) PopBlock.block(head)
                   }
               }
-              if (n != null) {
-                  Row(
+              if (head != null) {
+                  val canAllow = head.url.isNotBlank()
+                  Column(
                       modifier
                           .fillMaxWidth()
                           .padding(horizontal = 12.dp)
                           .background(Bar)
-                          .padding(start = 12.dp, top = 4.dp, bottom = 4.dp, end = 2.dp),
-                      verticalAlignment = Alignment.CenterVertically
+                          .padding(start = 14.dp, top = 10.dp, end = 6.dp, bottom = 2.dp)
                   ) {
-                      Column(Modifier.weight(1f)) {
-                          Text("Blocked " + n.kind, color = Color.White, fontSize = 13.sp)
-                          Text(n.url.take(90), color = Soft, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                      Text(
+                          "Allow " + head.kind + "?" + (if (more > 0) "  (" + more + " more waiting)" else ""),
+                          color = Color.White,
+                          fontSize = 14.sp
+                      )
+                      if (head.pageHost.isNotBlank()) {
+                          Text("from " + head.pageHost, color = Soft, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                       }
-                      if (n.url.startsWith("http")) {
-                          TextButton(onClick = {
-                              PopBlock.note = null
-                              onOpen(n.url)
-                          }) { Text("Open", color = Color.White, fontSize = 13.sp) }
+                      Text(
+                          if (canAllow) head.url.take(110) else "empty window",
+                          color = Soft,
+                          fontSize = 11.sp,
+                          maxLines = 2,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Row(Modifier.fillMaxWidth()) {
+                          Spacer(Modifier.weight(1f))
+                          if (more > 0) {
+                              TextButton(onClick = { PopBlock.blockAll() }) { Text("Block all", color = Soft, fontSize = 13.sp) }
+                          }
+                          TextButton(onClick = { PopBlock.block(head) }) { Text("Block", color = Color.White, fontSize = 13.sp) }
+                          if (canAllow) {
+                              TextButton(onClick = { onAllow(head) }) { Text("Allow", color = Color.White, fontSize = 13.sp) }
+                          }
                       }
-                      if (n.pageHost.isNotBlank()) {
-                          TextButton(onClick = {
-                              PopBlock.allowHost(n.pageHost)
-                              PopBlock.note = null
-                              toast(ctx, "Allowed on " + n.pageHost + ". Reload the page")
-                          }) { Text("Allow site", color = Color.White, fontSize = 13.sp) }
-                      }
-                      TextButton(onClick = { PopBlock.note = null }) { Text("✕", color = Soft, fontSize = 14.sp) }
                   }
               }
           }
