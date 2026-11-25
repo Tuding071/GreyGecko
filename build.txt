@@ -5460,6 +5460,32 @@ jobs:
           }
           EOF
 
+          cat > app/src/main/java/com/grey/gecko/Privacy.kt <<'EOF'
+          package com.grey.gecko
+
+          import org.mozilla.geckoview.ContentBlocking
+
+          // Tracking protection that stays on. Site data of third-party content is kept separate for each
+          // site you visit (Total Cookie Protection), so nothing follows you from one site to another.
+          object PrivacyConfig {
+              // Extra Gecko preferences, one per line in the YAML config file.
+              const val PREFS = "  network.http.referer.XOriginTrimmingPolicy: 2\n" +
+                  "  privacy.query_stripping.enabled: true\n" +
+                  "  privacy.globalprivacycontrol.enabled: true\n" +
+                  "  privacy.globalprivacycontrol.functionality.enabled: true\n" +
+                  "  media.peerconnection.ice.default_address_only: true\n" +
+                  "  media.peerconnection.ice.no_host: true\n" +
+                  "  privacy.trackingprotection.fingerprinting.enabled: true\n" +
+                  "  privacy.trackingprotection.cryptomining.enabled: true\n"
+
+              fun blocking(): ContentBlocking.Settings = ContentBlocking.Settings.Builder()
+                  .cookieBehavior(ContentBlocking.CookieBehavior.ACCEPT_FIRST_PARTY_AND_ISOLATE_OTHERS)
+                  .cookiePurging(true)
+                  .queryParameterStrippingEnabled(true)
+                  .build()
+          }
+          EOF
+
           cat > app/src/main/java/com/grey/gecko/Touch.kt <<'EOF'
           package com.grey.gecko
 
@@ -5481,21 +5507,45 @@ jobs:
           import androidx.compose.ui.composed
           import androidx.compose.ui.draw.drawWithContent
           import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Rect
           import androidx.compose.ui.graphics.BlendMode
           import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ColorFilter
+          import androidx.compose.ui.graphics.ColorMatrix
           import androidx.compose.ui.graphics.Outline
+          import androidx.compose.ui.graphics.Paint
           import androidx.compose.ui.graphics.RectangleShape
           import androidx.compose.ui.graphics.Shape
           import androidx.compose.ui.input.pointer.PointerEventPass
           import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.boundsInRoot
+          import androidx.compose.ui.layout.onGloballyPositioned
+          import androidx.compose.ui.platform.LocalView
           import androidx.compose.ui.platform.LocalViewConfiguration
           import kotlinx.coroutines.Job
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
 
+          class BoundsHolder {
+              var r: Rect = Rect.Zero
+          }
+
           object TouchOwner {
               var id by mutableStateOf<Any?>(null)
+              var bounds: Rect = Rect.Zero
+              var view: Any? = null
           }
+
+          private val INVERT = ColorFilter.colorMatrix(
+              ColorMatrix(
+                  floatArrayOf(
+                      -1f, 0f, 0f, 0f, 255f,
+                      0f, -1f, 0f, 0f, 255f,
+                      0f, 0f, -1f, 0f, 255f,
+                      0f, 0f, 0f, 1f, 0f
+                  )
+              )
+          )
 
           // Touch effect: while a finger is down on a touch area, the area is inverted
           // (dark background becomes white, white text becomes black). It does not take
@@ -5505,6 +5555,8 @@ jobs:
               val scope = rememberCoroutineScope()
               val jobs = remember { arrayOfNulls<Job>(1) }
               val token = remember { Any() }
+              val view = LocalView.current
+              val area = remember { BoundsHolder() }
               val slop = LocalViewConfiguration.current.touchSlop
               val watcher = if (!enabled) {
                   Modifier
@@ -5522,7 +5574,13 @@ jobs:
                                   val moved = (ch.position - start).getDistance() > slop
                                   jobs[0]?.cancel()
                                   down = inside && !moved
-                                  if (down) TouchOwner.id = token
+                                  if (down) {
+                                      TouchOwner.bounds = area.r
+                                      TouchOwner.view = view
+                                      TouchOwner.id = token
+                                  } else if (TouchOwner.id === token) {
+                                      TouchOwner.id = null
+                                  }
                               } else if (down) {
                                   jobs[0]?.cancel()
                                   jobs[0] = scope.launch {
@@ -5535,7 +5593,7 @@ jobs:
                       }
                   }
               }
-              this.then(watcher).drawWithContent {
+              this.then(watcher).onGloballyPositioned { area.r = it.boundsInRoot() }.drawWithContent {
                   drawContent()
                   if (down && TouchOwner.id === token) {
                       val modern = Build.VERSION.SDK_INT >= 29
@@ -5618,6 +5676,25 @@ jobs:
                   trailingIcon = trailingIcon,
                   enabled = enabled
               )
+          }
+
+          // For favicons and thumbnails: they keep their own colors while the touch area around them is inverted.
+          fun Modifier.keepColors(): Modifier = composed {
+              val view = LocalView.current
+              val box = remember { BoundsHolder() }
+              this.onGloballyPositioned { box.r = it.boundsInRoot() }.drawWithContent {
+                  val flip = TouchOwner.id != null && TouchOwner.view === view && TouchOwner.bounds.contains(box.r.center)
+                  if (!flip) {
+                      drawContent()
+                  } else {
+                      val paint = Paint()
+                      paint.colorFilter = INVERT
+                      val canvas = drawContext.canvas
+                      canvas.saveLayer(Rect(0f, 0f, size.width, size.height), paint)
+                      drawContent()
+                      canvas.restore()
+                  }
+              }
           }
           EOF
 
@@ -7996,12 +8073,14 @@ jobs:
                   appCtx = ctx.applicationContext
                   val cfg = java.io.File(appCtx.filesDir, "gecko-config.yaml")
                   try {
-                      cfg.writeText("prefs:\n  ui.click_hold_context_menus.delay: 350\n" + (if (Saver.autoplay()) "  media.autoplay.default: 5\n" else ""))
+                      cfg.writeText("prefs:\n  ui.click_hold_context_menus.delay: 350\n" + PrivacyConfig.PREFS + (if (Saver.autoplay()) "  media.autoplay.default: 5\n" else ""))
                   } catch (e: Exception) {
                       Log.e("GreyScript", "config write failed", e)
                   }
                   val settings = GeckoRuntimeSettings.Builder()
                       .configFilePath(cfg.absolutePath)
+                      .contentBlocking(PrivacyConfig.blocking())
+                      .globalPrivacyControlEnabled(true)
                       .build()
                   val r = GeckoRuntime.create(appCtx, settings)
                   rt = r
@@ -9553,6 +9632,7 @@ jobs:
                   Box(
                       Modifier
                           .size(size)
+                          .keepColors()
                           .clip(shape)
                           .background(Color(0xFFEFEFEF)),
                       contentAlignment = Alignment.Center
@@ -9567,6 +9647,7 @@ jobs:
                   Box(
                       Modifier
                           .size(size)
+                          .keepColors()
                           .clip(shape)
                           .background(groupColor(key)),
                       contentAlignment = Alignment.Center
@@ -9711,6 +9792,7 @@ jobs:
                   Box(
                       Modifier
                           .size(84.dp)
+                          .keepColors()
                           .clip(RoundedCornerShape(8.dp))
                           .background(Field),
                       contentAlignment = Alignment.Center
@@ -10597,6 +10679,10 @@ jobs:
           The menu switch Block pop-ups stops new windows that a page opens without a tap from you, and pages that send you to another site on their own. Each time something is blocked, a prompt at the bottom asks Allow or Block. Allow opens just that one (a redirect loads in the tab it came from). Block keeps it blocked and the same address stays quiet for 30 seconds. If you ignore the prompt for 15 seconds it counts as Block.
           It also stops new windows opened by invisible layers over the page and by scripts that click links for you. Real taps on buttons and links, windows on the same site and sign-in windows (Google, Apple, Microsoft, Facebook, GitHub and similar) are opened without asking.
           Limits: it cannot tell an ad from a wanted window when a visible button opens it. Some pages redirect on their own on purpose (link timers, slow sign-in). Tap Allow when that happens.
+
+          TRACKING PROTECTION
+          Always on. Cookies and site data of third-party content are kept separate for each site you visit (Total Cookie Protection), so an ad or widget embedded on two sites cannot recognise you across them. Sites you visit directly keep their own cookies, so remember-me and recommendations still work on that site. Known tracking cookies are purged, tracking parameters like fbclid are removed from links, other sites only get your site's address (not the full page address) as referrer, Global Privacy Control is sent, and WebRTC no longer exposes your local network address.
+          Limits: this does not stop a site from recognising you by itself, and it does not hide the sites you visit from your network. A few embedded sign-in widgets may need you to sign in on the site itself.
 
           The lists below belong to their maintainers. Links are not checked by this app."""
 
