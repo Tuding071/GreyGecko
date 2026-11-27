@@ -4937,7 +4937,7 @@ jobs:
                   }
               }
 
-              private val shared = listOf("filters", "adblock", "adcos", "hide", "popblock", "motion", "haptics")
+              private val shared = listOf("filters", "adblock", "adcos", "hide", "popblock")
 
               @Volatile
               private var sharedOk = true
@@ -5486,159 +5486,11 @@ jobs:
           }
           EOF
 
-          cat > app/src/main/java/com/grey/gecko/Motion.kt <<'EOF'
-          package com.grey.gecko
-
-          import android.content.Context
-          import android.os.Build
-          import android.os.SystemClock
-          import android.provider.Settings
-          import android.view.HapticFeedbackConstants
-          import android.view.View
-          import androidx.compose.animation.core.Animatable
-          import androidx.compose.animation.core.CubicBezierEasing
-          import androidx.compose.animation.core.FiniteAnimationSpec
-          import androidx.compose.animation.core.Spring
-          import androidx.compose.animation.core.spring
-          import androidx.compose.animation.core.tween
-          import androidx.compose.foundation.lazy.LazyItemScope
-          import androidx.compose.runtime.LaunchedEffect
-          import androidx.compose.runtime.getValue
-          import androidx.compose.runtime.mutableStateOf
-          import androidx.compose.runtime.remember
-          import androidx.compose.runtime.setValue
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.composed
-          import androidx.compose.ui.graphics.graphicsLayer
-          import androidx.compose.ui.unit.dp
-          import kotlinx.coroutines.delay
-
-          // One place for how things move. Durations follow Material 3: things entering decelerate,
-          // things leaving accelerate, small feedback stays near 100 ms.
-          object Motion {
-              const val OFF = 0
-              const val REDUCED = 1
-              const val FULL = 2
-
-              var mode by mutableStateOf(FULL)
-              var haptics by mutableStateOf(true)
-
-              @Volatile
-              var systemOff = false
-
-              @Volatile
-              var screenAt = 0L
-
-              val Standard = CubicBezierEasing(0.2f, 0f, 0f, 1f)
-              val EmphDecel = CubicBezierEasing(0.05f, 0.7f, 0.1f, 1f)
-              val EmphAccel = CubicBezierEasing(0.3f, 0f, 0.8f, 0.15f)
-
-              val on: Boolean get() = mode != OFF && !systemOff
-              val full: Boolean get() = mode == FULL && !systemOff
-
-              fun ms(base: Int): Int {
-                  if (!on) return 0
-                  return if (mode == REDUCED) (base * 0.6f).toInt() else base
-              }
-
-              fun <T> enter(base: Int = 300): FiniteAnimationSpec<T> = tween(ms(base), easing = EmphDecel)
-
-              fun <T> exit(base: Int = 200): FiniteAnimationSpec<T> = tween(ms(base), easing = EmphAccel)
-
-              fun <T> press(): FiniteAnimationSpec<T> = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium)
-
-              private fun sp() = Gecko.appCtx.getSharedPreferences("browser", Context.MODE_PRIVATE)
-
-              fun load() {
-                  try {
-                      val p = sp()
-                      mode = p.getInt("motion", FULL).coerceIn(OFF, FULL)
-                      haptics = p.getBoolean("haptics", true)
-                  } catch (e: Exception) {
-                  }
-                  refreshSystem()
-              }
-
-              fun refreshSystem() {
-                  try {
-                      val s = Settings.Global.getFloat(Gecko.appCtx.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f)
-                      systemOff = s == 0f
-                  } catch (e: Exception) {
-                  }
-              }
-
-              fun cycle() {
-                  mode = when (mode) {
-                      FULL -> REDUCED
-                      REDUCED -> OFF
-                      else -> FULL
-                  }
-                  try {
-                      sp().edit().putInt("motion", mode).apply()
-                  } catch (e: Exception) {
-                  }
-              }
-
-              fun setHaptics(v: Boolean) {
-                  haptics = v
-                  try {
-                      sp().edit().putBoolean("haptics", v).apply()
-                  } catch (e: Exception) {
-                  }
-              }
-
-              fun label(): String = when (mode) {
-                  FULL -> "Full"
-                  REDUCED -> "Reduced"
-                  else -> "Off"
-              }
-          }
-
-          object Haptics {
-              fun tap(v: View) {
-                  if (!Motion.haptics) return
-                  try {
-                      v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                  } catch (e: Exception) {
-                  }
-              }
-
-              fun reject(v: View) {
-                  if (!Motion.haptics) return
-                  try {
-                      v.performHapticFeedback(if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.REJECT else HapticFeedbackConstants.VIRTUAL_KEY)
-                  } catch (e: Exception) {
-                  }
-              }
-          }
-
-          // Rows of a list rise and fade in one after another, only on the first rows right after a screen opens.
-          fun Modifier.rise(index: Int): Modifier = composed {
-              val fresh = Motion.full && SystemClock.uptimeMillis() - Motion.screenAt < 450L && index < 8
-              val a = remember { Animatable(if (fresh) 0f else 1f) }
-              LaunchedEffect(Unit) {
-                  if (fresh) {
-                      delay(index * 22L)
-                      a.animateTo(1f, tween(Motion.ms(260), easing = Motion.EmphDecel))
-                  }
-              }
-              this.graphicsLayer {
-                  alpha = a.value
-                  translationY = (1f - a.value) * 10.dp.toPx()
-              }
-          }
-
-          // Rows of a keyed LazyColumn animate in, out and when they move.
-          fun LazyItemScope.itemFx(): Modifier =
-              if (Motion.on) Modifier.animateItem() else Modifier.animateItem(null, null, null)
-          EOF
-
           cat > app/src/main/java/com/grey/gecko/Touch.kt <<'EOF'
           package com.grey.gecko
 
           import android.os.Build
           import androidx.compose.foundation.clickable as baseClickable
-          import androidx.compose.animation.core.animateFloatAsState
           import androidx.compose.foundation.interaction.MutableInteractionSource
           import androidx.compose.foundation.layout.PaddingValues
           import androidx.compose.foundation.layout.RowScope
@@ -5664,14 +5516,12 @@ jobs:
           import androidx.compose.ui.graphics.Paint
           import androidx.compose.ui.graphics.RectangleShape
           import androidx.compose.ui.graphics.Shape
-          import androidx.compose.ui.graphics.graphicsLayer
           import androidx.compose.ui.input.pointer.PointerEventPass
           import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.layout.boundsInRoot
           import androidx.compose.ui.layout.onGloballyPositioned
           import androidx.compose.ui.platform.LocalView
           import androidx.compose.ui.platform.LocalViewConfiguration
-          import androidx.compose.ui.unit.dp
           import kotlinx.coroutines.Job
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
@@ -5707,11 +5557,6 @@ jobs:
               val token = remember { Any() }
               val view = LocalView.current
               val area = remember { BoundsHolder() }
-              val press by animateFloatAsState(
-                  targetValue = if (down && TouchOwner.id === token && Motion.on) 1f else 0f,
-                  animationSpec = Motion.press(),
-                  label = "press"
-              )
               val slop = LocalViewConfiguration.current.touchSlop
               val watcher = if (!enabled) {
                   Modifier
@@ -5748,14 +5593,7 @@ jobs:
                       }
                   }
               }
-              this.then(watcher).graphicsLayer {
-                  if (press > 0f) {
-                      val kx = (6.dp.toPx() / size.width).coerceIn(0f, 0.03f)
-                      val ky = (4.dp.toPx() / size.height).coerceIn(0f, 0.03f)
-                      scaleX = 1f - kx * press
-                      scaleY = 1f - ky * press
-                  }
-              }.onGloballyPositioned { area.r = it.boundsInRoot() }.drawWithContent {
+              this.then(watcher).onGloballyPositioned { area.r = it.boundsInRoot() }.drawWithContent {
                   drawContent()
                   if (down && TouchOwner.id === token) {
                       val modern = Build.VERSION.SDK_INT >= 29
@@ -5791,12 +5629,8 @@ jobs:
               contentPadding: PaddingValues = ButtonDefaults.TextButtonContentPadding,
               content: @Composable RowScope.() -> Unit
           ) {
-              val view = LocalView.current
               androidx.compose.material3.TextButton(
-                  onClick = {
-                      Haptics.tap(view)
-                      onClick()
-                  },
+                  onClick = onClick,
                   modifier = modifier.touchInvert(CircleShape, enabled),
                   enabled = enabled,
                   contentPadding = contentPadding,
@@ -5814,12 +5648,8 @@ jobs:
               contentPadding: PaddingValues = ButtonDefaults.ContentPadding,
               content: @Composable RowScope.() -> Unit
           ) {
-              val view = LocalView.current
               androidx.compose.material3.Button(
-                  onClick = {
-                      Haptics.tap(view)
-                      onClick()
-                  },
+                  onClick = onClick,
                   modifier = modifier.touchInvert(shape, enabled),
                   enabled = enabled,
                   shape = shape,
@@ -5838,13 +5668,9 @@ jobs:
               trailingIcon: @Composable (() -> Unit)? = null,
               enabled: Boolean = true
           ) {
-              val view = LocalView.current
               androidx.compose.material3.DropdownMenuItem(
                   text = text,
-                  onClick = {
-                      Haptics.tap(view)
-                      onClick()
-                  },
+                  onClick = onClick,
                   modifier = modifier.touchInvert(RectangleShape, enabled),
                   leadingIcon = leadingIcon,
                   trailingIcon = trailingIcon,
@@ -7037,6 +6863,8 @@ jobs:
               var errorUrl: String? = null
               var lastUsed = System.currentTimeMillis()
               var savedState: GeckoSession.SessionState? = null
+              var goodUrl = ""
+              var awaitingStart = false
               val videos = mutableStateListOf<VideoItem>()
               val seen = HashSet<String>()
 
@@ -7274,7 +7102,7 @@ jobs:
                       if (t.preview) continue
                       val o = JSONObject()
                       o.put("id", t.id)
-                          o.put("u", t.url)
+                          o.put("u", if (t.url.isBlank() || t.url == "about:blank") t.goodUrl else t.url)
                           o.put("t", t.title)
                           o.put("o", t.openerId)
                           arr.put(o)
@@ -7304,6 +7132,7 @@ jobs:
                           val id = o.getInt("id")
                           val t = BrowserTab(id, null, o.optInt("o", 0))
                           t.url = o.optString("u")
+                          t.goodUrl = t.url
                           t.title = o.optString("t")
                           val f = thumbFile(id)
                           if (f.exists()) {
@@ -7405,8 +7234,19 @@ jobs:
                       s.loadUri(initialUrl)
                   } else if (st != null) {
                       s.restoreState(st)
+                      t.awaitingStart = true
+                      main.postDelayed({
+                          if (t.awaitingStart && t.session === s) {
+                              t.awaitingStart = false
+                              val u = if (t.url.isNotBlank() && t.url != "about:blank") t.url else t.goodUrl
+                              if (u.isNotBlank() && u != "about:blank") s.loadUri(u)
+                          }
+                      }, 3500L)
                   } else if (t.url.isNotBlank() && t.url != "about:blank") {
                       s.loadUri(t.url)
+                  } else if (t.goodUrl.isNotBlank()) {
+                      t.url = t.goodUrl
+                      s.loadUri(t.goodUrl)
                   }
               }
 
@@ -7534,6 +7374,7 @@ jobs:
                   val now = System.currentTimeMillis()
                   if (now - t.lastRecover < 5000L) t.savedState = null
                   t.lastRecover = now
+                  if (t.url.isBlank() || t.url == "about:blank") t.url = t.goodUrl
                   if (t === current && !home && t.url.isNotBlank() && t.url != "about:blank") ensureLive(t)
               }
 
@@ -7678,13 +7519,17 @@ jobs:
                           perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
                           hasUserGesture: Boolean
                       ) {
+                          if (t.session !== session) return
                           val nu = url ?: ""
+                          if ((nu.isBlank() || nu == "about:blank") && t.url.isNotBlank() && t.url != "about:blank") return
+                          t.awaitingStart = false
                           val eu = t.errorUrl
                           if (eu != null && isErrorUri(nu)) {
                               t.url = eu
                           } else {
                               t.errorUrl = null
                               t.url = nu
+                              if (nu.isNotBlank() && nu != "about:blank" && !isErrorUri(nu)) t.goodUrl = nu
                           }
                           Capture.event("NAV", "tab" + t.id + " location " + nu + (if (hasUserGesture) " (user gesture)" else ""))
                           dedupe(t)
@@ -7723,12 +7568,16 @@ jobs:
                   }
                   s.progressDelegate = object : GeckoSession.ProgressDelegate {
                       override fun onPageStart(session: GeckoSession, url: String) {
+                          if (t.session !== session) return
+                          if ((url.isBlank() || url == "about:blank") && t.url.isNotBlank() && t.url != "about:blank") return
+                          t.awaitingStart = false
                           Capture.event("NAV", "tab" + t.id + " page start " + url)
                           t.loading = true
                           t.progress = 8
                           t.title = ""
                           val eu0 = t.errorUrl
                           if (eu0 != null && isErrorUri(url)) t.url = eu0 else t.url = url
+                          if (url.isNotBlank() && url != "about:blank" && !isErrorUri(url)) t.goodUrl = url
                           t.thumb = null
                           t.videos.clear()
                           t.scrollY = 0
@@ -7754,6 +7603,7 @@ jobs:
                           session: GeckoSession,
                           sessionState: GeckoSession.SessionState
                       ) {
+                          if (t.session !== session) return
                           t.savedState = sessionState
                       }
                   }
@@ -7861,6 +7711,7 @@ jobs:
                           Downloads.fromResponse(response)
                       }
                       override fun onTitleChange(session: GeckoSession, title: String?) {
+                          if (t.session !== session) return
                           t.title = title ?: ""
                           HistoryStore.setTitle(t.url, t.title)
                           persist()
@@ -8006,7 +7857,6 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.activity.enableEdgeToEdge
-          import androidx.compose.animation.Crossfade
           import androidx.compose.animation.animateColorAsState
           import androidx.compose.animation.core.RepeatMode
           import androidx.compose.animation.core.animateFloat
@@ -8027,7 +7877,6 @@ jobs:
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
-          import androidx.compose.foundation.lazy.itemsIndexed
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
@@ -8308,7 +8157,6 @@ jobs:
                   if (useBackup) Backup.start()
                   Downloads.load()
                   PopBlock.load()
-                  Motion.load()
                   val runtime = Gecko.runtime(this)
                   Videos.load(this)
                   Thread { Updater.autoCheck() }.start()
@@ -8417,7 +8265,7 @@ jobs:
                   withFrameNanos { }
                   ready = true
               }
-              val a by animateFloatAsState(if (ready) 1f else 0f, tween(Motion.ms(150)), label = "body")
+              val a by animateFloatAsState(if (ready) 1f else 0f, tween(150), label = "body")
               Box(Modifier.weight(1f).fillMaxWidth().graphicsLayer { alpha = a }) {
                   if (ready) Column(Modifier.fillMaxSize(), content = content)
               }
@@ -8491,6 +8339,10 @@ jobs:
                               startEdit = startEdit,
                               onEditStarted = { startEdit = false },
                               onTabs = { screen = "tabs" },
+                              onNewTab = {
+                                  tabs.home = true
+                                  startEdit = true
+                              },
                               onHistory = { screen = "history" },
                               onBookmarks = { screen = "bookmarks" },
                               onScripts = { screen = "scripts" },
@@ -8509,7 +8361,7 @@ jobs:
                                       .background(BG)
                                       .pointerInput(Unit) { detectTapGestures { } }
                               ) {
-                                  key(screen) { ScreenDeferred(slide = screen != "browser") { when (screen) {
+                                  key(screen) { ScreenDeferred { when (screen) {
                                       "tabs" -> TabManagerScreen(
                                           tabs,
                                           onBack = { screen = "browser" },
@@ -8784,24 +8636,16 @@ jobs:
 
           // Shows a cheap background-only skeleton for the first frame, then builds the real screen and fades in.
           @Composable
-          fun ScreenDeferred(slide: Boolean = false, content: @Composable () -> Unit) {
+          fun ScreenDeferred(content: @Composable () -> Unit) {
               var started by remember { mutableStateOf(false) }
               var ready by remember { mutableStateOf(false) }
               LaunchedEffect(Unit) {
-                  Motion.screenAt = android.os.SystemClock.uptimeMillis()
-                  Motion.refreshSystem()
                   started = true
                   withFrameNanos { }
                   ready = true
               }
-              val a by animateFloatAsState(targetValue = if (started) 1f else 0f, animationSpec = tween(Motion.ms(140)), label = "screenFade")
-              val p by animateFloatAsState(targetValue = if (started) 1f else 0f, animationSpec = Motion.enter(300), label = "screenSlide")
-              Box(
-                  Modifier.fillMaxSize().graphicsLayer {
-                      alpha = a
-                      if (slide) translationX = (1f - p) * 36.dp.toPx()
-                  }
-              ) {
+              val a by animateFloatAsState(targetValue = if (started) 1f else 0f, animationSpec = tween(140), label = "screenFade")
+              Box(Modifier.fillMaxSize().graphicsLayer { alpha = a }) {
                   if (ready) content() else ScreenSkeleton()
               }
           }
@@ -8865,6 +8709,7 @@ jobs:
               startEdit: Boolean,
               onEditStarted: () -> Unit,
               onTabs: () -> Unit,
+              onNewTab: () -> Unit,
               onHistory: () -> Unit,
               onBookmarks: () -> Unit,
               onScripts: () -> Unit,
@@ -9015,12 +8860,13 @@ jobs:
                               onSubmit = { submit(text.text) },
                               modifier = Modifier.weight(1f)
                           )
+                          Spacer(Modifier.width(6.dp))
                           if (editing) {
-                              Spacer(Modifier.width(6.dp))
-                              Button(onClick = { submit(text.text) }) { Text("Go") }
+                              BarButton("Go", 14.sp) { submit(text.text) }
                           } else if (!tabs.home && cur?.loading == true) {
-                              Spacer(Modifier.width(6.dp))
-                              Button(onClick = { cur?.session?.stop() }) { Text("×", fontSize = 20.sp) }
+                              BarButton("×", 24.sp) { cur?.session?.stop() }
+                          } else {
+                              BarButton("+", 26.sp) { onNewTab() }
                           }
                           Box {
                               TextButton(onClick = { menu = true }) {
@@ -9150,21 +8996,6 @@ jobs:
                                           PopBlock.set(v)
                                           toast(ctx, if (v) "Pop-ups and redirects blocked. You will be asked each time" else "Pop-up blocking off")
                                       }
-                                  )
-                                  DropdownMenuItem(
-                                      text = { Text("Animations: " + Motion.label(), color = Color.White) },
-                                      onClick = { Motion.cycle() }
-                                  )
-                                  DropdownMenuItem(
-                                      text = { Text("Haptic feedback", color = Color.White) },
-                                      trailingIcon = {
-                                          Switch(
-                                              checked = Motion.haptics,
-                                              onCheckedChange = { v -> Motion.setHaptics(v) },
-                                              colors = switchColors()
-                                          )
-                                      },
-                                      onClick = { Motion.setHaptics(!Motion.haptics) }
                                   )
                                   DropdownMenuItem(
                                   text = { Text(if (marked) "Remove bookmark" else "Add to bookmark", color = Color.White) },
@@ -9828,38 +9659,36 @@ jobs:
               LaunchedEffect(key) { Favicons.request(key) }
               val ib = Favicons.get(key)
               val shape = RoundedCornerShape(radius)
-              Crossfade(targetState = ib != null, animationSpec = tween(Motion.ms(160)), label = "favicon") { has ->
-                  if (has && ib != null) {
-                      Box(
-                          Modifier
-                              .size(size)
-                              .keepColors()
-                              .clip(shape)
-                              .background(Color(0xFFEFEFEF)),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Image(
-                              bitmap = ib,
-                              contentDescription = null,
-                              modifier = Modifier.fillMaxSize().padding(size * 0.12f)
-                          )
-                      }
-                  } else {
-                      Box(
-                          Modifier
-                              .size(size)
-                              .keepColors()
-                              .clip(shape)
-                              .background(groupColor(key)),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text(
-                              groupLetter(key),
-                              color = Color.White,
-                              fontSize = letterSize.sp,
-                              fontWeight = FontWeight.Bold
-                          )
-                      }
+              if (ib != null) {
+                  Box(
+                      Modifier
+                          .size(size)
+                          .keepColors()
+                          .clip(shape)
+                          .background(Color(0xFFEFEFEF)),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Image(
+                          bitmap = ib,
+                          contentDescription = null,
+                          modifier = Modifier.fillMaxSize().padding(size * 0.12f)
+                      )
+                  }
+              } else {
+                  Box(
+                      Modifier
+                          .size(size)
+                          .keepColors()
+                          .clip(shape)
+                          .background(groupColor(key)),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text(
+                          groupLetter(key),
+                          color = Color.White,
+                          fontSize = letterSize.sp,
+                          fontWeight = FontWeight.Bold
+                      )
                   }
               }
           }
@@ -10261,18 +10090,16 @@ jobs:
                   Body {
                       if (hist.isEmpty()) EmptyNote("No history yet.")
                       LazyColumn(Modifier.weight(1f)) {
-                          itemsIndexed(hist) { ri, e ->
+                          items(hist) { e ->
                               val host = android.net.Uri.parse(e.url).host ?: e.url
-                              Box(Modifier.rise(ri)) {
-                                  SheetRow(
-                                      title = e.title.ifBlank { e.url },
-                                      sub = host + " · " + fmt.format(java.util.Date(e.time)),
-                                      active = false,
-                                      onClick = { onOpen(e.url) },
-                                      onRemove = null,
-                                      leading = { FaviconBox(keyOfUrl(e.url), 24.dp, 6.dp, 12) }
-                                  )
-                              }
+                              SheetRow(
+                                  title = e.title.ifBlank { e.url },
+                                  sub = host + " · " + fmt.format(java.util.Date(e.time)),
+                                  active = false,
+                                  onClick = { onOpen(e.url) },
+                                  onRemove = null,
+                                  leading = { FaviconBox(keyOfUrl(e.url), 24.dp, 6.dp, 12) }
+                              )
                           }
                       }
                   }
@@ -10410,19 +10237,17 @@ jobs:
                                               letterSpacing = 0.5.sp,
                                               modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 10.dp)
                                           )
-                                          for ((ri, e) in active.items.withIndex()) {
+                                          for (e in active.items) {
                                               key(e.url) {
-                                                  Column(Modifier.rise(ri)) {
-                                                      BookmarkCard(
-                                                          e,
-                                                          closing = BookmarkStore.closing.contains(e.url),
-                                                          onClick = { onOpen(e.url) },
-                                                          onToggleClose = {
-                                                              if (BookmarkStore.closing.contains(e.url)) BookmarkStore.undoRemove(e.url)
-                                                              else BookmarkStore.requestRemove(e.url)
-                                                          }
-                                                      )
-                                                  }
+                                                  BookmarkCard(
+                                                      e,
+                                                      closing = BookmarkStore.closing.contains(e.url),
+                                                      onClick = { onOpen(e.url) },
+                                                      onToggleClose = {
+                                                          if (BookmarkStore.closing.contains(e.url)) BookmarkStore.undoRemove(e.url)
+                                                          else BookmarkStore.requestRemove(e.url)
+                                                      }
+                                                  )
                                               }
                                           }
                                       }
@@ -10512,14 +10337,12 @@ jobs:
                           )
                       }
                       LazyColumn(Modifier.weight(1f)) {
-                          itemsIndexed(scripts, key = { _, s -> s.id }) { ri, s ->
-                              Box(itemFx().rise(ri)) {
-                                  ScriptRow(
-                                      s,
-                                      onClick = { onEdit(s.id) },
-                                      onToggle = { v -> Store.setEnabled(s.id, v); reload() }
-                                  )
-                              }
+                          items(scripts, key = { it.id }) { s ->
+                              ScriptRow(
+                                  s,
+                                  onClick = { onEdit(s.id) },
+                                  onToggle = { v -> Store.setEnabled(s.id, v); reload() }
+                              )
                           }
                       }
                   }
@@ -11091,42 +10914,40 @@ jobs:
                           if (lists.isEmpty()) {
                               EmptyNote("No filter lists yet. Tap URL to download one or Import to load a .txt file. Tap ? for links to popular lists.")
                           }
-                          for ((ri, f) in lists.withIndex()) {
+                          for (f in lists) {
                               key(f.id) {
-                                  Column(Modifier.rise(ri)) {
-                                      Row(
-                                          Modifier.fillMaxWidth().clickable { sel = f }.padding(horizontal = 12.dp, vertical = 10.dp),
-                                          verticalAlignment = Alignment.CenterVertically
-                                      ) {
-                                          Column(Modifier.weight(1f)) {
-                                              Text(
-                                                  f.name,
-                                                  color = if (f.enabled) Color.White else Color(0xFF888888),
-                                                  fontSize = 14.sp,
-                                                  maxLines = 1,
-                                                  overflow = TextOverflow.Ellipsis
-                                              )
-                                              Text(
-                                                  f.count.toString() + " rules" +
-                                                      (if (f.updated > 0) " · " + fmt.format(java.util.Date(f.updated)) else "") +
-                                                      (if (f.url.isBlank()) " · imported file" else " · " + hostOf(f.url)),
-                                                  color = Soft,
-                                                  fontSize = 12.sp,
-                                                  maxLines = 1,
-                                                  overflow = TextOverflow.Ellipsis
-                                              )
-                                          }
-                                          Switch(
-                                              checked = f.enabled,
-                                              onCheckedChange = { v ->
-                                                  Filters.setEnabled(f.id, v)
-                                                  reload()
-                                              },
-                                              colors = switchColors()
+                                  Row(
+                                      Modifier.fillMaxWidth().clickable { sel = f }.padding(horizontal = 12.dp, vertical = 10.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Column(Modifier.weight(1f)) {
+                                          Text(
+                                              f.name,
+                                              color = if (f.enabled) Color.White else Color(0xFF888888),
+                                              fontSize = 14.sp,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                          Text(
+                                              f.count.toString() + " rules" +
+                                                  (if (f.updated > 0) " · " + fmt.format(java.util.Date(f.updated)) else "") +
+                                                  (if (f.url.isBlank()) " · imported file" else " · " + hostOf(f.url)),
+                                              color = Soft,
+                                              fontSize = 12.sp,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
                                           )
                                       }
-                                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
+                                      Switch(
+                                          checked = f.enabled,
+                                          onCheckedChange = { v ->
+                                              Filters.setEnabled(f.id, v)
+                                              reload()
+                                          },
+                                          colors = switchColors()
+                                      )
                                   }
+                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                               }
                           }
                       }
@@ -11974,10 +11795,8 @@ jobs:
                           EmptyNote("No downloads yet. Use Save in the video list, Download in the long-press menu, or open a downloadable file.")
                       }
                       LazyColumn(Modifier.weight(1f)) {
-                          itemsIndexed(Downloads.items, key = { _, d -> d.id }) { ri, d ->
-                              Box(itemFx().rise(ri)) {
-                                  DlRow(d, onOpen = { openDownload(ctx, it) }, onDeleteFile = { fileTarget = it })
-                              }
+                          items(Downloads.items, key = { it.id }) { d ->
+                              DlRow(d, onOpen = { openDownload(ctx, it) }, onDeleteFile = { fileTarget = it })
                           }
                       }
                   }
@@ -12143,56 +11962,54 @@ jobs:
                           EmptyNote("Profiles need All files access. Allow it for GreyGecko and restart the app.")
                       }
                       Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                          for ((ri, n) in names.withIndex()) {
+                          for (n in names) {
                               key(n) {
-                                  Column(Modifier.rise(ri)) {
-                                      val isCur = n == cur
-                                      Row(
-                                          Modifier
-                                              .fillMaxWidth()
-                                              .clickable(enabled = !isCur) { switchTo = n }
-                                              .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
-                                          verticalAlignment = Alignment.CenterVertically
-                                      ) {
-                                          Column(Modifier.weight(1f)) {
-                                              Text(n, color = Color.White, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                              Text(
-                                                  if (isCur) "Current profile" else "Tap to switch",
-                                                  color = if (isCur) TmGreen else Soft,
-                                                  fontSize = 11.sp
+                                  val isCur = n == cur
+                                  Row(
+                                      Modifier
+                                          .fillMaxWidth()
+                                          .clickable(enabled = !isCur) { switchTo = n }
+                                          .padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Column(Modifier.weight(1f)) {
+                                          Text(n, color = Color.White, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                          Text(
+                                              if (isCur) "Current profile" else "Tap to switch",
+                                              color = if (isCur) TmGreen else Soft,
+                                              fontSize = 11.sp
+                                          )
+                                      }
+                                      Box {
+                                          TextButton(onClick = { menuFor = n }) { Text("⋮", color = Color.White, fontSize = 20.sp) }
+                                          DropdownMenu(
+                                              expanded = menuFor == n,
+                                              onDismissRequest = { menuFor = null },
+                                              modifier = Modifier.background(Bar)
+                                          ) {
+                                              DropdownMenuItem(
+                                                  text = { Text("Rename", color = Color.White) },
+                                                  onClick = { menuFor = null; input = n; renameFor = n }
                                               )
-                                          }
-                                          Box {
-                                              TextButton(onClick = { menuFor = n }) { Text("⋮", color = Color.White, fontSize = 20.sp) }
-                                              DropdownMenu(
-                                                  expanded = menuFor == n,
-                                                  onDismissRequest = { menuFor = null },
-                                                  modifier = Modifier.background(Bar)
-                                              ) {
-                                                  DropdownMenuItem(
-                                                      text = { Text("Rename", color = Color.White) },
-                                                      onClick = { menuFor = null; input = n; renameFor = n }
-                                                  )
-                                                  DropdownMenuItem(
-                                                      text = { Text("Duplicate", color = Color.White) },
-                                                      onClick = {
-                                                          menuFor = null
-                                                          val r = Backup.duplicate(n, null)
-                                                          toast(ctx, if (r != null) "Created " + r else "Could not duplicate")
-                                                          rev++
-                                                      }
-                                                  )
-                                                  if (!isCur) {
-                                                      DropdownMenuItem(
-                                                          text = { Text("Delete", color = Danger) },
-                                                          onClick = { menuFor = null; deleteFor = n }
-                                                      )
+                                              DropdownMenuItem(
+                                                  text = { Text("Duplicate", color = Color.White) },
+                                                  onClick = {
+                                                      menuFor = null
+                                                      val r = Backup.duplicate(n, null)
+                                                      toast(ctx, if (r != null) "Created " + r else "Could not duplicate")
+                                                      rev++
                                                   }
+                                              )
+                                              if (!isCur) {
+                                                  DropdownMenuItem(
+                                                      text = { Text("Delete", color = Danger) },
+                                                      onClick = { menuFor = null; deleteFor = n }
+                                                  )
                                               }
                                           }
                                       }
-                                      Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                                   }
+                                  Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF333333)))
                               }
                           }
                       }
@@ -12480,61 +12297,61 @@ jobs:
           }
 
           @Composable
+          fun BarButton(label: String, size: androidx.compose.ui.unit.TextUnit, onClick: () -> Unit) {
+              Box(
+                  Modifier
+                      .size(44.dp)
+                      .clip(RoundedCornerShape(10.dp))
+                      .background(Color.White)
+                      .clickable { onClick() },
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text(label, color = Color.Black, fontSize = size)
+              }
+          }
+
+          @Composable
           fun PopNotice(modifier: Modifier = Modifier, onAllow: (PopNote) -> Unit) {
               val head = PopBlock.pending.firstOrNull()
               val more = PopBlock.pending.size - 1
-              val view = androidx.compose.ui.platform.LocalView.current
-              var last by remember { mutableStateOf<PopNote?>(null) }
               LaunchedEffect(head) {
                   if (head != null) {
-                      last = head
-                      Haptics.reject(view)
                       delay(15000)
                       if (PopBlock.pending.firstOrNull() === head) PopBlock.block(head)
                   }
               }
-              val shown = head ?: last
-              androidx.compose.animation.AnimatedVisibility(
-                  visible = head != null,
-                  modifier = modifier,
-                  enter = androidx.compose.animation.slideInVertically(Motion.enter(250)) { it / 2 } +
-                      androidx.compose.animation.fadeIn(Motion.enter(250)),
-                  exit = androidx.compose.animation.slideOutVertically(Motion.exit(150)) { it / 2 } +
-                      androidx.compose.animation.fadeOut(Motion.exit(150))
-              ) {
-                  if (shown != null) {
-                      val canAllow = shown.url.isNotBlank()
-                      Column(
-                          Modifier
-                              .fillMaxWidth()
-                              .padding(horizontal = 12.dp)
-                              .background(Bar)
-                              .padding(start = 14.dp, top = 10.dp, end = 6.dp, bottom = 2.dp)
-                      ) {
-                          Text(
-                              "Allow " + shown.kind + "?" + (if (more > 0) "  (" + more + " more waiting)" else ""),
-                              color = Color.White,
-                              fontSize = 14.sp
-                          )
-                          if (shown.pageHost.isNotBlank()) {
-                              Text("from " + shown.pageHost, color = Soft, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+              if (head != null) {
+                  val canAllow = head.url.isNotBlank()
+                  Column(
+                      modifier
+                          .fillMaxWidth()
+                          .padding(horizontal = 12.dp)
+                          .background(Bar)
+                          .padding(start = 14.dp, top = 10.dp, end = 6.dp, bottom = 2.dp)
+                  ) {
+                      Text(
+                          "Allow " + head.kind + "?" + (if (more > 0) "  (" + more + " more waiting)" else ""),
+                          color = Color.White,
+                          fontSize = 14.sp
+                      )
+                      if (head.pageHost.isNotBlank()) {
+                          Text("from " + head.pageHost, color = Soft, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                      }
+                      Text(
+                          if (canAllow) head.url.take(110) else "empty window",
+                          color = Soft,
+                          fontSize = 11.sp,
+                          maxLines = 2,
+                          overflow = TextOverflow.Ellipsis
+                      )
+                      Row(Modifier.fillMaxWidth()) {
+                          Spacer(Modifier.weight(1f))
+                          if (more > 0) {
+                              TextButton(onClick = { PopBlock.blockAll() }) { Text("Block all", color = Soft, fontSize = 13.sp) }
                           }
-                          Text(
-                              if (canAllow) shown.url.take(110) else "empty window",
-                              color = Soft,
-                              fontSize = 11.sp,
-                              maxLines = 2,
-                              overflow = TextOverflow.Ellipsis
-                          )
-                          Row(Modifier.fillMaxWidth()) {
-                              Spacer(Modifier.weight(1f))
-                              if (more > 0) {
-                                  TextButton(onClick = { PopBlock.blockAll() }) { Text("Block all", color = Soft, fontSize = 13.sp) }
-                              }
-                              TextButton(onClick = { PopBlock.block(shown) }) { Text("Block", color = Color.White, fontSize = 13.sp) }
-                              if (canAllow) {
-                                  TextButton(onClick = { onAllow(shown) }) { Text("Allow", color = Color.White, fontSize = 13.sp) }
-                              }
+                          TextButton(onClick = { PopBlock.block(head) }) { Text("Block", color = Color.White, fontSize = 13.sp) }
+                          if (canAllow) {
+                              TextButton(onClick = { onAllow(head) }) { Text("Allow", color = Color.White, fontSize = 13.sp) }
                           }
                       }
                   }
