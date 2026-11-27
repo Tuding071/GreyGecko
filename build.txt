@@ -7100,9 +7100,11 @@ jobs:
                       val arr = JSONArray()
                       for (t in tabs) {
                       if (t.preview) continue
+                      val saveUrl = if (t.url.isBlank() || t.url == "about:blank") t.goodUrl else t.url
+                      if (saveUrl.isBlank() || saveUrl == "about:blank") continue
                       val o = JSONObject()
                       o.put("id", t.id)
-                          o.put("u", if (t.url.isBlank() || t.url == "about:blank") t.goodUrl else t.url)
+                          o.put("u", saveUrl)
                           o.put("t", t.title)
                           o.put("o", t.openerId)
                           arr.put(o)
@@ -7130,8 +7132,11 @@ jobs:
                       for (i in 0 until arr.length()) {
                           val o = arr.getJSONObject(i)
                           val id = o.getInt("id")
+                          if (id > maxId) maxId = id
+                          val savedUrl = o.optString("u")
+                          if (savedUrl.isBlank() || savedUrl == "about:blank") continue
                           val t = BrowserTab(id, null, o.optInt("o", 0))
-                          t.url = o.optString("u")
+                          t.url = savedUrl
                           t.goodUrl = t.url
                           t.title = o.optString("t")
                           val f = thumbFile(id)
@@ -7143,6 +7148,7 @@ jobs:
                           tabs.add(t)
                       }
                       counter = maxId
+                      if (tabs.isEmpty()) return false
                       val curId = root.optInt("cur", 0)
                       val c = tabs.firstOrNull { it.id == curId } ?: tabs.last()
                       current = c
@@ -7559,6 +7565,10 @@ jobs:
                       ): GeckoResult<AllowOrDeny>? {
                           Capture.event("NAV", "tab" + t.id + " load request " + request.uri + (if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) " [new window]" else ""))
                           if (PopBlock.inspect(t, request)) return GeckoResult.fromValue(AllowOrDeny.DENY)
+                          if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW && (request.uri.isBlank() || request.uri == "about:blank")) {
+                              Capture.event("POPUP", "tab" + t.id + " empty new window not opened")
+                              return GeckoResult.fromValue(AllowOrDeny.DENY)
+                          }
                           if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
                               newTab(request.uri, true, t.id)
                               return GeckoResult.fromValue(AllowOrDeny.DENY)
